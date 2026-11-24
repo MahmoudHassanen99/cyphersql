@@ -1,0 +1,107 @@
+# Zeek DNS Log - Multi-Relationship Denormalized Edge Table Example
+# 
+# This schema demonstrates two relationship types from a single edge table,
+# including a relationship that requires array flattening.
+#
+# Sample dns.log data:
+# {
+#   "ts": 1591367999.305988,
+#   "uid": "CMdzit1AMNsmfAIiQc",
+#   "id.orig_h": "192.168.4.76",      <- Source IP
+#   "id.resp_h": "192.168.4.1",       <- DNS Server IP  
+#   "query": "testmyids.com",         <- Domain queried
+#   "qtype_name": "A",
+#   "rcode_name": "NOERROR",
+#   "answers": ["31.3.245.133"],      <- Resolved IPs (array!)
+#   "TTLs": [3600]
+# }
+#
+# Graph model:
+#   Rule 1: (source_ip:IP)-[:REQUESTED]->(domain:Domain)
+#           "192.168.4.76 requested testmyids.com"
+#
+#   Rule 2: (domain:Domain)-[:RESOLVED_TO]->(resolved_ip:IP)
+#           "testmyids.com resolved_to 31.3.245.133"
+#           NOTE: Requires ARRAY JOIN to flatten the answers array
+
+name: zeek_dns
+version: "1.0"
+
+graph_schema:
+  nodes:
+    # IP node - appears as source in REQUESTED relationships
+    - label: IP
+      database: zeek
+      table: dns_log
+      node_id: ip_address
+      property_mappings: {}
+      
+      from_node_properties:
+        ip_address: "id.orig_h"
+      
+      to_node_properties:
+        ip_address: "id.resp_h"  # Could be used for DNS server relationships
+
+    # Domain node - queried domain names
+    - label: Domain
+      database: zeek
+      table: dns_log  # Same table - domain is embedded
+      node_id: domain_name
+      property_mappings: {}
+      
+      from_node_properties:
+        domain_name: query  # When domain is source (in RESOLVED_TO)
+      
+      to_node_properties:
+        domain_name: query  # When domain is target (in REQUESTED)
+
+    # ResolvedIP node - resolved IP addresses from answers array
+    # NOTE: answers is an array - use UNWIND to flatten
+    - label: ResolvedIP
+      database: zeek
+      table: dns_log
+      node_id: answers
+      property_mappings: {}
+
+      from_node_properties:
+        resolved_ip: answers
+
+      to_node_properties:
+        resolved_ip: answers
+
+  edges:
+    # REQUESTED relationship - "192.168.4.76 requested testmyids.com"
+    - type: REQUESTED
+      database: zeek
+      table: dns_log
+      from_id: "id.orig_h"
+      to_id: query
+      from_node: IP
+      to_node: Domain
+      
+      edge_id: uid
+      
+      property_mappings:
+        uid: uid
+        timestamp: ts
+        dns_server: "id.resp_h"
+        qtype: qtype_name
+        rcode: rcode_name
+
+    # RESOLVED_TO relationship - "testmyids.com resolved_to 31.3.245.133"
+    # Note: use UNWIND to flatten the answers array
+    - type: RESOLVED_TO
+      database: zeek
+      table: dns_log
+      from_id: query
+      to_id: answers
+      from_node: Domain
+      to_node: ResolvedIP
+      
+      # Edge ID includes both uid and the specific answer for uniqueness
+      edge_id: [uid, answers]
+      
+      property_mappings:
+        uid: uid
+        timestamp: ts
+        query: query

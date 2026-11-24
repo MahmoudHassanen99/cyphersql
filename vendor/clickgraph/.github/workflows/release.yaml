@@ -1,0 +1,161 @@
+name: Release Pipeline
+
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  create_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog for release body
+        uses: orhun/git-cliff-action@v4
+        id: git_cliff
+        with:
+          config: cliff.toml
+          args: "--latest"
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - id: create
+        name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build_and_upload:
+    name: Build, Package & Upload Assets
+    needs: create_release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Don't let one platform's failure cancel the others — each produces
+      # independent release assets, and a partial upload is better than none.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: win-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos-amd64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      # Windows checkout of this repo fails without long-path support: some
+      # golden corpus filenames exceed the legacy 260-char MAX_PATH limit.
+      # Must run BEFORE actions/checkout, which does its own clone.
+      - name: Enable Git long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # We ship the `clickgraph` server + `clickgraph-client` REPL (ClickHouse)
+      # and the `deltagraph` server (Databricks) as release artifacts. Building
+      # `--workspace` would pull in `clickgraph-ffi` and `clickgraph-tck`, which
+      # both enable the `embedded` feature on `clickgraph-embedded` → pulls in
+      # `chdb-rust` → requires `libchdb`, which has no Windows binary. Cargo
+      # feature unification means any single workspace crate enabling `embedded`
+      # infects the whole graph, so we use explicit `-p` flags to scope the
+      # build to just the shipped binaries.
+      #
+      # The `clickgraph` tarball is built WITHOUT any extra feature, so a
+      # ClickHouse user's download stays byte-for-byte identical and carries no
+      # Databricks code. `deltagraph` is a separate pass with
+      # `--features databricks` (chdb-free — cross-compiles to all four targets;
+      # see docs/deltagraph/PACKAGING.md).
+      - name: Build & cross-compile clickgraph + client (ClickHouse)
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--locked --release -p clickgraph -p clickgraph-client -p clickgraph-tool"
+          strip: true
+
+      - name: Build & cross-compile deltagraph (Databricks)
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--locked --release --features databricks --bin deltagraph"
+          strip: true
+
+      - name: Package artifacts (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/${{ matrix.name }}
+          tar -C target/${{ matrix.target }}/release -czf \
+            dist/${{ matrix.name }}/clickgraph-${{ matrix.name }}.tar.gz clickgraph
+          tar -C target/${{ matrix.target }}/release -czf \
+            dist/${{ matrix.name }}/clickgraph-client-${{ matrix.name }}.tar.gz clickgraph-client
+          tar -C target/${{ matrix.target }}/release -czf \
+            dist/${{ matrix.name }}/cg-${{ matrix.name }}.tar.gz cg
+          tar -C target/${{ matrix.target }}/release -czf \
+            dist/${{ matrix.name }}/deltagraph-${{ matrix.name }}.tar.gz deltagraph
+
+      - name: Package artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Ensure output directory exists
+          New-Item -ItemType Directory -Path dist/${{ matrix.name }} -Force | Out-Null
+          # Use PowerShell Compress-Archive to create ZIPs
+          Compress-Archive -Path target/${{ matrix.target }}/release/clickgraph.exe -DestinationPath dist/${{ matrix.name }}/clickgraph-${{ matrix.name }}.zip -Force
+          Compress-Archive -Path target/${{ matrix.target }}/release/clickgraph-client.exe -DestinationPath dist/${{ matrix.name }}/clickgraph-client-${{ matrix.name }}.zip -Force
+          Compress-Archive -Path target/${{ matrix.target }}/release/cg.exe -DestinationPath dist/${{ matrix.name }}/cg-${{ matrix.name }}.zip -Force
+          Compress-Archive -Path target/${{ matrix.target }}/release/deltagraph.exe -DestinationPath dist/${{ matrix.name }}/deltagraph-${{ matrix.name }}.zip -Force
+
+      - name: Upload clickgraph binary
+        uses: softprops/action-gh-release@v2
+        with:
+          # upload_url: ${{ needs.create_release.outputs.upload_url }}
+          files: dist/${{ matrix.name }}/clickgraph-${{ matrix.name }}.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload clickgraph-client binary
+        uses: softprops/action-gh-release@v2
+        with:
+          # upload_url: ${{ needs.create_release.outputs.upload_url }}
+          files: dist/${{ matrix.name }}/clickgraph-client-${{ matrix.name }}.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload cg binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.name }}/cg-${{ matrix.name }}.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload deltagraph binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.name }}/deltagraph-${{ matrix.name }}.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

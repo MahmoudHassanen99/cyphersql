@@ -1,0 +1,61 @@
+//! ClickGraph Embedded — in-process graph query engine.
+//!
+//! Provides a Kuzu-compatible synchronous API for running Cypher queries directly
+//! in your Rust process, powered by [chdb](https://github.com/chdb-io/chdb) (an
+//! embedded ClickHouse engine).
+//!
+//! ## Quick Start
+//!
+//! ```no_run
+//! use clickgraph_embedded::{Database, Connection, SystemConfig};
+//!
+//! let db = Database::new("schema.yaml", SystemConfig::default()).unwrap();
+//! let conn = Connection::new(&db).unwrap();
+//!
+//! let mut result = conn.query("MATCH (u:User) RETURN u.name LIMIT 5").unwrap();
+//! while let Some(row) = result.next() {
+//!     println!("{:?}", row);
+//! }
+//! ```
+//!
+//! ## Kuzu API Compatibility
+//!
+//! | Kuzu | ClickGraph Embedded |
+//! |------|---------------------|
+//! | `Database::new(path, config)` | `Database::new(schema_yaml, config)` |
+//! | `Connection::new(&db)` | `Connection::new(&db)` |
+//! | `conn.query(cypher)` | `conn.query(cypher)` |
+//! | `result.next()` -> `FlatTuple` | `result.next()` -> `Row` |
+//! | `row[0]` | `row[0]` |
+//!
+//! ## Key Differences vs Kuzu
+//!
+//! - **No data loading required**: ClickGraph reads Parquet/Iceberg/Delta directly.
+//! - **Read-only**: ClickGraph is an analytical engine; no `CREATE NODE TABLE` needed.
+//! - **YAML schema**: Graph mapping defined in YAML, not Cypher DDL.
+//! - **Synchronous API**: chdb FFI is blocking; async wrappers are in the server.
+
+pub mod connection;
+pub mod cypher_loader;
+pub mod database;
+pub mod error;
+pub mod export;
+pub mod graph_result;
+pub mod query_result;
+pub mod result_display;
+pub mod value;
+pub(crate) mod write_helpers;
+
+pub use clickgraph::sql_generator::SqlDialect;
+pub use connection::Connection;
+pub use cypher_loader::LoadStats;
+#[cfg(feature = "embedded")]
+pub use database::StorageCredentials;
+pub use database::{Database, RemoteConfig, SystemConfig};
+#[cfg(feature = "databricks")]
+pub use database::{DatabricksConfig, DatabricksSqlExecutor, OAuthM2MConfig};
+pub use error::EmbeddedError;
+pub use export::{ExportFormat, ExportOptions};
+pub use graph_result::{GraphEdge, GraphNode, GraphResult, GraphResultBuilder, StoreStats};
+pub use query_result::{QueryResult, Row};
+pub use value::Value;

@@ -1,0 +1,753 @@
+//! Bolt Protocol Message Types
+//!
+//! This module defines the message types for the Neo4j Bolt protocol v4.4.
+//! Messages are the primary communication unit between client and server.
+
+use serde_json::Value;
+use std::collections::HashMap;
+
+use super::errors::BoltError;
+use super::BOLT_VERSION_5_7;
+
+/// Bolt message signatures (message types)
+pub mod signatures {
+    // Connection management (Bolt 3+)
+    pub const HELLO: u8 = 0x01;
+    pub const GOODBYE: u8 = 0x02;
+
+    // Authentication (Bolt 5.1+)
+    pub const LOGON: u8 = 0x6A;
+    pub const LOGOFF: u8 = 0x6B;
+
+    // Session management
+    pub const RESET: u8 = 0x0F;
+    pub const RUN: u8 = 0x10;
+    pub const DISCARD: u8 = 0x2F;
+    pub const PULL: u8 = 0x3F;
+
+    // Transaction management (Bolt 3+)
+    pub const BEGIN: u8 = 0x11;
+    pub const COMMIT: u8 = 0x12;
+    pub const ROLLBACK: u8 = 0x13;
+
+    // Routing (Bolt 4.3+)
+    pub const ROUTE: u8 = 0x66;
+
+    // Response messages
+    pub const SUCCESS: u8 = 0x70;
+    pub const RECORD: u8 = 0x71;
+    pub const IGNORED: u8 = 0x7E;
+    pub const FAILURE: u8 = 0x7F;
+}
+
+/// Value types that can be sent in Bolt messages
+///
+/// BoltValue allows mixing regular JSON values with pre-encoded packstream
+/// bytes for graph objects (Node, Relationship) that need special encoding.
+#[derive(Debug, Clone)]
+pub enum BoltValue {
+    /// Regular JSON value (serialized via packstream)
+    Json(Value),
+    /// Pre-encoded packstream bytes for a Node structure
+    PackstreamBytes(Vec<u8>),
+}
+
+/// Bolt's Integer is 64-bit signed, as Neo4j's. A `UInt64` above `i64::MAX`
+/// has no Integer: it is sent as the string of its digits, which is exact
+/// (the encoder would wrap it to a negative Integer, or send a Float that
+/// has lost its low digits). HTTP JSON keeps the number.
+///
+/// A Float64 of 2^63 or more is written by ClickHouse as the digits of an
+/// integer (`9300000000000000000`), which JSON reads as a `u64`: it is sent
+/// as the string of the digits of its value too.
+pub(crate) fn integers_exact_in_bolt(value: &mut Value) {
+    exact_at(value, 0);
+}
+
+/// As deep as the packstream encoder goes (`graph_objects`): a deeper value
+/// is not a result a query makes.
+const EXACT_DEPTH: usize = 64;
+
+fn exact_at(value: &mut Value, depth: usize) {
+    match value {
+        Value::Number(n) if n.is_u64() && n.as_i64().is_none() => {
+            let digits = n.to_string();
+            *value = Value::String(digits);
+        }
+        Value::Array(items) if depth < EXACT_DEPTH => {
+            for item in items {
+                exact_at(item, depth + 1);
+            }
+        }
+        Value::Object(map) if depth < EXACT_DEPTH => {
+            for item in map.values_mut() {
+                exact_at(item, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl BoltValue {
+    /// Create a BoltValue from a JSON value
+    pub fn from_json(value: Value) -> Self {
+        BoltValue::Json(value)
+    }
+
+    /// Create a BoltValue from pre-encoded packstream bytes
+    pub fn from_packstream(bytes: Vec<u8>) -> Self {
+        BoltValue::PackstreamBytes(bytes)
+    }
+}
+
+/// Bolt message structure
+#[derive(Debug, Clone)]
+pub struct BoltMessage {
+    /// Message signature (type)
+    pub signature: u8,
+    /// Message fields
+    pub fields: Vec<BoltValue>,
+}
+
+impl BoltMessage {
+    /// Create a new Bolt message
+    pub fn new(signature: u8, fields: Vec<BoltValue>) -> Self {
+        BoltMessage { signature, fields }
+    }
+
+    /// Create a HELLO message
+    pub fn hello(user_agent: String, auth_token: HashMap<String, Value>) -> Self {
+        BoltMessage::new(
+            signatures::HELLO,
+            vec![
+                BoltValue::Json(Value::Object(serde_json::Map::from_iter([(
+                    "user_agent".to_string(),
+                    Value::String(user_agent),
+                )]))),
+                BoltValue::Json(Value::Object(serde_json::Map::from_iter(auth_token))),
+            ],
+        )
+    }
+
+    /// Create a GOODBYE message
+    pub fn goodbye() -> Self {
+        BoltMessage::new(signatures::GOODBYE, vec![])
+    }
+
+    /// Create a RESET message
+    pub fn reset() -> Self {
+        BoltMessage::new(signatures::RESET, vec![])
+    }
+
+    /// Create a RUN message
+    pub fn run(
+        query: String,
+        parameters: HashMap<String, Value>,
+        extra: Option<HashMap<String, Value>>,
+    ) -> Self {
+        let mut fields = vec![
+            BoltValue::Json(Value::String(query)),
+            BoltValue::Json(Value::Object(serde_json::Map::from_iter(parameters))),
+        ];
+
+        if let Some(extra_map) = extra {
+            fields.push(BoltValue::Json(Value::Object(serde_json::Map::from_iter(
+                extra_map,
+            ))));
+        }
+
+        BoltMessage::new(signatures::RUN, fields)
+    }
+
+    /// Create a PULL message
+    pub fn pull(n: i64, qid: Option<i64>) -> Self {
+        let mut extra = serde_json::Map::new();
+        extra.insert("n".to_string(), Value::Number(n.into()));
+
+        if let Some(qid) = qid {
+            extra.insert("qid".to_string(), Value::Number(qid.into()));
+        }
+
+        BoltMessage::new(
+            signatures::PULL,
+            vec![BoltValue::Json(Value::Object(extra))],
+        )
+    }
+
+    /// Create a DISCARD message
+    pub fn discard(n: i64, qid: Option<i64>) -> Self {
+        let mut extra = serde_json::Map::new();
+        extra.insert("n".to_string(), Value::Number(n.into()));
+
+        if let Some(qid) = qid {
+            extra.insert("qid".to_string(), Value::Number(qid.into()));
+        }
+
+        BoltMessage::new(
+            signatures::DISCARD,
+            vec![BoltValue::Json(Value::Object(extra))],
+        )
+    }
+
+    /// Create a BEGIN message
+    pub fn begin(extra: Option<HashMap<String, Value>>) -> Self {
+        let fields = if let Some(extra_map) = extra {
+            vec![BoltValue::Json(Value::Object(serde_json::Map::from_iter(
+                extra_map,
+            )))]
+        } else {
+            vec![BoltValue::Json(Value::Object(serde_json::Map::new()))]
+        };
+
+        BoltMessage::new(signatures::BEGIN, fields)
+    }
+
+    /// Create a COMMIT message
+    pub fn commit() -> Self {
+        BoltMessage::new(signatures::COMMIT, vec![])
+    }
+
+    /// Create a ROLLBACK message
+    pub fn rollback() -> Self {
+        BoltMessage::new(signatures::ROLLBACK, vec![])
+    }
+
+    /// Create a SUCCESS response message
+    pub fn success(metadata: HashMap<String, Value>) -> Self {
+        BoltMessage::new(
+            signatures::SUCCESS,
+            vec![BoltValue::Json(Value::Object(serde_json::Map::from_iter(
+                metadata,
+            )))],
+        )
+    }
+
+    /// Create a RECORD response message
+    /// Takes a vector of BoltValues that form the record fields
+    pub fn record(fields: Vec<BoltValue>) -> Self {
+        // RECORD message has structure: RECORD [field1, field2, ...]
+        // where the array is a single packstream LIST field
+
+        // We'll create a special marker to indicate this is a record array
+        // The serializer will handle encoding it as a proper packstream LIST
+        BoltMessage {
+            signature: signatures::RECORD,
+            fields, // Store fields directly - serializer will wrap in LIST
+        }
+    }
+
+    /// Create a FAILURE response message, shaped by the negotiated Bolt
+    /// version (#1368). On 5.7 and above it sends message, neo4j_code,
+    /// gql_status, description and diagnostic_record, with no legacy code
+    /// key (matching Neo4j 5.26). Below 5.7, or when the version is
+    /// unknown, it sends the legacy code and message only, so older
+    /// clients never receive keys Neo4j would not send them.
+    /// Metadata carries code/message-derived strings only.
+    pub fn failure(code: String, message: String, version: Option<u32>) -> Self {
+        if version.is_none_or(|v| v < BOLT_VERSION_5_7) {
+            let metadata = HashMap::from([
+                ("code".to_string(), Value::String(code)),
+                ("message".to_string(), Value::String(message)),
+            ]);
+            return BoltMessage::new(
+                signatures::FAILURE,
+                vec![BoltValue::Json(Value::Object(serde_json::Map::from_iter(
+                    metadata,
+                )))],
+            );
+        }
+        let diagnostic_record = serde_json::Map::from_iter([
+            (
+                "_classification".to_string(),
+                Value::String(BoltError::classification_for(&code).to_string()),
+            ),
+            ("OPERATION".to_string(), Value::String(String::new())),
+            ("OPERATION_CODE".to_string(), Value::String("0".to_string())),
+            ("CURRENT_SCHEMA".to_string(), Value::String("/".to_string())),
+        ]);
+        let metadata = HashMap::from([
+            ("message".to_string(), Value::String(message.clone())),
+            ("neo4j_code".to_string(), Value::String(code)),
+            (
+                "gql_status".to_string(),
+                Value::String(BoltError::GQLSTATUS_DEFAULT.to_string()),
+            ),
+            (
+                "description".to_string(),
+                Value::String(BoltError::status_description_for(&message)),
+            ),
+            (
+                "diagnostic_record".to_string(),
+                Value::Object(diagnostic_record),
+            ),
+        ]);
+
+        BoltMessage::new(
+            signatures::FAILURE,
+            vec![BoltValue::Json(Value::Object(serde_json::Map::from_iter(
+                metadata,
+            )))],
+        )
+    }
+    /// Create an IGNORED response message
+    pub fn ignored() -> Self {
+        BoltMessage::new(signatures::IGNORED, vec![])
+    }
+
+    /// Get the message type name for debugging
+    pub fn type_name(&self) -> &'static str {
+        match self.signature {
+            signatures::HELLO => "HELLO",
+            signatures::GOODBYE => "GOODBYE",
+            signatures::LOGON => "LOGON",
+            signatures::LOGOFF => "LOGOFF",
+            signatures::RESET => "RESET",
+            signatures::RUN => "RUN",
+            signatures::DISCARD => "DISCARD",
+            signatures::PULL => "PULL",
+            signatures::BEGIN => "BEGIN",
+            signatures::COMMIT => "COMMIT",
+            signatures::ROLLBACK => "ROLLBACK",
+            signatures::ROUTE => "ROUTE",
+            signatures::SUCCESS => "SUCCESS",
+            signatures::RECORD => "RECORD",
+            signatures::IGNORED => "IGNORED",
+            signatures::FAILURE => "FAILURE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Check if this is a request message
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self.signature,
+            signatures::HELLO
+                | signatures::GOODBYE
+                | signatures::LOGON
+                | signatures::LOGOFF
+                | signatures::RESET
+                | signatures::RUN
+                | signatures::DISCARD
+                | signatures::PULL
+                | signatures::BEGIN
+                | signatures::COMMIT
+                | signatures::ROLLBACK
+                | signatures::ROUTE
+        )
+    }
+
+    /// Check if this is a response message
+    pub fn is_response(&self) -> bool {
+        matches!(
+            self.signature,
+            signatures::SUCCESS | signatures::RECORD | signatures::IGNORED | signatures::FAILURE
+        )
+    }
+
+    /// Extract authentication token from HELLO message
+    /// Bolt 4.x can send either:
+    /// - 1 field: combined auth+metadata in `field[0]`
+    /// - 2 fields: metadata in `field[0]`, auth in `field[1]`
+    pub fn extract_auth_token(&self) -> Option<HashMap<String, Value>> {
+        if self.signature == signatures::HELLO {
+            if self.fields.len() >= 2 {
+                // Two-field format: field[1] is auth
+                if let BoltValue::Json(Value::Object(auth_map)) = &self.fields[1] {
+                    return Some(
+                        auth_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    );
+                }
+            } else if self.fields.len() == 1 {
+                // Single-field format: field[0] contains auth (and maybe metadata)
+                if let BoltValue::Json(Value::Object(auth_map)) = &self.fields[0] {
+                    return Some(
+                        auth_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract database name from HELLO message extra metadata
+    /// Neo4j 4.0+ clients can specify database using "db" or "database" field
+    /// Bolt 4.x can send either:
+    /// - 1 field: combined auth+metadata in `field[0]` (check for "db"/"database" key)
+    /// - 2 fields: metadata in `field[0]`, auth in `field[1]`
+    pub fn extract_database(&self) -> Option<String> {
+        if self.signature == signatures::HELLO && !self.fields.is_empty() {
+            if let BoltValue::Json(Value::Object(extra_map)) = &self.fields[0] {
+                // Check for "db" field (primary)
+                if let Some(Value::String(db)) = extra_map.get("db") {
+                    return Some(db.clone());
+                }
+                // Check for "database" field (alternative)
+                if let Some(Value::String(db)) = extra_map.get("database") {
+                    return Some(db.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract query from RUN message
+    pub fn extract_query(&self) -> Option<&str> {
+        if self.signature == signatures::RUN && !self.fields.is_empty() {
+            if let BoltValue::Json(Value::String(query)) = &self.fields[0] {
+                return Some(query);
+            }
+        }
+        None
+    }
+
+    /// Extract parameters from RUN message
+    pub fn extract_parameters(&self) -> Option<HashMap<String, Value>> {
+        if self.signature == signatures::RUN && self.fields.len() >= 2 {
+            if let BoltValue::Json(Value::Object(params_map)) = &self.fields[1] {
+                return Some(
+                    params_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+            }
+        }
+        None
+    }
+
+    /// Extract database from RUN message extra metadata (Bolt 4.x)
+    /// The RUN message can have: RUN query parameters extra_metadata
+    /// where extra_metadata may contain {"db": "database_name"}
+    pub fn extract_run_database(&self) -> Option<String> {
+        if self.signature == signatures::RUN && self.fields.len() >= 3 {
+            if let BoltValue::Json(Value::Object(extra_map)) = &self.fields[2] {
+                // Check for "db" field
+                if let Some(Value::String(db)) = extra_map.get("db") {
+                    return Some(db.clone());
+                }
+                // Check for "database" field (alternative)
+                if let Some(Value::String(db)) = extra_map.get("database") {
+                    return Some(db.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract tenant_id from RUN message extra metadata (Phase 2 Multi-tenancy)
+    /// The RUN message can have: RUN query parameters extra_metadata
+    /// where extra_metadata may contain {"tenant_id": "acme-corp"}
+    pub fn extract_run_tenant_id(&self) -> Option<String> {
+        if self.signature == signatures::RUN && self.fields.len() >= 3 {
+            if let BoltValue::Json(Value::Object(extra_map)) = &self.fields[2] {
+                if let Some(Value::String(tenant)) = extra_map.get("tenant_id") {
+                    return Some(tenant.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract role from RUN message extra metadata (Phase 2 RBAC)
+    /// Example: RUN "MATCH (n) RETURN n" {} {"db": "brahmand", "role": "admin_role"}
+    pub fn extract_run_role(&self) -> Option<String> {
+        if self.signature == signatures::RUN && self.fields.len() >= 3 {
+            if let BoltValue::Json(Value::Object(extra_map)) = &self.fields[2] {
+                if let Some(Value::String(role)) = extra_map.get("role") {
+                    return Some(role.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract view_parameters from RUN message extra metadata (Phase 2 Multi-tenancy)
+    /// Example: RUN "MATCH (n) RETURN n" {} {"db": "brahmand", "view_parameters": {"tenant_id": "acme", "region": "US"}}
+    pub fn extract_run_view_parameters(&self) -> Option<HashMap<String, String>> {
+        if self.signature == signatures::RUN && self.fields.len() >= 3 {
+            if let BoltValue::Json(Value::Object(extra_map)) = &self.fields[2] {
+                if let Some(Value::Object(view_params)) = extra_map.get("view_parameters") {
+                    // Convert HashMap<String, Value> to HashMap<String, String>
+                    let converted: HashMap<String, String> = view_params
+                        .iter()
+                        .map(|(k, v)| {
+                            let string_value = match v {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                _ => v.to_string(),
+                            };
+                            (k.clone(), string_value)
+                        })
+                        .collect();
+                    return Some(converted);
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract authentication token from LOGON message (Bolt 5.1+)
+    /// LOGON message has a single field: auth::Dictionary(scheme::String, ...)
+    pub fn extract_logon_auth(&self) -> Option<HashMap<String, Value>> {
+        if self.signature == signatures::LOGON && !self.fields.is_empty() {
+            if let BoltValue::Json(Value::Object(auth_map)) = &self.fields[0] {
+                return Some(
+                    auth_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+            }
+        }
+        None
+    }
+
+    /// Extract database from BEGIN message extra metadata
+    /// BEGIN message: BEGIN {extra::Dictionary(bookmarks, tx_timeout, tx_metadata, mode, db, ...)}
+    pub fn extract_begin_database(&self) -> Option<String> {
+        if self.signature == signatures::BEGIN && !self.fields.is_empty() {
+            if let BoltValue::Json(Value::Object(extra_map)) = &self.fields[0] {
+                // Check for "db" field
+                if let Some(Value::String(db)) = extra_map.get("db") {
+                    return Some(db.clone());
+                }
+                // Check for "database" field (alternative)
+                if let Some(Value::String(db)) = extra_map.get("database") {
+                    return Some(db.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Bolt message chunk for streaming large messages
+#[derive(Debug, Clone)]
+pub struct BoltChunk {
+    /// Chunk size (2 bytes, big-endian)
+    pub size: u16,
+    /// Chunk data
+    pub data: Vec<u8>,
+}
+
+impl BoltChunk {
+    /// Create a new chunk
+    pub fn new(data: Vec<u8>) -> Self {
+        BoltChunk {
+            size: data.len() as u16,
+            data,
+        }
+    }
+
+    /// Create an end-of-message marker chunk
+    pub fn end_marker() -> Self {
+        BoltChunk {
+            size: 0,
+            data: vec![],
+        }
+    }
+
+    /// Check if this is an end-of-message marker
+    pub fn is_end_marker(&self) -> bool {
+        self.size == 0 && self.data.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1516: only a `UInt64` above `i64::MAX` changes; the rest of a value
+    /// is as it was.
+    #[test]
+    fn integers_above_i64_are_their_digits() {
+        // A scalar field (the common case) takes no walk.
+        for (digits, text) in [
+            (u64::MAX, "18446744073709551615"),
+            (9223372036854775808u64, "9223372036854775808"),
+        ] {
+            let mut scalar = serde_json::json!(digits);
+            integers_exact_in_bolt(&mut scalar);
+            assert_eq!(scalar, serde_json::json!(text));
+        }
+        let mut scalar = serde_json::json!(i64::MAX);
+        integers_exact_in_bolt(&mut scalar);
+        assert_eq!(scalar, serde_json::json!(i64::MAX));
+        // A Float64 of 9.3e18 arrives as integer digits (ClickHouse prints
+        // it so): the digits of its value, not a Float (known limitation).
+        let mut float: Value = serde_json::from_str("9300000000000000000").unwrap();
+        integers_exact_in_bolt(&mut float);
+        assert_eq!(float, serde_json::json!("9300000000000000000"));
+        let mut value = serde_json::json!({
+            "big": u64::MAX,
+            "edge": 9223372036854775808u64,
+            "ok": [i64::MAX, i64::MIN, 0, 1.5, "x", null, true],
+            "deep": [[{ "v": 18446744073709551614u64 }]],
+        });
+        integers_exact_in_bolt(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "big": "18446744073709551615",
+                "edge": "9223372036854775808",
+                "ok": [i64::MAX, i64::MIN, 0, 1.5, "x", null, true],
+                "deep": [[{ "v": "18446744073709551614" }]],
+            })
+        );
+    }
+
+    #[test]
+    fn test_hello_message_creation() {
+        let auth_token = HashMap::from([
+            ("scheme".to_string(), Value::String("basic".to_string())),
+            ("principal".to_string(), Value::String("user".to_string())),
+            (
+                "credentials".to_string(),
+                Value::String("password".to_string()),
+            ),
+        ]);
+
+        let hello = BoltMessage::hello("Brahmand/1.0".to_string(), auth_token.clone());
+        assert_eq!(hello.signature, signatures::HELLO);
+        assert_eq!(hello.fields.len(), 2);
+
+        let extracted_auth = hello.extract_auth_token();
+        assert!(extracted_auth.is_some());
+        assert_eq!(extracted_auth.unwrap(), auth_token);
+    }
+
+    #[test]
+    fn test_run_message_creation() {
+        let parameters = HashMap::from([("name".to_string(), Value::String("Alice".to_string()))]);
+
+        let run = BoltMessage::run(
+            "MATCH (n:Person {name: $name}) RETURN n".to_string(),
+            parameters.clone(),
+            None,
+        );
+
+        assert_eq!(run.signature, signatures::RUN);
+        assert_eq!(
+            run.extract_query(),
+            Some("MATCH (n:Person {name: $name}) RETURN n")
+        );
+        assert_eq!(run.extract_parameters(), Some(parameters));
+    }
+
+    #[test]
+    fn test_message_type_identification() {
+        let success = BoltMessage::success(HashMap::new());
+        assert!(success.is_response());
+        assert!(!success.is_request());
+
+        let hello = BoltMessage::hello("Test".to_string(), HashMap::new());
+        assert!(hello.is_request());
+        assert!(!hello.is_response());
+    }
+
+    #[test]
+    fn test_failure_message() {
+        let failure = BoltMessage::failure(
+            "Neo.ClientError.Statement.SyntaxError".to_string(),
+            "Invalid syntax".to_string(),
+            None,
+        );
+
+        assert_eq!(failure.signature, signatures::FAILURE);
+        assert_eq!(failure.type_name(), "FAILURE");
+    }
+
+    #[test]
+    fn test_1368_failure_carries_gql_status_fields() {
+        // #1368: on Bolt 5.7+, FAILURE carries the GQL-status object and NO
+        // legacy `code` key (matching Neo4j 5.26 wire captures).
+        let failure = BoltMessage::failure(
+            "Neo.ClientError.Statement.SyntaxError".to_string(),
+            "Invalid syntax".to_string(),
+            Some(super::super::BOLT_VERSION_5_8),
+        );
+        let meta = match &failure.fields[0] {
+            BoltValue::Json(Value::Object(map)) => map,
+            other => panic!("FAILURE metadata must be a map, got {:?}", other),
+        };
+        assert!(
+            !meta.contains_key("code"),
+            "5.7+ FAILURE has no legacy code key"
+        );
+        assert_eq!(
+            meta.get("message").and_then(Value::as_str),
+            Some("Invalid syntax")
+        );
+        assert_eq!(
+            meta.get("neo4j_code").and_then(Value::as_str),
+            Some("Neo.ClientError.Statement.SyntaxError")
+        );
+        let gql_status = meta
+            .get("gql_status")
+            .and_then(Value::as_str)
+            .expect("gql_status present");
+        assert_eq!(gql_status.len(), 5, "GQLSTATUS is 5 chars: {gql_status}");
+        assert_eq!(
+            meta.get("description").and_then(Value::as_str),
+            Some("error: general processing exception - unexpected error. Invalid syntax")
+        );
+        let diag = meta
+            .get("diagnostic_record")
+            .and_then(Value::as_object)
+            .expect("diagnostic_record present");
+        assert_eq!(
+            diag.get("_classification").and_then(Value::as_str),
+            Some("CLIENT_ERROR")
+        );
+    }
+
+    #[test]
+    fn test_1368_failure_legacy_shape_below_57() {
+        // Below 5.7 (and unknown): legacy {code, message} only.
+        for version in [
+            None,
+            Some(super::super::BOLT_VERSION_5_6),
+            Some(super::super::BOLT_VERSION_4_4),
+        ] {
+            let failure = BoltMessage::failure(
+                "Neo.ClientError.Statement.SyntaxError".to_string(),
+                "Invalid syntax".to_string(),
+                version,
+            );
+            let meta = match &failure.fields[0] {
+                BoltValue::Json(Value::Object(map)) => map,
+                other => panic!("FAILURE metadata must be a map, got {:?}", other),
+            };
+            assert_eq!(
+                meta.get("code").and_then(Value::as_str),
+                Some("Neo.ClientError.Statement.SyntaxError")
+            );
+            assert_eq!(
+                meta.get("message").and_then(Value::as_str),
+                Some("Invalid syntax")
+            );
+            assert!(!meta.contains_key("neo4j_code"), "no GQL keys below 5.7");
+            assert!(!meta.contains_key("gql_status"), "no GQL keys below 5.7");
+        }
+    }
+
+    #[test]
+    fn test_bolt_chunk() {
+        let data = vec![1, 2, 3, 4];
+        let chunk = BoltChunk::new(data.clone());
+        assert_eq!(chunk.size, 4);
+        assert_eq!(chunk.data, data);
+        assert!(!chunk.is_end_marker());
+
+        let end_chunk = BoltChunk::end_marker();
+        assert_eq!(end_chunk.size, 0);
+        assert!(end_chunk.is_end_marker());
+    }
+}

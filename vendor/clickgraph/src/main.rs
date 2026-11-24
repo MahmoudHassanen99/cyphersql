@@ -1,0 +1,137 @@
+// jemalloc is only available on non-MSVC targets — Cargo.toml gates the dep
+// with `[target.'cfg(not(target_env = "msvc"))'.dependencies]`. Mirror the
+// guard here so Windows MSVC builds use the system allocator. Without this,
+// the default `jemalloc` feature is on for Windows but the crate isn't,
+// producing E0433 ("unresolved module `tikv_jemallocator`").
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+use clap::Parser;
+use clickgraph::{config, server};
+
+/// ClickGraph - A graph analysis layer for ClickHouse
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// HTTP server host address
+    #[arg(long, default_value = "0.0.0.0")]
+    http_host: String,
+
+    /// HTTP server port
+    #[arg(long, default_value_t = 7475)]
+    http_port: u16,
+
+    /// Disable Bolt protocol server (enabled by default)
+    #[arg(long)]
+    disable_bolt: bool,
+
+    /// Bolt server host address
+    #[arg(long, default_value = "0.0.0.0")]
+    bolt_host: String,
+
+    /// Bolt server port
+    #[arg(long, default_value_t = 7687)]
+    bolt_port: u16,
+
+    /// Maximum recursive CTE evaluation depth for variable-length paths
+    #[arg(long, default_value_t = 100)]
+    max_cte_depth: u32,
+
+    /// Validate YAML schema against ClickHouse tables on startup
+    #[arg(long)]
+    validate_schema: bool,
+
+    /// Run server in daemon mode (background process)
+    #[arg(long)]
+    daemon: bool,
+
+    /// Neo4j compatibility mode - masquerade as Neo4j server for tool compatibility
+    /// Useful for graph-notebook, Neodash, and other Neo4j ecosystem tools
+    #[arg(long)]
+    neo4j_compat_mode: bool,
+
+    /// Run in embedded mode using in-process chdb (no ClickHouse server required).
+    /// Requires the `embedded` Cargo feature.
+    #[arg(long)]
+    embedded: bool,
+
+    /// Route queries to a Databricks SQL Warehouse instead of ClickHouse.
+    /// Reads DATABRICKS_HOST, DATABRICKS_WAREHOUSE_ID, DATABRICKS_TOKEN
+    /// from the environment. Requires the `databricks` Cargo feature.
+    /// Mutually exclusive with --embedded.
+    #[arg(long)]
+    databricks: bool,
+
+    /// Per-query timeout in seconds (0 = no timeout)
+    #[arg(long, default_value_t = 300)]
+    query_timeout_secs: u64,
+
+    /// Maximum HTTP request body size in bytes
+    #[arg(long, default_value_t = 1_048_576)]
+    max_request_body_bytes: usize,
+
+    /// Maximum concurrent queries (0 = unlimited)
+    #[arg(long, default_value_t = 64)]
+    max_concurrent_queries: usize,
+
+    /// Log level (overridden by RUST_LOG env var)
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+impl From<Cli> for config::CliConfig {
+    fn from(cli: Cli) -> Self {
+        config::CliConfig {
+            http_host: cli.http_host,
+            http_port: cli.http_port,
+            bolt_host: cli.bolt_host,
+            bolt_port: cli.bolt_port,
+            bolt_enabled: !cli.disable_bolt, // Invert the flag
+            max_cte_depth: cli.max_cte_depth,
+            validate_schema: cli.validate_schema,
+            daemon: cli.daemon,
+            neo4j_compat_mode: cli.neo4j_compat_mode,
+            embedded: cli.embedded,
+            databricks: cli.databricks,
+            query_timeout_secs: cli.query_timeout_secs,
+            max_request_body_bytes: cli.max_request_body_bytes,
+            max_concurrent_queries: cli.max_concurrent_queries,
+        }
+    }
+}
+
+fn main() {
+    // Build tokio runtime with larger worker thread stacks to handle
+    // deep recursive logical plan traversal (e.g., bidirectional + WITH chains).
+    // Default 128 MB covers all known query patterns; override via CLICKGRAPH_THREAD_STACK_MB.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(clickgraph::translate::translation_stack_bytes())
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
+    let cli = Cli::parse();
+
+    // Initialize logger - use --log-level value as default, RUST_LOG env var overrides
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&cli.log_level))
+        .init();
+
+    println!("\nClickGraph v{}\n", env!("CARGO_PKG_VERSION"));
+
+    // Create configuration from CLI args
+    let cli_config: config::CliConfig = cli.into();
+    let config = match config::ServerConfig::from_cli(cli_config) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    server::run_with_config(config).await;
+}

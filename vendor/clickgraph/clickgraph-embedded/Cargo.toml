@@ -1,0 +1,34 @@
+[package]
+name = "clickgraph-embedded"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Embedded graph query engine (ClickGraph with in-process chdb)"
+repository = "https://github.com/your-org/clickgraph"
+license = "Apache-2.0"
+
+[features]
+default = []
+embedded = ["clickgraph/embedded"]
+# DeltaGraph Phase 2.2b: expose Database::new_databricks(). Forwards
+# to the upstream clickgraph crate's `databricks` feature, which gates
+# the executor + reqwest dep.
+databricks = ["clickgraph/databricks"]
+
+[dependencies]
+clickgraph = { path = "..", default-features = false }
+thiserror = "2.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "4.0"
+# Mock HTTP server for the Databricks end-to-end test. Mirrors the
+# pattern in the upstream clickgraph crate; the test itself is gated
+# on `#[cfg(feature = "databricks")]`.
+wiremock = "0.6"

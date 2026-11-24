@@ -1,0 +1,1 @@
+parse error: Parsing Failure: OpenCypherParsingError { errors: [("MATCH (u:User) RETURN count(u)", "Unexpected tokens after query"), ("MATCH (u:User) RETURN count(u)", "Unparsed input")] }

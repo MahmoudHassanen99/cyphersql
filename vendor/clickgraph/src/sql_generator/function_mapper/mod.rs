@@ -1,0 +1,646 @@
+//! Function-name mapping per dialect.
+//!
+//! `render_plan` and helpers construct synthetic SQL expressions that
+//! reference function names directly (e.g. `groupArray`, `arrayElement`).
+//! This module funnels those names through a `FunctionMapper` trait so
+//! Phase 1 can swap in a Databricks/Spark SQL implementation without
+//! grepping for string literals across the planner.
+//!
+//! ## Status
+//! Two mappers ship: `ClickhouseFunctionMapper` (production) and
+//! `DatabricksFunctionMapper` (Phase 1.0 spike — exercised by unit tests
+//! but not yet reached from emission). `current_function_mapper()`
+//! still returns ClickHouse unconditionally because the dialect isn't
+//! plumbed through call sites yet; use [`for_dialect`] when you need
+//! an explicit one. Phase 1.1 will route call sites through
+//! [`for_dialect`] with the active dialect.
+
+pub(crate) mod clickhouse;
+pub(crate) mod databricks;
+
+/// Returns the dialect-specific name for built-in SQL functions used by
+/// `render_plan` and downstream emission helpers.
+///
+/// All methods return `&'static str`. IR construction sites use the bare
+/// name (it's later wrapped as `name(args)` by the SQL emitter); raw
+/// SQL emission sites compose `format!("{name}({args})", ...)` directly.
+/// This shape works for ClickHouse function-call syntax and for the
+/// function-call cast aliases Spark/Databricks also accepts (`string(x)`,
+/// `bigint(x)`, etc.). If a dialect ever needs full `CAST(x AS T)` syntax
+/// or a structural rewrite (e.g. `arrayJoin` → `LATERAL VIEW explode`),
+/// that becomes a dedicated method then — not a global redesign.
+pub(crate) trait FunctionMapper: Send + Sync {
+    /// 1-based array indexing that yields NULL when the index is out of
+    /// bounds (either end) — the openCypher contract for `list[i]`
+    /// (Neo4j returns `null`, not a type default). CH `arrayElement`/`arr[i]`
+    /// silently returns the element type's default (`0`, `''`) for an
+    /// out-of-range index, so CH must use `arrayElementOrNull(arr, i)`.
+    /// Spark's `element_at(arr, i)` already returns NULL on out-of-bounds
+    /// (non-ANSI default), so Databricks keeps `element_at` — byte-identical
+    /// to the plain `array_element` accessor. `arr` and `idx` are
+    /// pre-rendered SQL fragments (the caller applies the 1-based offset).
+    fn array_element_or_null(&self, arr: &str, idx: &str) -> String;
+
+    /// Conditional count. CH: `countIf`. Spark: `count_if` (DBR 13.1+).
+    fn count_if(&self) -> &'static str;
+
+    /// Any-value aggregate for deduplicated own-table joins: CH `any`,
+    /// Spark `any_value`. Used by the denormalized-endpoint own-table LEFT
+    /// JOIN (`GROUP BY node_id, any(col)`) so a node table with duplicated
+    /// node_ids still yields exactly one row per id.
+    fn any(&self) -> &'static str;
+
+    /// An aggregate of any of the values `{0}` that are not NULL (NULL when
+    /// all are): CH `any` skips a `Nullable`'s NULLs but not a `Variant`'s;
+    /// Spark's `any_value` needs its `ignoreNulls` argument. `is_complex`: the
+    /// value is an `Array` / `Map` / `Tuple` / `Dynamic`, which ClickHouse 25.8
+    /// cannot put inside `Nullable` (`anyIfOrNull` returns one, #1490); only
+    /// ClickHouse acts on it.
+    fn any_non_null(&self, value: &str, _is_complex: bool) -> String {
+        format!("{}({value})", self.any())
+    }
+
+    /// An aggregate of the one value the non-NULL values `{0}` of a group
+    /// hold (NULL when all are NULL), and an error with the text `message`
+    /// when they hold several, as Cypher values (`CypherUnion::distinct_key`,
+    /// DISTINCT's equality): a node's property, read from the rows of its id
+    /// (#531). The value is `any_non_null`'s, of its type. `None`: the
+    /// dialect has no distinct key.
+    fn one_value(&self, value: &str, message: &str) -> Option<String>;
+
+    /// The number of elements of the list `{0}`, NULL when it is NULL. CH
+    /// `length` (of an array or a string alike).
+    fn list_size(&self, list: &str) -> String {
+        format!("length({list})")
+    }
+
+    /// The clause that repeats each row once per element of the lists
+    /// `(list, alias, position alias)`, read in step (the n-th row reads
+    /// each list's n-th element), each element's position (increasing along
+    /// its list) where asked: the lowering's UNWIND (`Lowerer::unwind`,
+    /// printed by `render_plan_to_sql_plain`). CH `ARRAY JOIN l AS a,
+    /// arrayEnumerate(l) AS p`.
+    fn array_join_clause(&self, lists: &[(String, String, Option<String>)]) -> String {
+        let mut items = Vec::new();
+        for (l, a, p) in lists {
+            items.push(format!("{l} AS {a}"));
+            if let Some(p) = p {
+                items.push(format!("arrayEnumerate({l}) AS {p}"));
+            }
+        }
+        format!("ARRAY JOIN {}\n", items.join(", "))
+    }
+
+    /// Do two arrays share any element? CH: `hasAny(a, b)`. Databricks/Spark:
+    /// `arrays_overlap(a, b)`. Both return a boolean-ish value usable directly
+    /// under `NOT`. Used for VLP cross-segment relationship-uniqueness (#544).
+    fn arrays_overlap(&self) -> &'static str;
+
+    /// Cast to 64-bit signed integer. CH: `toInt64`. Spark: `bigint`
+    /// (works as a function-call cast alias).
+    fn cast_int64(&self) -> &'static str;
+
+    /// Cast to 64-bit float. CH: `toFloat64`. Spark: `double`
+    /// (function-call cast alias).
+    fn cast_float64(&self) -> &'static str;
+
+    /// Parse-or-null cast to a 64-bit integer, for Cypher `toInteger(<string>)`,
+    /// which returns NULL (not an error) when the string is not a valid number
+    /// (#880). `expr` is a pre-rendered SQL fragment.
+    ///
+    /// ClickHouse `toInt64` THROWS (Code 6) on an unparseable string, so the CH
+    /// impl must use `toInt64OrNull({expr})` — but that variant only accepts a
+    /// String argument, so the caller must route here ONLY when `expr` is known
+    /// to be string-typed (a string literal, `toString(...)`, or a declared
+    /// string column; see the render-site type classifier). Spark's `bigint(...)`
+    /// already returns NULL on parse failure, so the Databricks impl returns the
+    /// plain cast — byte-identical to `cast_int64`.
+    fn cast_int64_or_null(&self, expr: &str) -> String;
+
+    /// Parse-or-null cast to a 64-bit float, for Cypher `toFloat(<string>)`
+    /// (#880). CH: `toFloat64OrNull({expr})` (String arg only — caller gates on
+    /// string type); Spark: plain `double({expr})` (already null-on-failure). See
+    /// [`cast_int64_or_null`](Self::cast_int64_or_null).
+    fn cast_float64_or_null(&self, expr: &str) -> String;
+
+    /// Cast to string. CH: `toString`. Spark: `string` (function-call alias).
+    fn cast_string(&self) -> &'static str;
+
+    /// A date or a time `expr` as a text equal to another's exactly where
+    /// `=` holds of them (ELEMENT_IDENTITY.md I2, a `Date` id met by times of
+    /// several zones): its text, in its own zone, with a midnight time of day
+    /// dropped (`=` reads a `Date` at midnight in each time's zone). By its
+    /// text, so every year a type holds.
+    fn day_or_time_text(&self, expr: &str) -> String;
+
+    /// The text `expr` with every occurrence of the text `search` replaced by
+    /// `replacement` (all three SQL). CH: `replaceAll`; Spark: `replace`.
+    fn replace_text(&self, expr: &str, search: &str, replacement: &str) -> String;
+
+    /// Render Cypher `toString(<float>)` so a whole-valued float keeps its
+    /// trailing `.0` (#1055). Neo4j preserves the Integer/Float distinction in
+    /// the string form: `toString(3.0)` → `"3.0"`, `toString(3)` → `"3"`.
+    ///
+    /// Applied ONLY when the render-site classifier proves the argument is
+    /// `RenderType::Float` (a float literal, `toFloat(...)`, or a declared Float
+    /// column). Two roots converge here: whole-valued float *literals* render as
+    /// integer SQL literals (`3.0` → `3`), and CH `toString(toFloat64(3))` itself
+    /// returns `"3"` — both drop the decimal. A `Num`/`Integer`/unknown arg never
+    /// reaches this (would wrongly turn `toString(abs(-3))` into `"3.0"`), so the
+    /// plain cast is unchanged for every non-Float case. `expr` is a pre-rendered
+    /// SQL fragment.
+    fn to_string_float(&self, expr: &str) -> String;
+
+    /// `toString()` of a datetime: the ISO-8601 `T` between the date and the
+    /// time (Neo4j `1984-10-11T12:31:14`), where the dialect's stringifier
+    /// spells a space (`1984-10-11 12:31:14`, #1068). `expr` is pre-rendered
+    /// SQL of an arg the classifier proved `RenderType::DateTime` — a `Date`
+    /// (no time-of-day to separate) never reaches this.
+    fn to_string_datetime(&self, expr: &str) -> String;
+
+    /// Cast a boolean-typed expression to the dialect's native boolean so it
+    /// surfaces on the wire as `true`/`false` rather than `1`/`0` (#1057).
+    ///
+    /// Applied ONLY at projection emit to expressions the render-site classifier
+    /// proves `RenderType::Boolean` (comparisons, `IN`, `STARTS WITH`, `IS NULL`,
+    /// boolean scalar fns, `EXISTS`), whose ClickHouse result type is `UInt8`
+    /// (`3 > 2` → `1`). Cypher requires a boolean there; Neo4j returns
+    /// `true`/`false`.
+    ///
+    /// NULL-safety is mandatory: `x IS NULL`-adjacent comparisons like
+    /// `n.missing > 2` must stay `null`, and CH `CAST(NULL > 2 AS Bool)` THROWS
+    /// (Code 70, non-nullable). CH therefore uses `Nullable(Bool)`, which
+    /// preserves `null` and is otherwise physically `UInt8` — transparent to
+    /// every downstream op (`= 1`, arithmetic, `sum`, `AND`, GROUP/ORDER/DISTINCT
+    /// all identical), so only the wire display changes. Spark `BOOLEAN` is
+    /// already nullable. `expr` is a pre-rendered SQL fragment.
+    fn cast_bool(&self, expr: &str) -> String;
+
+    /// `a` equals `b`, NULL equal to NULL, as one condition a hash join can
+    /// key on (`a = b OR (a IS NULL AND b IS NULL)` is not, in a join of
+    /// three or more relations). `a` and `b` are pre-rendered SQL.
+    fn null_safe_equal(&self, a: &str, b: &str) -> String;
+
+    /// Cypher `a XOR b`: true when exactly one is true, NULL when either is
+    /// NULL. `a` and `b` are pre-rendered SQL booleans.
+    fn logical_xor(&self, a: &str, b: &str) -> String;
+
+    /// Concatenate two arrays. CH: `arrayConcat`. Spark: `concat`
+    /// (overloaded for arrays).
+    fn array_concat(&self) -> &'static str;
+
+    /// Test array membership. CH: `has`. Spark: `array_contains`.
+    /// Used for cycle detection in VLP recursive CTEs.
+    fn array_contains(&self) -> &'static str;
+
+    /// Cypher `value IN list` (`negated`: `NOT IN`) for a list that is an
+    /// expression, not a list of items; `None` when the dialect's `IN`
+    /// takes it as it is (ClickHouse's `x IN arr`). Spark's `IN` takes a
+    /// parenthesized list or a subquery only.
+    fn in_list_expression(&self, _value: &str, _list: &str, _negated: bool) -> Option<String> {
+        None
+    }
+
+    /// Integer (truncate-toward-zero) division. CH: `intDiv`. Spark: `div`.
+    /// Both match Neo4j's `int / int` (`intDiv(-7, 2) = -3`, toward zero, not
+    /// floor). Used to render Cypher integer-literal division, whose default
+    /// `/` is float division on both engines.
+    fn integer_division(&self) -> &'static str;
+
+    /// Render the Cypher exponentiation operator `a ^ b`. Both ClickHouse and
+    /// Databricks/Spark accept the ANSI `POWER(base, exp)` call form; NEITHER
+    /// has an infix `^` operator (ClickHouse errors with Code 62 SYNTAX_ERROR
+    /// on a bare `^`). `base`/`exp` are pre-rendered SQL fragments. Keeping the
+    /// spelling in the dialect layer satisfies Rule #7; the shared default is
+    /// correct for both shipped dialects.
+    fn power(&self, base: &str, exp: &str) -> String {
+        format!("POWER({}, {})", base, exp)
+    }
+
+    /// Empty `Array(String)` literal with explicit cast. CH:
+    /// `CAST([] AS Array(String))`. Spark: `CAST(array() AS ARRAY<STRING>)`.
+    /// Returned as a full snippet (not a function name) because the array
+    /// literal syntax and the element-type spelling both diverge.
+    fn empty_string_array_cast(&self) -> &'static str;
+
+    /// Array literal with the given comma-separated elements. CH:
+    /// `[a, b, c]`. Spark: `array(a, b, c)`. Empty input (`""`) yields
+    /// `[]` / `array()` respectively. Returned as `String` because the
+    /// elements aren't known to the trait — callers join their own
+    /// rendered expressions and pass them here.
+    fn array_literal(&self, elems: &str) -> String;
+
+    /// A list of literals of no common type (`literal_list`), where the
+    /// dialect cannot type the literal spelling: `None` where it can.
+    fn mixed_array_literal(&self, _elems: &str) -> Option<String> {
+        None
+    }
+
+    /// Tuple / struct constructor for composite-key comparisons (e.g.,
+    /// `tuple(a, b) = tuple(c, d)`). CH: `tuple`. Spark: `struct`.
+    /// Both spellings preserve element-wise ordering and equality.
+    fn tuple_constructor(&self) -> &'static str;
+
+    /// A lambda over `params` with body `body` (SQL), as a higher-order
+    /// function's argument (`ch.arrayMap(x -> x * 2, l)`, P-4c S11n). CH and
+    /// Spark: `x -> body`, `(x, y) -> body`.
+    fn lambda(&self, params: &[String], body: &str) -> String {
+        match params {
+            [one] => format!("{one} -> {body}"),
+            _ => format!("({}) -> {body}", params.join(", ")),
+        }
+    }
+
+    /// The modifier reading a table's merged rows (`use_final`), after its
+    /// alias in SQL the lowering writes as text. CH: ` FINAL`. A dialect
+    /// without it reads the table as it is: empty.
+    fn final_modifier(&self) -> &'static str {
+        ""
+    }
+
+    /// Settings that make a subquery's `SELECT *` read every column a
+    /// property can map to. CH: ALIAS and MATERIALIZED columns, which `*`
+    /// leaves out by default. Empty where `*` reads them all.
+    fn all_columns_settings(&self) -> &'static str {
+        ""
+    }
+
+    /// Quote a column alias / aliased identifier. Used for both `AS`
+    /// clauses and references to those aliases elsewhere in the query
+    /// (e.g., GROUP BY, aggregate args after an inner-query rewrite).
+    /// CH: `"name"` (also accepts backticks but the existing pipeline
+    /// emits double quotes here historically). Spark: `` `name` `` —
+    /// Spark parses `"name"` as a string literal, so backticks are
+    /// mandatory. Each impl is responsible for escaping its own
+    /// delimiter inside `name` (CH doubles `"`, Spark doubles `` ` ``).
+    /// The bare `quote_identifier` helper in `common.rs` routes here for
+    /// special-char identifiers, so both stay dialect-consistent (CH `"x"`,
+    /// Spark `` `x` ``); it only skips this for plain identifiers, returning
+    /// them bare.
+    fn quote_alias(&self, name: &str) -> String;
+
+    /// Array slice from a 1-based `offset`. CH `arraySlice(arr, offset[, length])`
+    /// accepts a 2-arg "rest from offset" form; Spark `slice(arr, start, length)`
+    /// REQUIRES a length, so the `None` case computes `size(arr) - offset + 1`.
+    /// `offset`/`length` are pre-rendered SQL fragments.
+    fn array_slice(&self, arr: &str, offset: &str, length: Option<&str>) -> String;
+
+    /// Element count of an array expression, used to normalize Cypher's
+    /// negative list-range bounds (`list[-2..]`) into the non-negative
+    /// offset/length that `array_slice` needs. The two dialects diverge:
+    /// ClickHouse `length(arr)` is overloaded for arrays AND strings, whereas
+    /// Spark reserves `length` for strings/binary and requires `size(arr)` for
+    /// arrays — so the spelling must live in the dialect layer (Rule #7).
+    /// `arr` is a pre-rendered SQL fragment.
+    fn array_length(&self, arr: &str) -> String;
+
+    /// Convert an epoch-millis `BIGINT` expression to a timestamp value, so
+    /// interval arithmetic can run on it. CH: `fromUnixTimestamp64Milli(expr)`
+    /// (-> DateTime64). Spark: `timestamp_millis(expr)` (-> TIMESTAMP). The
+    /// inverse of [`timestamp_to_epoch_millis`](Self::timestamp_to_epoch_millis).
+    fn epoch_millis_to_timestamp(&self, expr: &str) -> String;
+
+    /// Convert a timestamp expression back to an epoch-millis `BIGINT`, so the
+    /// result of interval arithmetic matches the stored column type. CH:
+    /// `toUnixTimestamp64Milli(expr)`. Spark: `unix_millis(expr)`.
+    fn timestamp_to_epoch_millis(&self, expr: &str) -> String;
+
+    /// Explicit `NULLS …` suffix (including its leading space) to append to a
+    /// user-facing `ORDER BY <expr> ASC|DESC` term so the row ordering matches
+    /// Neo4j (#1065 — the general normalization pass #556 deferred).
+    ///
+    /// Cypher fixes NULL placement by sort direction: **NULLs sort last on
+    /// `ASC`, first on `DESC`** (no `NULLS FIRST/LAST` keyword exists in
+    /// Cypher — it is implicit). A bare emitted `ORDER BY … ASC|DESC` instead
+    /// inherits each backend's own default, which diverges from Neo4j on 3 of
+    /// the 4 (dialect × direction) cells:
+    ///
+    /// | dir  | Neo4j       | ClickHouse | Spark/Databricks |
+    /// |------|-------------|------------|------------------|
+    /// | ASC  | nulls last  | last ✓     | first ✗          |
+    /// | DESC | nulls first | last ✗     | last ✗           |
+    ///
+    /// Each dialect returns the MINIMAL suffix needed to reach Neo4j semantics
+    /// from its own default, so a direction already correct stays bare (no
+    /// golden churn): ClickHouse `ASC` → `""`, everything else explicit. Both
+    /// dialects support the `NULLS FIRST/LAST` syntax (CH `DESC NULLS FIRST`
+    /// verified live). `descending` is `true` for `DESC`, `false` for `ASC`.
+    fn order_by_nulls_clause(&self, descending: bool) -> &'static str;
+
+    /// How a single quote INSIDE a single-quoted string literal is spelled (#1217).
+    ///
+    /// ClickHouse reads a doubled quote (`''`) as one quote. Spark/Databricks parses `''` as two
+    /// ADJACENT literals (`'it''s'` → `its`, silently wrong); its documented escape is `\'`.
+    fn string_literal_quote_escape(&self) -> &'static str;
+
+    /// Render an openCypher percentile aggregate — `percentileCont(expr, p)` or
+    /// `percentileDisc(expr, p)` — honoring the percentile argument `p` (#639).
+    ///
+    /// The two dialects and the two variants diverge on call SHAPE, so this
+    /// can't be a registry name-swap:
+    /// - `percentileCont` (continuous, linear interpolation): CH
+    ///   `quantileExactInclusive(p)(expr)` (parametric aggregate — the
+    ///   percentile sits in a leading parameter list); Spark `percentile(expr, p)`.
+    /// - `percentileDisc` (discrete, nearest actual value): NO ClickHouse or
+    ///   Spark builtin reproduces Neo4j's index convention — `quantileExact`,
+    ///   `quantileExactLow`/`High` and Spark's `percentile_disc` all round
+    ///   differently (e.g. [10,20,30,40]@0.25 → Neo4j 10 but `quantileExact` 20).
+    ///   So both dialects build the exact index by hand over the sorted value
+    ///   array at Neo4j's 1-based index `greatest(1, ceil(p * n))` (n = non-null
+    ///   count): CH `arrayElement(arraySort(groupArray(expr)), …)`, Spark
+    ///   `element_at(array_sort(collect_list(expr)), …)`.
+    ///
+    /// Verified exact against the Neo4j reference algorithm: percentileCont
+    /// (`PercentileContFunction`) and percentileDisc (`PercentileDiscFunction`,
+    /// `floatIdx = p*count` with the integer-boundary `-1` correction) — 0
+    /// mismatches across n=1..40 × p=0.05..0.95, plus live corpus checks.
+    ///
+    /// `expr` and `percentile` are pre-rendered SQL fragments; `continuous`
+    /// selects Cont vs Disc.
+    fn percentile_aggregate(&self, expr: &str, percentile: &str, continuous: bool) -> String;
+
+    /// How the dialect spells a shortest-path search
+    /// (`bound_plan::lower::path::shortest_ctes`, EXPLICIT_SCOPE §4.11), or
+    /// `None` when its recursive CTEs are not known to evaluate it: each
+    /// step reads only the rows of the step before, a step of several
+    /// `UNION ALL` arms reads the CTE in an `IN` subquery and aggregates,
+    /// and `ARRAY JOIN` repeats a row.
+    fn shortest_path_search(&self) -> Option<ShortestPathSearch>;
+
+    /// How the dialect spells a node, relationship or path as a value
+    /// (`bound_plan::lower::value`, EXPLICIT_SCOPE §4.11, S6c), or `None`
+    /// when it has no type that holds elements of different labels and
+    /// kinds in one list.
+    fn graph_values(&self) -> Option<GraphValues>;
+
+    /// One property of the arms of a union whose arms are different tables
+    /// (the nodes of several labels or the relationships of several types,
+    /// `bound_plan::lower::Lowerer::label_union` / `rel_union`), held in one
+    /// column per definition (`columns`: each NULL outside its definition's
+    /// rows) so that each keeps its own type: their value, failing the query
+    /// when the definitions' types differ beyond what changes no value
+    /// (integer widths, string representations, nullability) instead of
+    /// converting them; `None` when the dialect cannot (the union is then not
+    /// lowered).
+    fn one_type_guard(&self, columns: &[String]) -> Option<String>;
+
+    /// How the dialect spells UNWIND (`bound_plan::lower::Lowerer::unwind`,
+    /// EXPLICIT_SCOPE §4.4, S7c), or `None` when the lowering does not emit
+    /// it (the query stays on the legacy path).
+    fn unwind(&self) -> Option<Unwind>;
+
+    /// How the dialect spells a Cypher UNION's columns
+    /// (`bound_plan::lower::union`, EXPLICIT_SCOPE §4.4, S7d), or `None` when
+    /// the lowering does not emit it (the query stays on the legacy path).
+    fn cypher_union(&self) -> Option<CypherUnion>;
+
+    /// How the dialect spells list comprehensions and an ordered `collect()`
+    /// (`bound_plan::lower`, EXPLICIT_SCOPE §4.4, S7e1), or `None` when the
+    /// lowering does not emit them (the query stays on the legacy path).
+    fn lists(&self) -> Option<Lists>;
+}
+
+/// The dialect's parts of a graph value ([`FunctionMapper::graph_values`]).
+/// An element is an object of entries whose values differ in type (Neo4j's
+/// JSON form: `elementId`, `labels`, `properties`, …); a list or a path is a
+/// list of such objects, whatever their labels and kinds. Every argument is
+/// SQL; an object key is an SQL string literal.
+pub(crate) struct GraphValues {
+    /// An object of `(key, value)` entries.
+    pub object: fn(&[(String, String)]) -> String,
+    /// An object of the entries whose value is not NULL.
+    pub object_without_nulls: fn(&[(String, String)]) -> String,
+    /// A list of objects (possibly none).
+    pub list: fn(&[String]) -> String,
+    /// The lists one after another.
+    pub concat: fn(&[String]) -> String,
+    /// A list without its first element.
+    pub tail: fn(&str) -> String,
+    pub reverse: fn(&str) -> String,
+    /// `[r1, n1, r2, n2, …]` from the lists `[r1, r2, …]` and `[n1, n2, …]`
+    /// of one length.
+    pub interleave: fn(&str, &str) -> String,
+    /// The number of elements of a list.
+    pub length: fn(&str) -> String,
+    /// A string of the parts (SQL strings) one after another.
+    pub text: fn(&[String]) -> String,
+    /// A scalar as a string.
+    pub to_text: fn(&str) -> String,
+    /// The values (SQL, two or more: a composite identity's columns) as one
+    /// string that tells any two lists of values apart, however their parts
+    /// read (`('B|1', '2')` is not `('B', '1|2')`).
+    pub tuple_text: fn(&[String]) -> String,
+    /// The tuple value `{0}` of `{1}` parts as a string, the same as
+    /// `tuple_text` of its parts: the two spell one identity alike.
+    pub tuple_value_text: fn(&str, usize) -> String,
+    /// NULL when the condition holds, else the value (an object or a list).
+    pub null_if: fn(&str, &str) -> String,
+    /// Any one of a group's values (they are all equal).
+    pub any: fn(&str) -> String,
+    /// A list of texts (possibly none).
+    pub texts: fn(&[String]) -> String,
+    /// The texts of a list's elements, each after the text `prefix`; an
+    /// element of `arity` parts (`{2}`, more than one: a tuple) as
+    /// `tuple_value_text` spells it.
+    pub prefixed_texts: fn(&str, &str, usize) -> String,
+    /// An empty list when the condition holds, else the list.
+    pub empty_if: fn(&str, &str) -> String,
+}
+
+/// The dialect's parts of UNWIND ([`FunctionMapper::unwind`]). A SELECT
+/// repeats each of its rows once per element of a list with `ARRAY JOIN
+/// <list> AS <element>[, <list2> AS <element2>]` (the lists of one row have
+/// one length and are read in step), placed after its joins; a list of no
+/// elements drops the row.
+pub(crate) struct Unwind {
+    /// A table of one row: the FROM of a SELECT that reads no table.
+    pub one_row: &'static str,
+    /// The list `{0}`, failing the query when it is not a list (ARRAY JOIN
+    /// would repeat a row once per entry of a map).
+    pub list_only: fn(&str) -> String,
+    /// The number of a row in the order of the keys `{0}` (`ORDER BY` text).
+    pub row_number: fn(&str) -> String,
+    /// The number of a row, the rows in no particular order.
+    pub any_row_number: &'static str,
+    /// Whether the value `{0}` is NULL, as a function call (no operator
+    /// precedence to get wrong: `NOT a IS NULL` is `NOT (a IS NULL)`).
+    pub is_null: fn(&str) -> String,
+    /// The list of the value `{0}`, of nothing when it is NULL.
+    pub value_list: fn(&str) -> String,
+}
+
+/// The dialect's parts of a Cypher UNION ([`FunctionMapper::cypher_union`]).
+/// The arms are one SQL `UNION ALL`; a column of values may hold values of
+/// different types in different arms (or rows), as in Cypher, so it must not
+/// be converted to one type: ClickHouse's common type of `Bool` and an
+/// integer turns `5` into `true`, or `true` into `1`.
+pub(crate) struct CypherUnion {
+    /// The value `{0}` in a column that keeps every value's own type.
+    pub any_type: fn(&str) -> String,
+    /// A key of the value `{0}` (of either kind of column) that is equal
+    /// for two values exactly when Cypher's DISTINCT takes them as equal:
+    /// `1` and `1.0` are, `1` and `true` or `'1'` are not.
+    pub distinct_key: fn(&str) -> String,
+    /// [`Self::distinct_key`] of a value that is known to be a scalar (never a
+    /// list or a map): no element to look at, so the key a dialect needs for
+    /// a container is not paid for (ClickHouse plans it for every column of
+    /// a `UNION`: ~20 ms, ~165 ms on 25.8).
+    pub scalar_key: fn(&str) -> String,
+    /// A key of the value `{0}` of any type (a node's or relationship's
+    /// tuple too) that sorts: rows tied on such keys of all their columns
+    /// are alike, so which a SKIP / LIMIT takes, or how they are numbered,
+    /// is the same on every evaluation (#1395).
+    pub order_key: fn(&str) -> String,
+    /// An aggregate: any one of a group's values of `{0}`.
+    pub any: fn(&str) -> String,
+    /// The number of a row in the order of the keys `{0}` (`ORDER BY` text).
+    pub row_number: fn(&str) -> String,
+}
+
+/// The dialect's parts of lists ([`FunctionMapper::lists`]). Every argument
+/// is SQL; a parameter is a name.
+pub(crate) struct Lists {
+    /// The elements of the list `{2}` for which the predicate `{1}` of the
+    /// parameter `{0}` is true (not false, not NULL), in order.
+    pub filter: fn(&str, &str, &str) -> String,
+    /// The value of `{1}` for each element `{0}` of the list `{2}`, in order.
+    pub map: fn(&str, &str, &str) -> String,
+    /// An aggregate: the group's values of `{0}` for which `{2}` holds (it
+    /// is present), in the order of the key `{1}` (unique per row).
+    pub ordered_collect: fn(&str, &str, &str) -> String,
+    /// An aggregate: the group's values of `{0}` for which `{1}` holds.
+    pub collect_if: fn(&str, &str) -> String,
+    /// An aggregate: every one of the group's values of `{0}`, NULL
+    /// included (a pattern comprehension's list).
+    pub collect_all: fn(&str) -> String,
+    /// The elements of the list `{0}` (of any values) in an order fixed by
+    /// their values: a list collected over rows in no order, the same on
+    /// every evaluation (#1395).
+    pub fixed_order: fn(&str) -> String,
+    /// The `ORDER BY` key of the list `{0}` whose elements are not one
+    /// comparable type; `None` when the dialect sorts such a list as it is
+    /// (#1491). Its elements order as Neo4j orders values (type rank, then
+    /// the value in its own type) — never by their text alone.
+    pub mixed_order: Option<fn(&str) -> String>,
+    /// The list column `{0}` of a LEFT JOIN, empty on a row that joined no
+    /// row (a pattern comprehension that matches nothing); `None` when the
+    /// column already is.
+    pub or_empty: Option<fn(&str) -> String>,
+    /// A tuple of the values `{0}` (a list's node or relationship), whose
+    /// elements `element` reads.
+    pub tuple: fn(&[String]) -> String,
+    /// Element `{1}` (1-based) of the tuple `{0}`.
+    pub element: fn(&str, usize) -> String,
+    /// Whether the value `{0}` is NULL, as a function call.
+    pub is_null: fn(&str) -> String,
+    /// An empty list of the type of the tuple `{0}` over the table `{1}`
+    /// aliased `{2}` (reading no row).
+    pub empty_of: fn(&str, &str, &str) -> String,
+    /// A map of entries (keys distinct, in key order) whose values keep
+    /// their own types, of one type whatever its keys and values (maps of
+    /// different keys are values of one column); `None` when the dialect
+    /// cannot hold one of the values.
+    pub map_of: fn(&[MapEntry]) -> Option<String>,
+    /// The keys of the map `{0}`, in its order (key order).
+    pub map_keys: fn(&str) -> String,
+    /// The list `{0}` without its repeated elements, each where it first
+    /// occurs.
+    pub distinct: fn(&str) -> String,
+    /// Whether the list `{0}`, of no NULL, has an element equal to `{1}`
+    /// (a tuple of the type of its elements).
+    pub contains: fn(&str, &str) -> String,
+    /// The elements of the list `{0}` that the list `{1}` has, once each
+    /// (by hashing, not one search per element).
+    pub intersect: fn(&str, &str) -> String,
+    /// The list `{0}` in ascending order.
+    pub sorted: fn(&str) -> String,
+    /// The list `{1}` as a result column, NULL where `{0}` holds: a NULL
+    /// list may be held as `[]` (`bound_plan::lower::null_list`), and is
+    /// returned as NULL.
+    pub null_list: fn(&str, &str) -> String,
+    /// The dialect has no NULL list: one is held as `[]` (ClickHouse).
+    pub null_as_empty: bool,
+    /// An aggregate `{0}` (`min`, `max`) of the group's values of `{1}` for
+    /// which `{2}` holds.
+    pub aggregate_if: fn(&str, &str, &str) -> String,
+    /// A 64-bit hash of the value `{0}` (a list of tuples).
+    pub fingerprint: fn(&str) -> String,
+}
+
+/// An entry of a map ([`Lists::map_of`]).
+pub(crate) struct MapEntry {
+    pub key: String,
+    /// The value's SQL.
+    pub value: String,
+    /// The value is an empty list literal, or a list literal holding one
+    /// (its elements are of no type).
+    pub holds_empty_list: bool,
+}
+
+/// The dialect's parts of a shortest-path search
+/// ([`FunctionMapper::shortest_path_search`]).
+pub(crate) struct ShortestPathSearch {
+    /// The type of a node's distance from the first node.
+    pub depth: &'static str,
+    /// The type of the "reached at this depth" flag.
+    pub flag: &'static str,
+    /// The type of a number of shortest paths, which grows exponentially
+    /// with the distance.
+    pub count: &'static str,
+    /// An array of as many elements as the count `{0}` holds, failing when
+    /// it is beyond the array's size type rather than wrapping.
+    pub copies: fn(&str) -> String,
+    /// An aggregate: the group's distinct values of `{0}`, as an array.
+    pub distinct_list: fn(&str) -> String,
+    /// A recursive CTE's steps (SELECTs reading it): each reads the rows of
+    /// the step before.
+    pub recursive_steps: fn(&[String]) -> String,
+    /// A step may read the CTE in an aggregate: a first node whose search
+    /// has reached every end goes no further (else the search ends when a
+    /// depth adds no node, the same paths later).
+    pub stops_early: bool,
+    /// A step may aggregate the rows it reads (a node's number of shortest
+    /// paths, its parents); else `allShortestPaths` and a shortest path's
+    /// relationships and nodes are not lowered.
+    pub grouped_steps: bool,
+    /// A recursive CTE may read another in a subquery (the trails of a
+    /// shortestPath condition start only at the pairs that need them); else
+    /// they start at every first node, and the pick keeps the same pairs.
+    pub nested_recursion: bool,
+}
+
+/// Returns the function mapper for the active SQL dialect, read from the
+/// task-local [`QueryContext`].
+///
+/// Outside a task-local scope (notably unit tests), this defaults to
+/// ClickHouse — matching the historical hard-coded behavior so existing
+/// tests don't need to opt in to a context.
+///
+/// The trait itself stays `pub(crate)`: external code can't name it, so
+/// it can't implement it either, and the simpler visibility rule is
+/// enough for now.
+///
+/// [`QueryContext`]: crate::server::query_context::QueryContext
+pub(crate) fn current_function_mapper() -> &'static dyn FunctionMapper {
+    for_dialect(crate::server::query_context::get_current_dialect())
+}
+
+/// Returns the function mapper for an explicit dialect.
+///
+/// `current_function_mapper()` delegates here with `ClickHouse`; Phase 1.1
+/// will route call sites through this accessor with the active dialect once
+/// it's plumbed through the rendering pipeline. Unsupported dialects panic
+/// at the boundary rather than silently falling back (entry points refuse
+/// them before translating).
+pub(crate) fn for_dialect(
+    dialect: crate::sql_generator::SqlDialect,
+) -> &'static dyn FunctionMapper {
+    use crate::sql_generator::SqlDialect;
+    static CLICKHOUSE: clickhouse::ClickhouseFunctionMapper = clickhouse::ClickhouseFunctionMapper;
+    static DATABRICKS: databricks::DatabricksFunctionMapper = databricks::DatabricksFunctionMapper;
+    match dialect {
+        SqlDialect::ClickHouse => &CLICKHOUSE,
+        SqlDialect::Databricks => &DATABRICKS,
+        d => unimplemented!("FunctionMapper for dialect {:?} is not yet implemented", d),
+    }
+}

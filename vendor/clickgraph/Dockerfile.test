@@ -1,0 +1,27 @@
+# Multi-stage build for testing
+FROM rust:1.85 as builder
+
+WORKDIR /build
+COPY . .
+
+# Build release binary (--locked ensures Cargo.lock versions are used,
+# preventing transitive dep updates from pulling in crates that require
+# a newer rustc than the image provides)
+RUN cargo build --release --locked --bin clickgraph
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /build/target/release/clickgraph /app/clickgraph
+
+# Default command
+ENTRYPOINT ["/app/clickgraph"]
+CMD ["--http-port", "7475"]

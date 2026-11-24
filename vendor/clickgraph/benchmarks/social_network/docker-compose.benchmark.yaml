@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  clickhouse-benchmark:
+    image: clickhouse/clickhouse-server:25.8.11
+    container_name: clickhouse-benchmark
+    environment:
+      CLICKHOUSE_DB: "social"
+      CLICKHOUSE_USER: "test_user"
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_PASSWORD: "test_pass"
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - clickhouse_social:/var/lib/clickhouse
+
+  clickgraph-benchmark:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: clickgraph-benchmark
+    depends_on:
+      clickhouse-benchmark:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse-benchmark:8123"
+      CLICKHOUSE_USER: "test_user"
+      CLICKHOUSE_PASSWORD: "test_pass"
+      CLICKHOUSE_DATABASE: "social"
+      RUST_LOG: "info"
+    ports:
+      - "7475:7475"
+    volumes:
+      - ./schemas:/app/schemas:ro
+
+volumes:
+  clickhouse_social:

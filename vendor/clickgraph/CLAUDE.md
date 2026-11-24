@@ -1,0 +1,263 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+ClickGraph is a **read-only graph query engine** for ClickHouse, written in Rust. It translates Cypher queries into ClickHouse SQL. Write operations (CREATE, SET, DELETE, MERGE) are explicitly out of scope.
+
+**Modes of operation:**
+- **Server mode** — HTTP (axum) + Bolt v5.8 protocol servers, querying a remote ClickHouse instance
+- **Embedded mode** — In-process serverless execution via chdb (ClickHouse embedded). Query Parquet, S3, Iceberg, Delta Lake directly without a running server
+- **Remote mode** — Cypher translated locally, executed against an external ClickHouse (no chdb needed)
+- **SQL-only mode** — Translate Cypher to SQL without executing (for debugging, testing, or external execution)
+
+**Ground rules**: (1) Never change query semantics — honestly return what is asked, no more, no less. (2) No shortcuts — fully understand the processing flow before making changes. Quality over speed.
+
+**Work dispatch**: `docs/design/PRIORITIES.md` is the canonical "what to work on next" queue across all workstreams. Before starting refactor/bug-sweep/optimization work, pick the highest unblocked item there; when a slice merges, update that doc (and the owning design doc's checklist) in the same PR.
+
+## Workspace Structure
+
+```
+clickgraph/                  # Main engine crate (Cypher parser, planner, SQL generator, server)
+clickgraph-embedded/         # Embedded Rust API (Database/Connection/QueryResult, Kuzu-compatible)
+clickgraph-ffi/              # UniFFI FFI layer (cdylib — single source of truth for all bindings)
+clickgraph-go/               # Idiomatic Go bindings via cgo + UniFFI-generated C bridge
+clickgraph-py/               # Pythonic wrapper over UniFFI-generated ctypes bridge
+clickgraph-client/           # Interactive REPL client for querying ClickGraph servers (human use)
+clickgraph-tool/             # cg CLI — agent/script-oriented tool (sql, validate, query, nl, schema)
+```
+
+**Workspace members** (in `Cargo.toml`): `clickgraph-client`, `clickgraph-embedded`, `clickgraph-ffi`, `clickgraph-tool`
+
+Go and Python bindings are not Cargo workspace members — they consume `libclickgraph_ffi.so`.
+
+## Build, Test, and Lint Commands
+
+```bash
+# Build
+cargo build                        # Debug build (all workspace members)
+cargo build --release              # Release build
+cargo build -p clickgraph-ffi      # FFI shared library only
+
+# Format (MANDATORY before push — CI will fail without this)
+cargo fmt --all
+
+# Lint
+cargo clippy --all-targets
+
+# Rust tests (~1,600 tests across workspace)
+cargo test                         # All Rust tests
+cargo test <test_name>             # Single test
+cargo test -- --nocapture          # With output
+
+# Python integration tests (~3,026 tests, requires running ClickHouse + ClickGraph server)
+pytest tests/integration/
+pytest tests/integration/test_optional_match.py -v   # Single file
+
+# Go tests (sql_only, no chdb)
+cd clickgraph-go && CGO_LDFLAGS="-L../target/debug" LD_LIBRARY_PATH="../target/debug" go test -v
+
+# Python binding tests (sql_only, no chdb)
+cd clickgraph-py && LD_LIBRARY_PATH="../target/debug" python3 -m pytest tests/test_bindings.py -v
+
+# Pre-push checklist (all mandatory)
+cargo fmt --all && cargo clippy --all-targets && cargo test
+
+# Run server
+export CLICKHOUSE_URL="http://localhost:8123"
+export CLICKHOUSE_USER="test_user"
+export CLICKHOUSE_PASSWORD="test_pass"
+export GRAPH_CONFIG_PATH="./benchmarks/social_network/schemas/social_benchmark.yaml"
+cargo run --bin clickgraph
+
+# Debug generated SQL without executing
+curl -X POST http://localhost:7475/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"MATCH (n) RETURN n","sql_only":true}'
+
+# cg CLI — agent/script-oriented tool (no server needed)
+cg --schema schema.yaml sql "MATCH (n:Person) RETURN n.name"   # translate only
+cg --schema schema.yaml validate "MATCH (n:Person) RETURN n"   # parse + plan check
+cg --schema schema.yaml \
+   --clickhouse http://localhost:8123 \
+   query "MATCH (n:Person) RETURN n.name LIMIT 10"             # execute via remote CH
+cg --schema schema.yaml nl "find people with more than 5 friends"  # NL → Cypher
+cg --schema schema.yaml schema show                             # agent-friendly schema view
+cg schema discover --clickhouse http://localhost:8123 \
+   --database mydb --out schema.yaml                            # LLM-assisted discovery
+```
+
+## Architecture — Query Pipeline
+
+```
+Cypher Query → Parse → Bind → Lower → Print SQL → Execute
+```
+
+| Stage | Module | Purpose |
+|-------|--------|---------|
+| Parse | `src/open_cypher_parser/` | Cypher → AST using `nom`; the clause-list parser (`clause_list`) is what the bound plan reads (the statement parse classifies read / CALL / write) |
+| Bind | `src/bound_plan/{binder,expr,labels}.rs` | Names → bindings, scopes, label inference (`docs/design/EXPLICIT_SCOPE.md`) |
+| Lower | `src/bound_plan/lower/` | Bound statement → `RenderPlan` (CTEs, SELECT, JOINs), dialect spellings via `FunctionMapper` |
+| Print | `src/sql_generator/emitters/clickhouse/` | `RenderPlan` → SQL (`render_plan_to_sql_plain`; `variable_length_cte.rs` for walks) |
+| Writes | `src/bound_plan/write.rs` | Embedded Cypher writes → `WriteRenderPlan` → `write_to_sql.rs` |
+| Seam | `src/translate.rs` | The one read translation every entry point calls |
+| Execute | `src/server/` | HTTP (axum) + Bolt v5.8 protocol servers, ClickHouse client |
+| Schema | `src/graph_catalog/` | YAML graph schema management and validation |
+
+The legacy planner/renderer (`query_planner` analyzer/optimizer and `LogicalPlan`, `render_plan` composition) was deleted in P-4c S14c; `query_planner` keeps the expression IR (`logical_expr`), statement classification and the CALL arguments.
+
+### Key Submodules
+
+- **`bound_plan/lower/mod.rs`** — The largest file; clause-by-clause lowering (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN). Most regressions originate here. Always run the full test suite after changes.
+- **`bound_plan/lower/{path,subquery,expr,value,elements}.rs`** — Walks and shortest paths, subquery expressions, expressions, graph values, list elements
+- **`sql_generator/function_mapper/`** — Per-dialect spellings (ClickHouse, Databricks)
+- **`sql_generator/emitters/clickhouse/to_sql_query.rs`** — SQL printing, CTE flattening
+- **`server/bolt_protocol/`** — Neo4j Bolt v5.8 wire protocol implementation
+- **`server/query_context.rs`** — Task-local schema and dialect
+
+## Ecosystem Architecture
+
+```
+   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+   │   Go App     │  │  Python App  │  │   Rust App   │  │  Agent/Script│
+   │  (cgo)       │  │  (ctypes)    │  │  (direct)    │  │  (cg CLI)    │
+   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+          │                 │                 │                 │
+   clickgraph-go     clickgraph-py    clickgraph-embedded  clickgraph-tool
+          │                 │           (sql_only/remote)       │
+          └────────┬────────┘          (chdb: +embedded feat)   │
+                   │                          │                 │
+         ┌─────────▼──────────┐               └────────┬────────┘
+         │  clickgraph-ffi    │                        │
+         │ (libclickgraph_ffi │                        │
+         │  .so / UniFFI)     │                        │
+         └─────────┬──────────┘                        │
+                   └──────────────────┬────────────────┘
+                                      │
+                           ┌──────────▼──────────┐
+                           │  clickgraph (core)   │
+                           │  Parser + Planner +  │
+                           │  SQL Generator       │
+                           └──────────┬──────────┘
+                                      │
+                           ┌──────────▼──────────┐
+                           │ ClickHouse / chdb    │
+                           └─────────────────────┘
+```
+
+### FFI Layer (`clickgraph-ffi/`)
+
+Single source of truth for all language bindings. Uses **UniFFI proc macros** (no `.udl` files). Exports: `Database`, `Connection`, `QueryResult`, `Row`, `Value`, `SystemConfig`, `ExportOptions`, `ClickGraphError`.
+
+Adding a method here automatically becomes available to all bindings after regenerating.
+
+**Regenerating bindings:**
+```bash
+# Python
+uniffi-bindgen generate --library target/debug/libclickgraph_ffi.so --language python -o clickgraph-py/clickgraph/
+mv clickgraph-py/clickgraph/clickgraph_ffi.py clickgraph-py/clickgraph/_ffi.py
+
+# Go
+uniffi-bindgen-go --library target/debug/libclickgraph_ffi.so --out-dir clickgraph-go/clickgraph_ffi/
+```
+
+### Embedded Mode (`clickgraph-embedded/`)
+
+Core Rust crate with Kuzu-compatible sync API (`Database` → `Connection` → `QueryResult`). Three constructors:
+
+| Constructor | Needs chdb? | Use case |
+|---|---|---|
+| `Database::sql_only(schema)` | No | Translate Cypher → SQL only |
+| `Database::new_remote(schema, RemoteConfig)` | No | Execute against external ClickHouse |
+| `Database::new(schema, SystemConfig)` | **Yes** (`embedded` feature) | In-process chdb execution |
+
+The `embedded` feature flag is **opt-in** (default off). `clickgraph-ffi` and `clickgraph-tck` enable it; `clickgraph-tool` does not.
+
+Schema `source:` field supports: local files, `s3://`, `iceberg+s3://`, `delta+s3://`, `table_function:...`.
+
+### Go Bindings (`clickgraph-go/`)
+
+Idiomatic Go API via cgo. Module: `github.com/genezhang/clickgraph-go`. Requires `libclickgraph_ffi.so` and `CGO_ENABLED=1`.
+
+### Python Bindings (`clickgraph-py/`)
+
+PyPI package: `clickgraph`. Thin wrapper over auto-generated UniFFI ctypes bridge (`_ffi.py` is auto-generated — never edit manually).
+
+## Critical Architectural Rules
+
+### 1. CTEs Are Flat — No Nesting
+All CTEs must be top-level siblings under a single `WITH RECURSIVE`. Never nest CTE definitions inside another CTE body. Enforced by `flatten_all_ctes()` in `to_sql_query.rs`.
+
+### 2. Variable Resolution: Forward Through Scope, Never Reverse
+After a WITH→CTE barrier, downstream expressions reference CTE column names directly. No reverse mapping from DB columns back to CTE columns.
+
+```
+Before WITH:  p.name → Person.full_name        (DB column via schema mapping)
+After WITH:   p.name → CTE1.p6_person_name     (CTE column via property_mapping)
+```
+
+### 3. Task-Local Schema Access
+Query-processing code MUST access schema via task-local `QueryContext` (`get_current_schema()`), never directly from `GLOBAL_SCHEMAS`. GLOBAL_SCHEMAS is only for server init and admin endpoints.
+
+### 4. CTE Column Naming
+WITH CTE columns use unambiguous `p{N}_{alias}_{property}` format where N = character length of alias. Generated by `cte_column_name()` in `src/utils/cte_column_naming.rs`.
+
+### 5. Axis-Dispatch Rule: Schema Patterns and Dialects
+Changes that behave differently across schema patterns (standard, FK-edge, denormalized, polymorphic, composite-id) must consume `PatternSchemaContext` / schema-catalog APIs (`src/graph_catalog/pattern_schema.rs`, `graph_schema.rs`) rather than branching on raw flags (`is_denormalized`, `is_fk_edge`, `type_column`, table-name comparisons). Changes emitting dialect-specific SQL must route through `Dialect`/`FunctionMapper` (`src/sql_generator/`), not inline branching. The ratchet test (`cargo test --test ratchet`, `tests/rust/ratchet/`) enforces this by tracking predicate occurrences per module; if it fails, route through dispatch APIs instead of bumping the baseline. Justify any baseline bump explicitly in the PR. See `docs/design/REFACTORING_SAFETY_PLAN.md` §2.1 for detail.
+
+## Schema Discipline
+
+**Always use the benchmark schema for development**: `benchmarks/social_network/schemas/social_benchmark.yaml`
+
+Property names in Cypher may differ from ClickHouse column names (e.g., `u.name` → `full_name`, `u.email` → `email_address`). Schema defines these mappings.
+
+Five schema variations exist: Standard, FK-edge, Denormalized, Polymorphic, Composite ID. Bug fixes should be tested against all relevant variations.
+
+## Development Conventions
+
+- **Branch naming**: `fix/`, `perf/`, `refactor/`, `test/`, `docs/`, `feature/` prefixes
+- **Error handling**: `thiserror` for error types, `?` operator for propagation, no panics
+- **Module pattern**: `mod.rs` as entry, separate files per component, `errors.rs` per module
+- **Late-stage project**: Reuse existing code before writing new. Investigate thoroughly before claiming code is dead. Add regression tests for fixed bugs.
+- **serde_json** uses `preserve_order` feature — column order in JSON responses must match SQL SELECT order
+
+## Key Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `CLICKHOUSE_URL` | ClickHouse connection URL (server mode) |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | Credentials (server mode) |
+| `GRAPH_CONFIG_PATH` | **Required for server mode** — YAML schema file path |
+| `RUST_LOG` | Logging level (debug, info) |
+| `CLICKGRAPH_THREAD_STACK_MB` | Tokio worker thread stack (default 128 MB) |
+| `CLICKGRAPH_STATS_ENABLED` | Stats-informed anchor selection (default false; ordering only, see `docs/design/STATS_PLANNING.md`). Inert since the P-4c cutover: only the legacy planner (deleted in S14c3) read the stats. Kept (user, 2026-10-13) for shaping the lowering's SQL if ClickHouse's own optimizer falls short (e.g. join ordering, S11o10) |
+| `CLICKGRAPH_STATS_TTL_SECS` | Row-count cache TTL for stats-informed planning (default 300) |
+| `CLICKGRAPH_CHECK_NODE_PROPERTIES` | Fail a read of an embedded node's property when the rows of one id hold several values of it (default false: any one is read; #531) |
+| `CLICKGRAPH_DATETIME_ISO8601` | Opt-in (default false, #1068): ClickHouse returns DateTime / DateTime64 as ISO-8601 (`2024-03-15T10:30:00Z`: the `T`, a `Z`, a zoned column converted to UTC) through the `date_time_output_format = 'iso'` session setting, which SQL-only output (`cg sql`, `query_to_sql`) then also carries, and `toString()` of a datetime the classifier proves spells the `T` (a property of undeclared type keeps the space). Accepts `true/false`, `1/0`, `yes/no`, `on/off`. `cg --datetime-iso8601` / `CG_DATETIME_ISO8601`; embedded reads the variable at first use. Off, nothing changes |
+| `CLICKGRAPH_WIDE_NUMBERS_AS_TEXT` | Opt-in (default false, #1536): a returned property whose every declaring type is `Int128` / `UInt128` / `Int256` / `UInt256` is its exact digits as text, and `output_format_json_quote_decimals = 1` makes every `Decimal` exact text in the session and in SQL-only output. A `UNION` column wide in one arm is text in every arm. Off, a wide value is a JSON number, which the server reads as a double and loses digits from. Known limits: a computed wide value, and a wide property inside a returned path / map / list (`RETURN p`, `collect(n)`, `{v: n.big}`), stay numbers (wrap them in `toString()`); a `Decimal` now arrives as a string for clients. Accepts `true/false`, `1/0`, `yes/no`, `on/off`. `cg --wide-numbers-as-text` / `CG_WIDE_NUMBERS_AS_TEXT`; embedded reads the variable at first use |
+| `CLICKGRAPH_OTLP_ENDPOINT` | OTLP/HTTP base URL for opt-in per-query tracing (traces go to `{endpoint}/v1/traces`; unset = off, zero per-query cost). Requires `CLICKGRAPH_METRICS_ENABLED=true`, since spans are emitted from the query registry |
+| `CLICKGRAPH_OTLP_INCLUDE_QUERY` | Include the literals-stripped, comments-stripped, length-capped Cypher text in OTLP spans (default false: shape/timings only, never query text). Accepts `true/false`, `1/0`, `yes/no`, `on/off` |
+| `CLICKGRAPH_OTLP_HEADERS` | Static auth/tenant headers for OTLP exports, comma-separated `key=value` (OTEL's `OTEL_EXPORTER_OTLP_HEADERS` form). Values are percent-decoded, so Langfuse's documented `Authorization=Basic%20…` works as written |
+| `CLICKGRAPH_SCHEMA_PERSISTENCE` | Runtime-registered schema durability: `off` (default - responses keep the exact pre-feature shape) or `clickhouse` (registrations land in a `clickgraph_schema_registry` table and are replayed at boot; `docs/design/SCHEMA_PERSISTENCE.md`). Strictly parsed - an unknown value fails startup. The ClickHouse user needs `SELECT`, `INSERT` and `ALTER DELETE` on that table; `CREATE TABLE` only if the server provisions it (once per process, with a read-probe fallback for a DBA-provisioned table). Writes may pass a role (`role` on the POST body, `?role=` on DELETE) resolved through the same pool as `/query`; boot replay always reads as the default user. Store calls are bounded (10 s; the boot replay's reads 60 s): a wedged store reports `persisted: false`, never hangs, and a registry whose high-water seed cannot be read is not written to - the next operation retries the whole preparation. Both endpoints validate their identifiers (empty, control or invisible formatting characters, over 512 bytes for a name; over 256 for a role) with a 400 before any store work; boot replay skips stored rows whose name fails the same check. With persistence on, one gate serializes the admin calls and the store half runs as its own task (a dropped request no longer abandons the store write once the memory half is done); with it off there is no gate. On a cluster, provision a replicated registry table yourself |
+| `CLICKGRAPH_SCHEMA_REPLAY_MAX_ROWS` | Boot-replay row budget (default 500): the oldest-first prefix up to the cap is restored; the exact overage is WARNed |
+| `CLICKGRAPH_SCHEMA_REPLAY_MAX_BYTES` | Boot-replay payload budget in bytes (default 67108864 = 64 MiB), enforced in the fetch itself |
+| `CLICKGRAPH_CHDB_TESTS` | Set to `1` to enable chdb e2e tests |
+| `CLICKGRAPH_LLM_PROVIDER` | LLM provider for schema discovery (`anthropic` or `openai`) |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | API keys for LLM schema discovery |
+| `CG_SCHEMA` | Default schema file path for `cg` CLI |
+| `CG_CLICKHOUSE_URL` | ClickHouse URL for `cg query` |
+| `CG_CLICKHOUSE_USER` / `CG_CLICKHOUSE_PASSWORD` | Credentials for `cg query` |
+| `CG_LLM_PROVIDER` | LLM provider for `cg nl` and `cg schema discover` |
+| `CG_LLM_MODEL` / `CG_LLM_API_KEY` / `CG_LLM_BASE_URL` | LLM config for `cg` |
+
+## Key Documentation Files
+
+- **`STATUS.md`** — Single source of truth for project state
+- **`docs/design/PRIORITIES.md`** — Canonical work-dispatch queue (what to do next, and why)
+- **`CHANGELOG.md`** — Release history (Keep-a-Changelog format)
+- **`DEV_QUICK_START.md`** — Essential developer workflow
+- **`DEVELOPMENT_PROCESS.md`** — Detailed 6-phase development process
+- **`.github/copilot-instructions.md`** — Comprehensive architecture guide
+- **`*/AGENTS.md`** — Module-level architecture guides (in `src/`, `src/render_plan/`, `src/server/`, `clickgraph-ffi/`, `clickgraph-embedded/`, `clickgraph-tool/`, `clickgraph-go/`, `clickgraph-py/`, etc.)
+- **`docs/wiki/cypher-language-reference.md`** — Primary feature documentation (must be updated for every feature)

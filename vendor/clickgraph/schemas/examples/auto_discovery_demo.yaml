@@ -1,0 +1,74 @@
+# Auto-Discovery Demo Schema
+#
+# This schema demonstrates the auto_discover_columns feature: at load, the
+# table's columns are read from ClickHouse (system.columns) and each becomes a
+# property. `naming_convention` renames them, `exclude_columns` leaves some
+# out, and declared property_mappings are added on top (a declared name wins).
+#
+# Discovery needs a database connection: the server with ClickHouse, embedded
+# chdb (columns read from `source:`), or a remote ClickHouse (`cg --clickhouse`).
+# A schema that asks for it is refused where no database is available.
+#
+# Tables: brahmand.users_bench, posts_bench, user_follows_bench,
+# post_likes_bench (created by scripts/test/setup_all_test_data.sh).
+
+name: auto_discovery_demo
+
+graph_schema:
+  nodes:
+    - label: User
+      database: brahmand
+      table: users_bench
+      node_id: user_id
+      
+      # Enable auto-discovery: All columns become properties
+      auto_discover_columns: true
+      
+      # Optional: Convert snake_case to camelCase (user_id → userId, ...)
+      naming_convention: camelCase
+      
+      # Columns that do not become properties
+      exclude_columns:
+        - city
+      
+      # Declared mappings, added on top of the discovered ones
+      property_mappings:
+        name: full_name           # property `name` reads column full_name
+        email: email_address      # property `email` reads column email_address
+
+    - label: Post
+      database: brahmand
+      table: posts_bench
+      node_id: post_id
+      
+      # Auto-discover without exclusions
+      auto_discover_columns: true
+      
+      # Declared mapping: property `body` reads column content
+      property_mappings:
+        body: content
+
+  edges:
+    - type: FOLLOWS
+      database: brahmand
+      table: user_follows_bench
+      from_id: follower_id
+      to_id: followed_id
+      from_node: User
+      to_node: User
+      
+      # Auto-discover relationship properties
+      auto_discover_columns: true
+      property_mappings: {}  # Every column, under its own name
+
+    - type: LIKES
+      database: brahmand
+      table: post_likes_bench
+      from_id: user_id
+      to_id: post_id
+      from_node: User
+      to_node: Post
+      
+      # Auto-discover all columns
+      auto_discover_columns: true
+      property_mappings: {}  # Empty mappings - all identity

@@ -1,0 +1,144 @@
+# Test Schema for Zeek Merged Logs (DNS + Connection)
+# 
+# Merged from zeek_dns_log.yaml and zeek_conn_log.yaml for cross-table correlation.
+# DNS log has 2 coupled edges (REQUESTED + RESOLVED_TO), conn_log has 1 edge (ACCESSED).
+#
+# Graph model from dns_log:
+#   (src:IP)-[:REQUESTED]->(d:Domain)-[:RESOLVED_TO]->(rip:ResolvedIP)
+#   "192.168.1.10 requested example.com which resolved_to 93.184.216.34"
+#
+# Graph model from conn_log:
+#   (src:IP)-[:ACCESSED]->(dest:IP)
+#   "192.168.1.10 accessed 93.184.216.34"
+#
+# Key correlation query (from GitHub issue #12):
+#   MATCH (src:IP)-[:REQUESTED]->(d:Domain)-[:RESOLVED_TO]->(rip:ResolvedIP),
+#         (src)-[:ACCESSED]->(dest:IP)
+#   WHERE rip.ip = dest.ip   -- or use array contains
+#   RETURN src.ip, d.name, dest.ip
+#
+# This finds: DNS lookups followed by connections to the resolved IPs
+
+name: zeek_merged_test
+version: "1.0"
+
+graph_schema:
+  nodes:
+    # ========================================
+    # IP node definitions (one per table)
+    # ========================================
+    
+    # IP in dns_log table (source of DNS requests)
+    - label: IP
+      database: zeek
+      table: dns_log
+      node_id: id.orig_h
+      property_mappings: {}
+      from_node_properties:
+        ip: id.orig_h
+      to_node_properties:
+        ip: id.resp_h  # DNS server IP
+
+    # IP in conn_log table (source/dest of connections)
+    - label: IP
+      database: zeek
+      table: conn_log
+      node_id: id.orig_h
+      property_mappings: {}
+      from_node_properties:
+        ip: id.orig_h
+        port: id.orig_p
+      to_node_properties:
+        ip: id.resp_h
+        port: id.resp_p
+
+    # ========================================
+    # Domain node (only in dns_log)
+    # ========================================
+    - label: Domain
+      database: zeek
+      table: dns_log
+      node_id: name
+      property_mappings: {}
+      from_node_properties:
+        name: query
+      to_node_properties:
+        name: query
+
+    # ========================================
+    # ResolvedIP node (from dns_log answers array)
+    # NOTE: answers is an array - queries may need ARRAY JOIN or UNWIND
+    # ========================================
+    - label: ResolvedIP
+      database: zeek
+      table: dns_log
+      node_id: answers
+      property_mappings: {}
+      to_node_properties:
+        ip: answers  # Array of resolved IPs
+
+  edges:
+    # ========================================
+    # DNS relationships (from dns_log table) - 2 coupled edges
+    # ========================================
+    
+    # REQUESTED: Source IP requested a domain lookup
+    # (src:IP)-[:REQUESTED]->(d:Domain)
+    - type: REQUESTED
+      database: zeek
+      table: dns_log
+      from_id: id.orig_h
+      to_id: query
+      from_node: IP
+      to_node: Domain
+      edge_id: uid
+      
+      property_mappings:
+        uid: uid
+        timestamp: ts
+        dns_server: id.resp_h
+        qtype: qtype_name
+        rcode: rcode_name
+        answers: answers
+
+    # RESOLVED_TO: Domain resolved to IP address(es)
+    # (d:Domain)-[:RESOLVED_TO]->(rip:ResolvedIP)
+    # NOTE: answers is an array - this creates multiple edges per DNS response
+    - type: RESOLVED_TO
+      database: zeek
+      table: dns_log
+      from_id: query
+      to_id: answers
+      from_node: Domain
+      to_node: ResolvedIP
+      edge_id: [uid, answers]  # Composite ID for uniqueness
+      
+      property_mappings:
+        uid: uid
+        timestamp: ts
+        ttls: TTLs
+
+    # ========================================
+    # Connection relationships (from conn_log table)
+    # ========================================
+    
+    # ACCESSED: Source IP accessed destination IP
+    # (src:IP)-[:ACCESSED]->(dest:IP)
+    - type: ACCESSED
+      database: zeek
+      table: conn_log
+      from_id: id.orig_h
+      to_id: id.resp_h
+      from_node: IP
+      to_node: IP
+      edge_id: uid
+      
+      property_mappings:
+        uid: uid
+        timestamp: ts
+        protocol: proto
+        service: service
+        duration: duration
+        orig_bytes: orig_bytes
+        resp_bytes: resp_bytes
+        conn_state: conn_state

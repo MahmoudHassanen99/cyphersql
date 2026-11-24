@@ -1,0 +1,53 @@
+name: ecommerce_benchmark
+version: "1.0"
+
+graph_schema:
+  nodes:
+    - label: Customer
+      database: brahmand
+      table: customers
+      node_id: customer_id
+      property_mappings:
+        customer_id: customer_id  # this is default and can be omitted, backwards compatibility
+        email: email
+        first_name: first_name
+        last_name: last_name
+        age: age
+        gender: gender
+        country: country
+        city: city
+        registration_date: registration_date
+        total_spent: total_spent
+        is_premium: is_premium
+
+    - label: Product
+      database: brahmand
+      table: products
+      node_id: product_id
+      property_mappings:
+        product_id: product_id
+        name: name
+        category: category
+        brand: brand
+        price: price
+        rating: rating
+        num_reviews: num_reviews
+        in_stock: in_stock
+        created_date: created_date
+
+  edges:
+    - type: PURCHASED
+      database: brahmand
+      table: orders
+      from_node: Customer
+      to_node: Product
+      from_id: customer_id
+      to_id: product_id
+      property_mappings:
+        order_id: order_id
+        quantity: quantity
+        unit_price: unit_price
+        total_amount: total_amount
+        order_date: order_date
+        order_time: order_time
+        status: status

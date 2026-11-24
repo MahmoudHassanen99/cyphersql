@@ -1,0 +1,52 @@
+name: test_graph_schema
+graph_schema:
+  nodes:
+    - label: User
+      database: test_integration
+      table: users
+      node_id: user_id
+      property_mappings:
+        user_id: user_id
+        name: name
+        age: age
+  
+  edges:
+    - type: FOLLOWS
+      database: test_multi_rel
+      table: follows
+      from_id: from_user_id
+      to_id: to_user_id
+      from_node: User
+      to_node: User
+      property_mappings:
+        since: since
+
+    - type: FRIENDS_WITH
+      database: test_multi_rel
+      table: friends
+      from_id: from_user_id
+      to_id: to_user_id
+      from_node: User
+      to_node: User
+      property_mappings:
+        since: since
+
+    - type: PURCHASED
+      database: test_integration
+      table: purchases
+      from_id: from_id
+      to_id: to_id
+      from_node: User
+      to_node: User
+      property_mappings:
+        amount: amount
+
+    - type: LIKED
+      database: test_integration
+      table: likes
+      from_id: from_id
+      to_id: to_id
+      from_node: User
+      to_node: User
+      property_mappings:
+        timestamp: timestamp

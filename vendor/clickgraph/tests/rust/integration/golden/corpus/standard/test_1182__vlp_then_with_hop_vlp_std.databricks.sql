@@ -1,0 +1,76 @@
+WITH RECURSIVE vlp_v1_path AS (
+    SELECT 
+        start_node.user_id as start_id,
+        end_node.user_id as end_id,
+        1 as hop_count,
+        CAST(array() AS ARRAY<STRING>) as path_relationships,
+        array(start_node.user_id, end_node.user_id) as path_nodes,
+        array(rel.follow_id) as path_edges
+    FROM test_integration.users_test AS start_node
+    JOIN test_integration.user_follows_test AS rel ON start_node.user_id = rel.follower_id
+    JOIN test_integration.users_test AS end_node ON rel.followed_id = end_node.user_id
+    UNION ALL
+    SELECT
+        vp.start_id,
+        end_node.user_id as end_id,
+        vp.hop_count + 1 as hop_count,
+        CAST(array() AS ARRAY<STRING>) as path_relationships,
+        concat(vp.path_nodes, array(end_node.user_id)) as path_nodes,
+        concat(vp.path_edges, array(rel.follow_id)) as path_edges
+    FROM vlp_v1_path vp
+    JOIN test_integration.user_follows_test AS rel ON vp.end_id = rel.follower_id
+    JOIN test_integration.users_test AS end_node ON rel.followed_id = end_node.user_id
+    WHERE vp.hop_count < 2
+      AND NOT array_contains(vp.path_edges, rel.follow_id)
+), 
+with_w2 AS (
+SELECT 
+      v0.user_id AS `v3__user_id`, 
+      v0.user_id AS `p2_v3_user_id`, 
+      v2.user_id AS `v4__user_id`
+FROM vlp_v1_path AS v1
+JOIN test_integration.users_test AS v0 ON v1.start_id = v0.user_id
+JOIN test_integration.users_test AS v2 ON v1.end_id = v2.user_id
+), 
+vlp_v7_path AS (
+    SELECT 
+        start_node.user_id as start_id,
+        end_node.user_id as end_id,
+        1 as hop_count,
+        CAST(array() AS ARRAY<STRING>) as path_relationships,
+        array(start_node.user_id, end_node.user_id) as path_nodes,
+        array(rel.follow_id) as path_edges
+    FROM test_integration.users_test AS start_node
+    JOIN test_integration.user_follows_test AS rel ON start_node.user_id = rel.follower_id
+    JOIN test_integration.users_test AS end_node ON rel.followed_id = end_node.user_id
+    WHERE (start_node.user_id IN (SELECT DISTINCT 
+      v6.user_id AS `id`
+FROM with_w2 AS w2
+JOIN test_integration.user_follows_test AS v5 ON v5.follower_id = w2.v4__user_id
+JOIN test_integration.users_test AS v6 ON v5.followed_id = v6.user_id))
+    UNION ALL
+    SELECT
+        vp.start_id,
+        end_node.user_id as end_id,
+        vp.hop_count + 1 as hop_count,
+        CAST(array() AS ARRAY<STRING>) as path_relationships,
+        concat(vp.path_nodes, array(end_node.user_id)) as path_nodes,
+        concat(vp.path_edges, array(rel.follow_id)) as path_edges
+    FROM vlp_v7_path vp
+    JOIN test_integration.user_follows_test AS rel ON vp.end_id = rel.follower_id
+    JOIN test_integration.users_test AS end_node ON rel.followed_id = end_node.user_id
+    WHERE vp.hop_count < 2
+      AND NOT array_contains(vp.path_edges, rel.follow_id)
+)
+SELECT 
+      w2.p2_v3_user_id AS `a.user_id`, 
+      v8.user_id AS `e.user_id`
+FROM vlp_v7_path AS v7
+JOIN test_integration.users_test AS v6 ON v7.start_id = v6.user_id
+JOIN test_integration.user_follows_test AS v5 ON v5.followed_id = v6.user_id
+JOIN with_w2 AS w2 ON v5.follower_id = w2.v4__user_id
+JOIN test_integration.users_test AS v8 ON v7.end_id = v8.user_id
+WHERE NOT array_contains(v7.path_edges, v5.follow_id)
+
+-- column a.user_id: Value [("a.user_id", "a.user_id")]
+-- column e.user_id: Value [("e.user_id", "e.user_id")]

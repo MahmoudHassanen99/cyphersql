@@ -1,0 +1,372 @@
+<div align="center">
+  <img src="https://github.com/genezhang/clickgraph/blob/main/docs/images/cglogo.png" height="150">
+</div>
+
+# ClickGraph
+
+#### ClickGraph - A high-performance graph query engine for ClickHouse, written in Rust, with Neo4j ecosystem compatibility - Cypher and Bolt Protocol 5.8 support. Server mode is stateless (translates Cypher to ClickHouse SQL with no extra datastore); embedded mode runs in-process via chdb and is **read-write** as of v0.6.7 (`CREATE` / `SET` / `DELETE` / `REMOVE`). Reads also work in remote and sql_only modes. Exports query results to external destinations. Golang and Python bindings in addition to native Rust. New `cg` CLI tool supports agentic workflows.
+
+> **Note: ClickGraph dev release is at beta quality for view-based graph analytics applications. Kindly raise an issue if you encounter any problem.**
+
+> 🧊 **Meet DeltaGraph — ClickGraph's sibling for Databricks.** The same engine, the same Cypher, the same Bolt/Neo4j-Browser compatibility — but translating to Spark SQL and executing against a **Databricks SQL Warehouse** instead of ClickHouse. One codebase, two server binaries (`clickgraph` for ClickHouse, `deltagraph` for Databricks); pick the backend at runtime. See the [Docker quickstart](docs/deltagraph/DOCKER_QUICKSTART.md), the [build-from-source quickstart](docs/deltagraph/QUICKSTART.md), or [how the two are packaged](docs/deltagraph/PACKAGING.md).
+
+> 📊 **Why warehouse- & lakehouse-native graph?** [**Read the positioning brief →**](https://genezhang.github.io/clickgraph/) — how ClickGraph & DeltaGraph compare to Neptune, Neo4j GDS, and lakehouse graph engines on scale, GraphRAG, and security graph at petabyte scale.
+
+`ClickGraph` provides three modes now:
+- Stateless service
+- Embedded mode with embedded `chDB`
+- Hybrid mode with remote querying and local storage
+
+See [motivation and rationale](docs/motivation.md).
+
+---
+## What's New in v0.6.8-dev — DeltaGraph preview 🧊
+
+- **DeltaGraph is now packaged for preview.** The `deltagraph` server (Cypher → Spark SQL → Databricks SQL Warehouse) ships alongside `clickgraph` in the same Docker image (`genezhang/clickgraph`, selected via `--entrypoint /usr/local/bin/deltagraph`) and as its own `deltagraph-<platform>` release tarball on every platform. A user chooses the backend at **runtime** — run `clickgraph` (ClickHouse), run `deltagraph` (Databricks), run both side-by-side on different ports, or `clickgraph --databricks`. The Neo4j Browser demo is verified live end-to-end on **both** backends at full result parity, including a live Databricks free-tier warehouse. Start here: [Docker quickstart](docs/deltagraph/DOCKER_QUICKSTART.md) · [packaging & binary selection](docs/deltagraph/PACKAGING.md).
+- **`toString()` float fidelity (#1055)** — `toString(3.0)` now returns `"3.0"` (Neo4j semantics), not `"3"`, on both the ClickHouse and Databricks dialects. See [CHANGELOG.md](CHANGELOG.md).
+
+<details>
+<summary><b>DeltaGraph — full capability detail</b> (dialect routing, surfaces, auth, what's pending)</summary>
+
+- **Cypher over Databricks SQL Warehouse** (opt-in `--features databricks`). A second SQL dialect alongside ClickHouse: Cypher is translated to Spark SQL locally and executed against a Databricks SQL Warehouse over the Statement Execution API. Dialect routing through `FunctionMapper` (`groupArray`→`collect_list`, `toInt64`→`bigint`, `Array(Int64)`→`ARRAY<BIGINT>`, etc.), including variable-length paths and BFS shortestPath. PAT auth with `Debug` redaction. Surfaces: `Database::new_databricks(schema, DatabricksConfig)` in `clickgraph-embedded`, `Database::open_databricks` over the FFI for Go/Python, `cg --dialect databricks` for SQL emission *and* execution (env-only PAT), `cg schema discover --dialect databricks` for LLM-assisted YAML drafts off a live warehouse, optional top-level `catalog:` YAML field for schemas permanently tied to one Unity Catalog (env still wins), and a dedicated **`deltagraph` server binary** (HTTP + Bolt, defaults to Databricks). Manual walkthrough: [docs/deltagraph/QUICKSTART.md](docs/deltagraph/QUICKSTART.md). Docker quickstart: [docs/deltagraph/DOCKER_QUICKSTART.md](docs/deltagraph/DOCKER_QUICKSTART.md). Packaging & binary selection: [docs/deltagraph/PACKAGING.md](docs/deltagraph/PACKAGING.md). Plan: [docs/design/DELTAGRAPH_PLAN.md](docs/design/DELTAGRAPH_PLAN.md). Still pending: `MERGE`, OAuth M2M auth, full LDBC validation against a live warehouse, external-link result chunks.
+
+</details>
+
+## What's New in v0.6.7-dev
+
+- **Cypher writes in embedded mode** — `CREATE`, `SET`, `DELETE` / `DETACH DELETE`, and `REMOVE` against ClickGraph-managed (non-`source:`) tables. Translates to ClickHouse's lightweight `INSERT` / `UPDATE` / `DELETE` mutation path; tables created by ClickGraph automatically get `enable_block_number_column = 1, enable_block_offset_column = 1`. Per-node `id_generation` schema attribute (`uuid` default / `provided` / `snowflake`). Returns Neo4j-compatible counters (`nodes_created`, `properties_set`, `nodes_deleted`, `relationships_deleted`). Server / remote / sql_only modes reject writes before planning them (the embedded connection's executor check); `source:`-backed nodes/edges remain read-only. `MERGE`, relationship `CREATE`, `CREATE … RETURN`, edge-alias `DELETE r`, `SET a += {…}` map-merge, and `REMOVE a:Label` are not implemented yet — each is rejected with an explicit error rather than silently mis-rendering. See [docs/wiki/Cypher-Language-Reference.md](docs/wiki/Cypher-Language-Reference.md#write-clauses) for full syntax + caveats and [docs/design/embedded-writes.md](docs/design/embedded-writes.md) for the design.
+
+## What's New in v0.6.6-dev
+
+- **`cg` CLI tool** — Agent/script-oriented CLI (`clickgraph-tool` crate). Translate and execute Cypher without a running server: `cg sql`, `cg validate`, `cg query`, `cg nl` (NL→Cypher via LLM), `cg schema show/validate/discover/diff`. Config via `~/.config/cg/config.toml`. Designed for agentic callers, CI pipelines, and scripting.
+- **`embedded` feature now opt-in** — `clickgraph-embedded` compiles without chdb by default. New `Database::new_remote(schema, RemoteConfig)` constructor executes Cypher against external ClickHouse with no chdb dependency — useful for lightweight tooling and the `cg` CLI.
+- **Agent skills** — Three publishable skills for any agentic framework (Claude Code, LangChain, AutoGen, CrewAI, OpenAI function calling): `/cypher` (NL→Cypher→execute), `/graph-schema` (show schema), `/schema-discover` (generate schema YAML from ClickHouse via LLM). See [skills/README.md](skills/README.md).
+- **openCypher TCK** — 402/402 read scenarios passing (100%). Write scenarios are not yet imported from upstream openCypher TCK; v0.6.7 adds the Cypher write pipeline that will unblock them.
+
+## What's New in v0.6.5-dev
+
+- **Hybrid remote query + local storage** — Execute Cypher against a remote ClickHouse cluster from embedded mode, store results locally in chdb for fast re-querying. `query_remote()`, `query_remote_graph()`, `store_subgraph()` — ideal for GraphRAG context enrichment. Available in Rust, Python, and Go.
+- **Embedded write API for GraphRAG** — `create_node()`, `create_edge()`, `upsert_node()` with batch variants. AI agents can extract entities from documents, store them as an in-process graph, and query with Cypher — all without a server.
+- **Kuzu API parity** — `Value::Date/Timestamp/UUID` types, query timing (`compiling_time`/`execution_time`), `Database::in_memory()`, `Connection::set_query_timeout()`, column type metadata, multi-format file import (CSV/Parquet/JSON).
+- **DataFrame output** — `result.get_as_df()` (Pandas), `result.get_as_arrow()` (PyArrow), `result.get_as_pl()` (Polars) for Python data science workflows.
+
+See [CHANGELOG.md](CHANGELOG.md) for complete release history.
+
+---
+## Features
+
+### Core Capabilities
+- **Cypher-to-SQL Translation** - Industry-standard Cypher read syntax translated to optimized ClickHouse SQL
+- **Stateless Architecture** - Offloads all query execution to ClickHouse; no extra datastore required
+- **Embedded Mode** - In-process graph queries over Parquet/Iceberg/Delta/S3 via chdb; no ClickHouse server needed (`--features embedded`)
+- **Remote Mode** - Cypher translated locally, executed against external ClickHouse — no chdb required (`Database::new_remote`)
+- **DeltaGraph (Databricks SQL Warehouse)** - Cypher translated to Spark SQL locally and executed against a Databricks SQL Warehouse via the Statement Execution API. Opt-in `--features databricks`; ships the `deltagraph` server binary, `cg --dialect databricks`, `Database::new_databricks` (embedded Rust), and `Database::open_databricks` (FFI for Go/Python). See [docs/deltagraph/QUICKSTART.md](docs/deltagraph/QUICKSTART.md) (build from source) or [docs/deltagraph/DOCKER_QUICKSTART.md](docs/deltagraph/DOCKER_QUICKSTART.md) (Docker).
+- **LLM-powered schema discovery** - `cg schema discover` or `:discover` generates YAML schema from ClickHouse table metadata using Anthropic or OpenAI — no server needed
+- **Variable-Length Paths** - Recursive traversals with `*1..3` syntax using ClickHouse `WITH RECURSIVE` CTEs
+- **Path Functions** - `length(p)`, `nodes(p)`, `relationships(p)` for path analysis
+- **Parameterized Queries** - Neo4j-compatible `$param` syntax for SQL injection prevention
+- **Query Cache** - LRU caching with 10-100x speedup for repeated translations
+- **ClickHouse Functions** - Pass-through via `ch.function_name()` and `chagg.aggregate()` prefixes
+- **GraphRAG structured output** - `format: "Graph"` returns deduplicated nodes, edges, and stats for graph visualization and RAG pipelines
+- **GraphRAG write API** - `create_node()`, `create_edge()`, `upsert_node()` for in-process graph building (embedded mode)
+- **Hybrid remote + local** - Query remote ClickHouse, store subgraph locally in chdb for fast re-querying
+- **Query Metrics** - Phase-by-phase timing via HTTP headers and structured logging
+- **ClickHouse cluster load balancing** - `CLICKHOUSE_CLUSTER` env var auto-discovers and balances queries across cluster nodes
+- **openCypher TCK: 402/402 read scenarios passing (100%)** - 0 failures. Write feature files are not yet imported from upstream; v0.6.7 adds the Cypher write pipeline (`CREATE` / `SET` / `DELETE` / `REMOVE`) that will unblock them.
+- **LDBC SNB benchmark: 36/37 queries (97%)** - Near-complete Social Network Benchmark coverage. See [benchmark results](benchmarks/ldbc_snb/BENCHMARK_RESULTS.md) for performance data on sf0.003, sf1 and sf10 datasets
+
+### Neo4j Ecosystem Compatibility
+- **Bolt Protocol v5.8** - Full Neo4j driver compatibility (cypher-shell, Neo4j Browser, graph-notebook)
+- **HTTP REST API** - Complete query execution with parameters and aggregations
+- **Multi-Schema Support** - Per-request schema selection via `USE` clause, session parameter, or default
+- **Authentication** - Multiple auth schemes including basic auth
+
+### Agentic & AI Integration
+- **Agent skills** - `/cypher`, `/graph-schema`, `/schema-discover` for Claude Code, LangChain, AutoGen, CrewAI, and OpenAI function calling (see [skills/README.md](skills/README.md))
+- **`cg` CLI** - Subprocess-friendly CLI for agentic callers; outputs clean text/JSON, no interactive prompts
+- **MCP compatibility** - `apoc.meta.schema()` and Neo4j schema procedures for MCP-based AI assistants
+- **DataFrame output** - `get_as_df()` (Pandas), `get_as_arrow()` (PyArrow), `get_as_pl()` (Polars) for Python data science
+
+### View-Based Graph Model
+- **Zero Migration** - Map existing tables to graph format through YAML configuration
+- **Auto-Discovery** - `auto_discover_columns: true` queries ClickHouse metadata automatically
+- **Dynamic Schema Loading** - Runtime schema registration via `POST /schemas/load`
+- **Composite Node IDs** - Multi-column identity (e.g., `node_id: [tenant_id, user_id]`)
+
+---
+
+## How ClickGraph compares
+
+ClickGraph and DeltaGraph are **warehouse- and lakehouse-native** graph query engines: they translate Cypher to SQL and execute it **inside** ClickHouse or Databricks. They are stateless translators — they store nothing and add no compute of their own. This is a deliberately different point in the design space from a graph database, and it wins in some places and loses in others. Here is the honest map.
+
+**Where warehouse-native pushdown wins**
+
+- **No data movement.** Your existing tables — including FK-edge and denormalized layouts — *are* the graph, mapped via YAML. Nothing is imported, copied, or flattened, so relationships already encoded in your schema are preserved rather than collapsed to primitive node/edge pairs.
+- **No second compute engine.** 100% of execution is pushed down to the warehouse you already run, secure, and pay for. There is no separate graph engine to size, scale, or bill — unlike engines that deploy their own distributed compute layer beside your data.
+- **No in-memory scale ceiling.** The graph-analytics engines are in-memory by design: Neo4j GDS runs algorithms in heap (≈90% of one machine's RAM), and Amazon Neptune Analytics holds the whole graph in memory (~1 TiB at its max capacity). ClickGraph's ceiling is the warehouse's — petabyte-native. At 100s of TB–PB, the data often physically cannot be loaded into the engine that would analyze it.
+- **Freshness.** Query where fresh data already lands (ClickHouse ingests millions of rows/sec) — zero ingestion lag, because there is no ingestion step.
+- **Graph algorithms in-place.** PageRank (`CALL pagerank(...)`) and shortest path (`shortestPath` / `allShortestPaths`) run as generated SQL over your warehouse tables — no export to a separate engine.
+- **Inspectable.** `sql_only` mode returns the exact generated SQL, so you can see precisely what runs on your warehouse — no black box.
+
+**Where a native graph database still wins — use one when:**
+
+- You need **very deep, tight-loop iterative graph algorithms** at small scale where an in-memory adjacency representation is decisively faster. ClickGraph *does* support graph algorithms — **PageRank** (`CALL pagerank(...)`, translated to iterated SQL) and **shortest path** (`shortestPath` / `allShortestPaths`, compiled to BFS recursive CTEs) ship today — but like any warehouse feature they carry a scale profile: iterative execution over very large graphs is bounded by the warehouse's recursive/iterative performance, not vectorized scans. For heavy, repeated whole-graph analytics (e.g. community detection over a resident in-memory graph), a dedicated GDS/cuGraph/TigerGraph engine on a snapshot can be the better tool. (Pushing more of the iterated-`JOIN`+`GROUP BY`-over-a-semiring family further inside SQL is an active optimization direction.)
+- You need **deep OLTP-style traversal** (10-hop, millisecond, per request). The columnar scan model isn't that shape.
+- Your data is small enough (GB–low TB) that in-memory adjacency is a clean win with no scale concern.
+
+**Query-shape note.** Pattern-matching + filtering + aggregation and *bounded* traversal push down and scale with the warehouse — this is the shape of most real "graph analytics" (fraud rings, lineage, recommendations, security graph). Exact fixed-hop paths already compile to MPP-parallel joins; unbounded transitive closure uses recursive CTEs (row-iterative on ClickHouse today, and expensive for any engine at PB scale).
+
+For the full breakdown with sources, GraphRAG, and security-graph-at-scale: **[the positioning brief →](https://genezhang.github.io/clickgraph/)**
+
+---
+
+## Architecture
+
+ClickGraph service runs as a lightweight stateless query translator alongside ClickHouse:
+
+```mermaid
+flowchart LR
+    Clients["Graph Clients<br/><br/>HTTP/REST<br/>Bolt Protocol<br/>(Neo4j tools)"]
+
+    ClickGraph["ClickGraph<br/><br/>Cypher -> SQL<br/>Translator<br/><br/>:7475 (HTTP)<br/>:7687 (Bolt)"]
+
+    ClickHouse["ClickHouse<br/><br/>Columnar Storage<br/>Query Engine"]
+
+    Clients -->|Cypher| ClickGraph
+    ClickGraph -->|SQL| ClickHouse
+    ClickHouse -->|Results| ClickGraph
+    ClickGraph -->|Results| Clients
+
+    style ClickGraph fill:#e1f5ff,stroke:#0288d1,stroke-width:3px
+    style ClickHouse fill:#fff3e0,stroke:#f57c00,stroke-width:3px
+    style Clients fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+```
+
+**Three-tier architecture:** Graph clients -> ClickGraph translator -> ClickHouse database
+
+---
+
+## Quick Start
+
+**New to ClickGraph?** See the **[Getting Started Guide](docs/getting-started.md)** for a complete walkthrough.
+
+### Option 0: Pre-built Binaries
+
+Download the latest release from [GitHub Releases](https://github.com/genezhang/clickgraph/releases/latest). Assets are gzipped tarballs (`.tar.gz` on Linux/macOS, `.zip` on Windows) named `<binary>-<platform>`, where `<platform>` is one of `linux-amd64`, `macos-amd64`, `macos-arm64`, `win-amd64`:
+
+```bash
+# ClickGraph server (ClickHouse backend)
+curl -L https://github.com/genezhang/clickgraph/releases/latest/download/clickgraph-linux-amd64.tar.gz \
+  | tar -xz && chmod +x clickgraph
+
+# DeltaGraph server (Databricks backend) — same Cypher/Bolt, Spark SQL dialect
+curl -L https://github.com/genezhang/clickgraph/releases/latest/download/deltagraph-linux-amd64.tar.gz \
+  | tar -xz && chmod +x deltagraph
+
+# cg CLI tool (agent/scripting use)
+curl -L https://github.com/genezhang/clickgraph/releases/latest/download/cg-linux-amd64.tar.gz \
+  | tar -xz && chmod +x cg
+```
+
+### Option 1: Docker (Recommended)
+
+```bash
+# Pull the latest image
+docker pull genezhang/clickgraph:latest
+
+# Start ClickHouse only
+docker-compose up -d clickhouse-service
+
+# Run ClickGraph from Docker Hub image
+docker run -d \
+  --name clickgraph \
+  --network clickgraph_default \
+  -p 7475:7475 \
+  -p 7687:7687 \
+  -e CLICKHOUSE_URL="http://clickhouse-service:8123" \
+  -e CLICKHOUSE_USER="test_user" \
+  -e CLICKHOUSE_PASSWORD="test_pass" \
+  -e GRAPH_CONFIG_PATH="/app/schemas/social_benchmark.yaml" \
+  -v $(pwd)/benchmarks/social_network/schemas:/app/schemas:ro \
+  genezhang/clickgraph:latest
+```
+
+Or use docker-compose (uses published image by default):
+
+```bash
+docker-compose up -d
+```
+
+### Option 2: Build from Source
+
+```bash
+# Prerequisites: Rust toolchain (1.85+) and Docker for ClickHouse
+
+# 1. Clone and start ClickHouse
+git clone https://github.com/genezhang/clickgraph
+cd clickgraph
+docker-compose up -d clickhouse-service
+
+# 2. Build and run
+cargo build --release
+export CLICKHOUSE_URL="http://localhost:8123"
+export CLICKHOUSE_USER="test_user"
+export CLICKHOUSE_PASSWORD="test_pass"
+export GRAPH_CONFIG_PATH="./benchmarks/social_network/schemas/social_benchmark.yaml"
+cargo run --bin clickgraph
+```
+
+> `GRAPH_CONFIG_PATH` is required. It tells ClickGraph how to map ClickHouse tables to graph nodes and edges.
+
+### Test Your Setup
+
+```bash
+# HTTP API
+curl -X POST http://localhost:7475/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (u:User) RETURN u.full_name LIMIT 5"}'
+
+# Bolt protocol (cypher-shell, Neo4j Browser, or any Neo4j driver)
+# (cypher-shell needs the server started with --neo4j-compat-mode)
+cypher-shell -a bolt://localhost:7687 -u neo4j -p password
+```
+
+### Visualize with Neo4j Browser
+
+Run the included demo for interactive graph visualization:
+
+```bash
+cd demos/neo4j-browser && bash setup.sh
+```
+
+Then open http://localhost:7474 and connect to `bolt://localhost:7687`.
+See [demos/neo4j-browser/README.md](https://github.com/genezhang/clickgraph/blob/main/demos/neo4j-browser/README.md) for details.
+
+### AI Assistant Integration
+
+**Agent skills** — drop-in skills for Claude Code and other agentic frameworks, backed by the `cg` CLI (no MCP server needed):
+
+```bash
+# Install for Claude Code
+mkdir -p .claude/commands
+curl -L https://raw.githubusercontent.com/genezhang/clickgraph/main/skills/cypher.md \
+  -o .claude/commands/cypher.md
+curl -L https://raw.githubusercontent.com/genezhang/clickgraph/main/skills/graph-schema.md \
+  -o .claude/commands/graph-schema.md
+
+# Then in Claude Code:
+# /cypher find users with more than 10 followers
+# /graph-schema
+```
+
+See **[skills/README.md](skills/README.md)** for installation across Claude Code, LangChain, AutoGen, CrewAI, and OpenAI function calling.
+
+**MCP server** — for frameworks requiring the MCP protocol, ClickGraph implements `apoc.meta.schema()` and Neo4j-compatible schema procedures, compatible with [`@anthropic-ai/mcp-server-neo4j`](https://www.npmjs.com/package/@anthropic-ai/mcp-server-neo4j) and [`@neo4j/mcp-neo4j`](https://www.npmjs.com/package/@neo4j/mcp-neo4j).
+
+See the **[MCP Setup Guide](https://github.com/genezhang/clickgraph/blob/main/docs/wiki/AI-Assistant-Integration-MCP.md)** for configuration details.
+
+### CLI Tools
+
+**`cg` — agent/script CLI** (no server needed):
+```bash
+cargo build --release -p clickgraph-tool
+# Translate Cypher → SQL
+./target/release/cg --schema schema.yaml sql "MATCH (u:User) RETURN u.name LIMIT 5"
+# Execute against ClickHouse
+./target/release/cg --schema schema.yaml --clickhouse http://localhost:8123 \
+  query "MATCH (u:User)-[:FOLLOWS]->(f) RETURN f.name LIMIT 5"
+# NL → Cypher (requires ANTHROPIC_API_KEY or OPENAI_API_KEY)
+./target/release/cg --schema schema.yaml nl "find users with more than 10 followers"
+```
+
+**`clickgraph-client` — interactive REPL** (connects to a running server):
+```bash
+cargo build --release -p clickgraph-client
+./target/release/clickgraph-client  # connects to http://localhost:7475
+```
+
+---
+
+## Schema Configuration
+
+Map your tables to a graph with YAML:
+
+```yaml
+views:
+  - name: social_network
+    nodes:
+      - label: user
+        table: users
+        database: mydb
+        node_id: user_id
+        property_mappings:
+          name: full_name
+    edges:
+      - type: follows
+        table: user_follows
+        database: mydb
+        from_node: user
+        to_node: user
+        from_id: follower_id
+        to_id: followed_id
+```
+
+```cypher
+MATCH (u:user)-[:follows]->(friend:user)
+WHERE u.name = 'Alice'
+RETURN friend.name
+```
+
+---
+
+## Documentation
+
+- **[Getting Started](docs/getting-started.md)** - Setup walkthrough and first queries
+- **[Features Overview](docs/features.md)** - Comprehensive feature list
+- **[API Documentation](docs/api.md)** - HTTP REST API and Bolt protocol
+- **[Configuration Guide](docs/configuration.md)** - Server configuration and CLI options
+- **[Wiki](https://github.com/genezhang/clickgraph/blob/main/docs/wiki/)** - Comprehensive guides: [Cypher Reference](https://github.com/genezhang/clickgraph/blob/main/docs/wiki/Cypher-Language-Reference.md), [Schema Basics](https://github.com/genezhang/clickgraph/blob/main/docs/wiki/Schema-Basics.md), [Graph-Notebook](https://github.com/genezhang/clickgraph/blob/main/docs/wiki/Graph-Notebook-Compatibility.md), [Neo4j Tools](https://github.com/genezhang/clickgraph/blob/main/docs/wiki/Neo4j-Tools-Integration.md)
+- **[Examples](examples/)** - [Quick Start](examples/quick-start.md) | [E-commerce Analytics](examples/ecommerce-analytics.md)
+- **[Dev Quick Start](DEV_QUICK_START.md)** - 30-second workflow for contributors
+
+---
+
+## Development Status
+
+**Current Version**: v0.6.6-dev
+
+### Test Coverage
+- **Rust Unit Tests**: 1,601 passing (100%)
+- **Integration Tests**: 3,068 passing (108 environment-dependent)
+- **openCypher TCK**: 402/402 read scenarios passing (100%), 0 failures
+- **LDBC SNB**: 36/37 queries passing (97%)
+- **Benchmarks**: 14/14 passing (100%)
+- **E2E Tests**: Bolt 4/4, Cache 5/5 (100%)
+
+### Known Limitations
+- **Cypher writes — embedded mode only**: `CREATE`, `SET`, `DELETE`, `REMOVE` work in embedded mode against ClickGraph-managed tables (v0.6.7+). Server / remote / sql_only modes reject writes; `source:`-backed nodes/edges remain read-only. `MERGE` is planned for v0.7.x. See [Known Issues #2 / #3](KNOWN_ISSUES.md) for the full list of unsupported write combinations.
+- **Anonymous Nodes**: Use named nodes for better SQL generation
+
+See [STATUS.md](STATUS.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
+
+## Roadmap
+
+| Phase | Version | Status |
+|-------|---------|--------|
+| Phase 1 | v0.4.0 | Complete - Query cache, parameters, Bolt protocol |
+| Phase 2 | v0.5.0 | Complete - Multi-tenancy, RBAC, auto-schema discovery |
+| Phase 2.5-2.6 | v0.5.2-v0.5.3 | Complete - Schema variations, Cypher functions |
+| Phase 3 | v0.6.3 | Complete - WITH redesign, GraphRAG, LDBC SNB, MCP |
+| Phase 4 | v0.6.x | Next - user-requested features, advanced optimizations |
+
+See [ROADMAP.md](ROADMAP.md) for detailed feature tracking.
+
+## Contributing
+
+Contributions welcome! See [DEV_QUICK_START.md](DEV_QUICK_START.md) to get started and [DEVELOPMENT_PROCESS.md](DEVELOPMENT_PROCESS.md) for the full workflow.
+
+## License
+
+ClickGraph is licensed under the Apache License, Version 2.0. See the LICENSE file for details.
+
+This project is developed on a forked repo of [Brahmand](https://github.com/darshanDevrai/brahmand) with zero-ETL view-based graph querying, Neo4j ecosystem compatibility and enterprise deployment capabilities.

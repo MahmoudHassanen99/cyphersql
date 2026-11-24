@@ -1,0 +1,907 @@
+//! Common utilities for ClickHouse query generation
+
+// ⚠️ NOTE: Literal rendering code appears in multiple places due to different Literal types:
+//
+// - crate::query_planner::logical_expr::Literal (used in to_sql.rs)
+// - crate::render_plan::render_expr::Literal (used in to_sql_query.rs)
+//
+// These are structurally similar but different types, making consolidation complex.
+// The rendering logic is duplicated across:
+// 1. to_sql.rs (lines ~65-70): Handles LogicalExpr::Literal
+// 2. to_sql_query.rs (lines ~1620-1630): Handles RenderExpr::Literal
+//
+// Future Improvement: Create a unified Literal trait that both types implement,
+// enabling a single render_literal() function in this module.
+
+/// Quote an identifier (column name, table name) if it contains special
+/// characters, using the **active dialect's** identifier delimiter.
+///
+/// An identifier needs quoting unless it is a plain ASCII identifier (a
+/// letter or `_`, then letters, digits and `_`, [`is_plain_identifier`]):
+/// a dot, a space, a hyphen, any other symbol, a non-ASCII letter (bare,
+/// ClickHouse reads `é` as an unrecognized token) or a leading digit. A
+/// Cypher name can hold any character (`` n.`a;b` ``, #1489), so a name
+/// is never emitted bare unless it is plain.
+///
+/// When quoting is needed the delimiter is dialect-specific — ClickHouse
+/// double-quotes (`"id.orig_h"`), Spark/Databricks backticks
+/// (`` `id.orig_h` ``) — routed through [`FunctionMapper::quote_alias`], which
+/// also escapes any embedded delimiter. This keeps a CTE-build-stage reference
+/// (Path C, `cte_extraction.rs`) byte-identical with the final-SELECT renderer
+/// (Path A, `to_sql_query.rs`), which qualifies special-char columns via the
+/// same dialect helper. Previously this hard-coded backticks for both dialects,
+/// which was valid CH but drifted from Path A's `"…"` — a query could emit both
+/// `` t2.`id.orig_h` `` (CTE body) and `t1."id.orig_h"` (SELECT). Plain
+/// identifiers (no special char) are returned bare, unchanged.
+///
+/// # Examples
+/// ```
+/// use clickgraph::clickhouse_query_generator::quote_identifier;
+/// // Default dialect (outside a query context) is ClickHouse → double-quotes.
+/// assert_eq!(quote_identifier("user_id"), "user_id");
+/// assert_eq!(quote_identifier("id.orig_h"), "\"id.orig_h\"");
+/// assert_eq!(quote_identifier("user-name"), "\"user-name\"");
+/// // Any other symbol, a non-ASCII letter, a backslash (#1489).
+/// assert_eq!(quote_identifier("a;b"), "\"a;b\"");
+/// assert_eq!(quote_identifier("é"), "\"é\"");
+/// assert_eq!(quote_identifier(r"a\"), r#""a\\""#);
+/// ```
+pub fn quote_identifier(name: &str) -> String {
+    if is_plain_identifier(name) {
+        name.to_string()
+    } else {
+        crate::sql_generator::function_mapper::current_function_mapper().quote_alias(name)
+    }
+}
+
+/// A name that is a valid unquoted identifier in every dialect: an ASCII
+/// letter or `_`, then ASCII letters, digits and `_`.
+pub fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Format a qualified column reference: table_alias.column_name
+///
+/// Quotes the column name (via [`quote_identifier`]) with the active dialect's
+/// delimiter when it contains special characters.
+///
+/// # Examples
+/// ```
+/// use clickgraph::clickhouse_query_generator::qualified_column;
+/// // Default dialect (outside a query context) is ClickHouse → double-quotes.
+/// assert_eq!(qualified_column("t1", "user_id"), "t1.user_id");
+/// assert_eq!(qualified_column("t1", "id.orig_h"), "t1.\"id.orig_h\"");
+/// ```
+pub fn qualified_column(table_alias: &str, column_name: &str) -> String {
+    format!("{}.{}", table_alias, quote_identifier(column_name))
+}
+
+/// Emit a substring-containment predicate for Cypher `haystack CONTAINS needle`,
+/// dialect-aware.
+///
+/// ClickHouse `position(haystack, needle)` and Spark/Databricks
+/// `position(substr, str)` take their two arguments in OPPOSITE order, so the
+/// operands are swapped when rendering for Databricks. Both return a 1-based
+/// index (0 = not found), so the `> 0` test is identical.
+pub fn contains_predicate(haystack: &str, needle: &str) -> String {
+    use crate::sql_generator::SqlDialect;
+    match crate::server::query_context::get_current_dialect() {
+        // Spark: position(substr, str) — substring first.
+        SqlDialect::Databricks => format!("(position({}, {}) > 0)", needle, haystack),
+        // ClickHouse: position(haystack, needle) — haystack first.
+        _ => format!("(position({}, {}) > 0)", haystack, needle),
+    }
+}
+
+/// Emit a prefix-match predicate for Cypher `haystack STARTS WITH needle`,
+/// dialect-aware.
+///
+/// ClickHouse spells it `startsWith(haystack, needle)` (camelCase);
+/// Spark/Databricks has the builtin `startswith(str, prefix)` (lowercase, same
+/// argument order). Pure name-case swap — both return a boolean. Emitted from
+/// every `StartsWith` render site so the two dialects stay in sync.
+pub fn starts_with_predicate(haystack: &str, needle: &str) -> String {
+    use crate::sql_generator::SqlDialect;
+    match crate::server::query_context::get_current_dialect() {
+        SqlDialect::Databricks => format!("startswith({}, {})", haystack, needle),
+        _ => format!("startsWith({}, {})", haystack, needle),
+    }
+}
+
+/// Emit a suffix-match predicate for Cypher `haystack ENDS WITH needle`,
+/// dialect-aware.
+///
+/// ClickHouse spells it `endsWith(haystack, needle)` (camelCase);
+/// Spark/Databricks has the builtin `endswith(str, suffix)` (lowercase, same
+/// argument order). Pure name-case swap — both return a boolean. Emitted from
+/// every `EndsWith` render site so the two dialects stay in sync.
+pub fn ends_with_predicate(haystack: &str, needle: &str) -> String {
+    use crate::sql_generator::SqlDialect;
+    match crate::server::query_context::get_current_dialect() {
+        SqlDialect::Databricks => format!("endswith({}, {})", haystack, needle),
+        _ => format!("endsWith({}, {})", haystack, needle),
+    }
+}
+
+/// Render a Cypher `=~` regex match (`RegexMatch` operator) for the active dialect.
+///
+/// ClickHouse spells it `match(haystack, pattern)`; Spark/Databricks has no
+/// `match` function and uses `rlike(str, regexp)` (both return a boolean).
+/// Emitted from every `RegexMatch` render site so the two dialects stay in sync.
+///
+/// #1171: Cypher's `=~` must match the ENTIRE string (Neo4j runs Java
+/// `Pattern.matches`; the manual's examples need `.*@company.com` for a partial
+/// match), but `match()` and `rlike()` are both unanchored SEARCHES — so
+/// `x =~ 'A.*'` returned every value merely CONTAINING an `A`. The pattern is
+/// therefore anchored (see [`anchor_regex_pattern_sql`]):
+/// - the general form is `\A(?:<pattern>)\z`. `(?:…)` keeps an alternation
+///   anchored as a whole (`a|b` is whole-string `a` or `b`, not `\Aa|b\z`) and still
+///   lets a leading inline flag (`(?i)…`) apply to the pattern;
+/// - `\z` (not `$`) means end of TEXT under RE2 (ClickHouse) and Java (Databricks)
+///   alike and — unlike `$` in Java — rejects a trailing newline;
+/// - a pattern with no alternation needs no group and is emitted as `^<pattern>\z`,
+///   so ClickHouse can still extract a literal prefix for primary-key pruning
+///   (`name =~ '^key12.*'` reads 12 of 195 granules; the grouped form reads all 195).
+pub fn regex_match_predicate(haystack: &str, pattern: &str) -> String {
+    use crate::sql_generator::SqlDialect;
+    let anchored = anchor_regex_pattern_sql(pattern);
+    match crate::server::query_context::get_current_dialect() {
+        SqlDialect::Databricks => format!("rlike({}, {})", haystack, anchored),
+        _ => format!("match({}, {})", haystack, anchored),
+    }
+}
+
+/// Wrap an already-rendered SQL pattern expression so it must match a whole string
+/// (see [`regex_match_predicate`]). The anchors are SQL string literals, so each
+/// backslash is doubled (`'\\A'` is the two characters `\A` in both dialects).
+///
+/// A plain single string literal is folded into one literal — readable SQL, and
+/// the pattern stays a compile-time constant, which ClickHouse's `match` requires.
+/// Anything else (a parameter, a concatenation, a column) gets `concat(...)`,
+/// which is constant whenever its parts are, and always the grouped form because
+/// its text cannot be inspected.
+///
+/// For a literal, the group is dropped (`'A.*'` becomes `'^A.*\\z'`; a user's own
+/// leading `^` is kept, not doubled) ONLY when that is provably the same pattern
+/// (see [`can_skip_regex_group`]); otherwise it is `'\\A(?:A|B)\\z'`, the grouped
+/// form, which fails LOUDLY on a malformed pattern rather than quietly changing
+/// its meaning.
+fn anchor_regex_pattern_sql(pattern: &str) -> String {
+    const OPEN: &str = "\\\\A(?:";
+    const CLOSE: &str = ")\\\\z";
+    const END: &str = "\\\\z";
+    match single_sql_string_literal_body(pattern) {
+        Some(body) if can_skip_regex_group(body) => {
+            let rest = body.strip_prefix('^').unwrap_or(body);
+            format!("'^{rest}{END}'")
+        }
+        Some(body) => format!("'{OPEN}{body}{CLOSE}'"),
+        None => format!("concat('{OPEN}', {pattern}, '{CLOSE}')"),
+    }
+}
+
+/// True when `^<body>\z` is the same whole-string pattern as `\A(?:<body>)\z`.
+/// `body` is the text between the SQL quotes (SQL escapes intact). Refuses, so the
+/// grouped form is used, when the group could matter:
+/// - any `|` — a top-level alternation would escape the anchors;
+/// - `\Q` — an unterminated quote would swallow the closing `\z`;
+/// - a trailing backslash — it would escape the `\` of `\z`.
+fn can_skip_regex_group(body: &str) -> bool {
+    !body.contains('|') && !body.contains("\\Q") && !body.ends_with('\\')
+}
+
+/// If `sql` is exactly ONE single-quoted SQL string literal, return the text
+/// between its quotes (escapes intact). Backslash escapes the next character and
+/// `''` is an escaped quote; a quote that closes the literal before the end of
+/// the text means `sql` is a larger expression (`'a' || x`), so `None`.
+fn single_sql_string_literal_body(sql: &str) -> Option<&str> {
+    let inner = sql.strip_prefix('\'')?;
+    let mut chars = inner.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' => {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    chars.next();
+                } else {
+                    return (i + 1 == inner.len()).then(|| &inner[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Render a Cypher `reduce(acc = init, x IN list | expr)` fold for the active
+/// dialect, from its already-rendered component strings.
+///
+/// ClickHouse's `arrayFold` binds the lambda's FIRST parameter to the
+/// **accumulator** and the second to the element:
+/// `arrayFold((accumulator, element) -> expr, list, init)` (CH also accepts the
+/// unparenthesized `arrayFold(acc, x -> expr, list, init)`). Spark/Databricks
+/// has no `arrayFold` and uses `aggregate(list, init, (acc, x) -> expr)` — same
+/// accumulator-first order, different spelling. Emitted from every `ReduceExpr`
+/// render site so the two dialects stay in sync.
+///
+/// #950: the ClickHouse branch previously emitted `arrayFold(x, acc -> expr,
+/// …)` — the ELEMENT first — so ClickHouse bound `x` to the accumulator and
+/// `acc` to the element, SWAPPING the two inside `expr`. That is silently wrong
+/// for any non-commutative/non-associative body (`reduce(acc = 0, y IN [1,2,3] |
+/// acc*10 + y)` gave 60 instead of 123) and a `Code 43` when the element and
+/// accumulator types differ. The Databricks branch was already correct.
+pub fn reduce_fold_sql(
+    variable: &str,
+    accumulator: &str,
+    expr_sql: &str,
+    list_sql: &str,
+    init_sql: &str,
+) -> String {
+    use crate::sql_generator::SqlDialect;
+    match crate::server::query_context::get_current_dialect() {
+        SqlDialect::Databricks => format!(
+            "aggregate({}, {}, ({}, {}) -> {})",
+            list_sql, init_sql, accumulator, variable, expr_sql
+        ),
+        // ClickHouse: accumulator is the FIRST lambda parameter.
+        _ => format!(
+            "arrayFold({}, {} -> {}, {}, {})",
+            accumulator, variable, expr_sql, list_sql, init_sql
+        ),
+    }
+}
+
+/// #969: build the `{binder_name → RenderType}` map for a `reduce()`'s lambda
+/// body from its structural components — `accumulator` takes the type of
+/// `initial_value`, `variable` the ELEMENT type of `list`. Only binders whose
+/// type resolves are inserted (an unresolved binder stays untyped → unchanged).
+///
+/// Install it around the body render with
+/// `push_reduce_binder_types` / `restore_reduce_binder_types` so
+/// `infer_render_type` can type a bare binder reference — letting the string-`+`
+/// → `concat` detector fire for `reduce(s = '', x IN ['a','b'] | s + x)`.
+pub fn reduce_binder_type_map(
+    accumulator: &str,
+    initial_value: &crate::render_plan::render_expr::RenderExpr,
+    variable: &str,
+    list: &crate::render_plan::render_expr::RenderExpr,
+) -> std::collections::HashMap<
+    String,
+    crate::sql_generator::emitters::clickhouse::type_inference::RenderType,
+> {
+    use crate::sql_generator::emitters::clickhouse::type_inference::{
+        infer_list_element_type, infer_render_type,
+    };
+    let mut map = std::collections::HashMap::new();
+    if let Some(t) = infer_render_type(initial_value) {
+        map.insert(accumulator.to_string(), t);
+    }
+    if let Some(t) = infer_list_element_type(list) {
+        map.insert(variable.to_string(), t);
+    }
+    map
+}
+
+/// Render a Cypher *simple* CASE (`CASE expr WHEN v1 THEN r1 ... ELSE d END`)
+/// for the active dialect, from its already-rendered component strings.
+///
+/// ClickHouse spells the simple form as a function,
+/// `caseWithExpression(expr, v1, r1, v2, r2, ..., default)`; Spark/Databricks
+/// has no such function and uses the standard `CASE expr WHEN v THEN r ... ELSE
+/// d END` syntax (which ClickHouse also accepts, but the function form is what
+/// this pipeline has historically emitted for CH, so it is preserved
+/// byte-identically here). Emitted from the `RenderExpr::Case` render site so
+/// the two dialects stay in sync.
+///
+/// `case_expr` is the rendered subject expression, `when_then` the rendered
+/// `(value, result)` branch pairs, and `default` the rendered ELSE result
+/// (callers pass the fallback — `NULL` or an empty array — when the Cypher CASE
+/// omits ELSE).
+pub fn simple_case_sql(case_expr: &str, when_then: &[(String, String)], default: &str) -> String {
+    use crate::sql_generator::SqlDialect;
+    match crate::server::query_context::get_current_dialect() {
+        SqlDialect::Databricks => {
+            let mut sql = format!("CASE {}", case_expr);
+            for (value, result) in when_then {
+                sql.push_str(&format!(" WHEN {} THEN {}", value, result));
+            }
+            sql.push_str(&format!(" ELSE {} END", default));
+            sql
+        }
+        // ClickHouse: caseWithExpression(expr, v1, r1, ..., default).
+        _ => {
+            let mut args = vec![case_expr.to_string()];
+            for (value, result) in when_then {
+                args.push(value.clone());
+                args.push(result.clone());
+            }
+            args.push(default.to_string());
+            format!("caseWithExpression({})", args.join(", "))
+        }
+    }
+}
+
+/// Render Cypher `round()` for the active dialect, matching the Neo4j 5.25
+/// reference semantics (`CypherFunctions.java`) from its already-rendered
+/// argument strings.
+///
+/// Neo4j's `round()` is NOT a single rounding mode — it has two branches:
+///
+/// - **1-arg `round(x)`** and **2-arg `round(x, 0)`** (precision literally 0,
+///   no explicit mode) fall to Java `Math.round(x)` = `floor(x + 0.5)`, which
+///   breaks ties toward **+∞** (`round(0.5)=1`, `round(2.5)=3`,
+///   `round(-0.5)=0`, `round(-2.5)=-2`, `round(-1.5)=-1`). This is *not*
+///   away-from-zero — negative `.5` ties round up toward zero/+∞.
+/// - **2-arg `round(x, d)` with d ≠ 0** uses
+///   `BigDecimal.valueOf(x).setScale(d, HALF_UP)` — HALF_UP is
+///   round-half-**away-from-zero**, applied to the *shortest decimal string*
+///   of the double (`round(0.575,2)=0.58`, `round(1.005,2)=1.01`,
+///   `round(0.145,2)=0.15`, `round(-0.575,2)=-0.58`, `round(0.125,2)=0.13`).
+///
+/// ClickHouse's native `round` is HALF_EVEN (banker's rounding), so a plain
+/// `round → round` name-map is a silent fidelity bug. This emits:
+///
+/// - 1-arg / 2-arg-with-`0`:  `floor(x + 0.5)`  (Math.round; x evaluated once)
+/// - 2-arg (d ≠ 0):
+///   `if(abs(x) >= 1e15, x, sign(x) * floor(abs(toDecimal128(toString(x), 18)) * toDecimal128(pow(10, d), 0) + toDecimal128('0.5', 18)) / pow(10, d))`
+///
+///   `toString(x)` recovers the shortest decimal representation (matching
+///   `BigDecimal.valueOf`, which parses the double's canonical string), and
+///   `toDecimal128(..., 18)` / `toDecimal128(pow(10, d), 0)` keep the scaling in
+///   the decimal domain so no binary-float error is reintroduced. The `+ 0.5`
+///   MUST be a decimal literal `toDecimal128('0.5', 18)`, not a Float64 `0.5`:
+///   a float `0.5` promotes the exact `Decimal(38,18)` product back to Float64
+///   (`toFloat64(Decimal 1234.5) = 1234.4999999999998`), collapsing ties
+///   downward — silent-wrong at magnitude ≥ 10 / precision ≥ 3
+///   (`round(12.345,2)` would give 12.34 instead of 12.35). The
+///   `sign(x) * floor(abs(...) ...)` shape gives HALF_UP away-from-zero
+///   symmetrically for negatives.
+///
+///   `toDecimal128(…, 18)` (Decimal(38,18)) overflows (CH Code 69) once the
+///   integer part exceeds ~20 digits, i.e. `|x| ≳ 10^20`. The `if(abs(x) >=
+///   1e15, x, …)` guard short-circuits BEFORE the decimal branch is evaluated
+///   (ClickHouse `if` is lazy), returning `x` unchanged for large magnitudes.
+///   This is exact, not a fallback compromise: a Float64 has no fractional bits
+///   left at `|x| ≥ 2^52 ≈ 4.5×10^15`, so `round(x, d) == x` there anyway, which
+///   is what Neo4j returns too. The 1e15 threshold sits safely inside both the
+///   "no fractional precision" regime and the decimal range. Scale 18 (not a
+///   smaller scale) is kept so the common small-|x| cases retain full 18-digit
+///   fractional fidelity. Live-validated on ClickHouse 26.7 across a
+///   magnitude × precision sweep, negatives, and the 1e30 overflow case.
+///
+/// Spark/Databricks `round` is ALREADY HALF_UP away-from-zero for the 2-arg
+/// form and matches Neo4j's Math.round default at precision 0, so it is emitted
+/// unchanged as a plain `round(args)` call — keeping Databricks output
+/// byte-identical.
+///
+/// `args_sql` are the already-rendered argument fragments in Cypher order.
+/// Returns `Some(sql)` for the 1-arg and 2-arg forms; `None` for any other
+/// arity. In particular the **3-arg explicit-mode form** `round(x, d, 'MODE')`
+/// returns `None` and falls through to CH's native `round`, which takes at most
+/// 2 arguments and therefore raises a **loud** `NUMBER_OF_ARGUMENTS_DOESNT_MATCH`
+/// (Code 42) error — the explicit-mode form is not yet supported on ClickHouse,
+/// and this fails loud rather than silently mis-rounding.
+///
+/// Residual: the 2-arg (d ≠ 0) form textually references `x` twice (`sign(x)`
+/// and `toString(x)`), so a non-deterministic argument such as `round(rand(),
+/// 2)` draws `rand()` more than once. The common 1-arg / precision-0 forms
+/// evaluate `x` exactly once.
+pub fn round_half_up_sql(args_sql: &[String]) -> Option<String> {
+    use crate::sql_generator::SqlDialect;
+    // Spark/Databricks round() already matches Neo4j (HALF_UP away-from-zero for
+    // the 2-arg form, Math.round default at precision 0) — emit the native call
+    // unchanged so its output stays byte-identical.
+    if matches!(
+        crate::server::query_context::get_current_dialect(),
+        SqlDialect::Databricks
+    ) {
+        return match args_sql.len() {
+            1 | 2 => Some(format!("round({})", args_sql.join(", "))),
+            _ => None,
+        };
+    }
+    // ClickHouse: emit the Neo4j-faithful formula (native round is HALF_EVEN).
+    match args_sql {
+        // 1-arg: Math.round = floor(x + 0.5), ties toward +∞.
+        [x] => Some(format!("floor({x} + 0.5)")),
+        // 2-arg with precision literally 0 hits the SAME Math.round branch in
+        // Neo4j (`precision == 0 && !explicitMode`), NOT the HALF_UP setScale
+        // path — so `round(-2.5, 0) = -2`, not -3.
+        [x, d] if d.trim() == "0" => Some(format!("floor({x} + 0.5)")),
+        // 2-arg (d != 0): BigDecimal.setScale(d, HALF_UP) on the shortest
+        // decimal string — HALF_UP away-from-zero, scaled in the decimal domain.
+        // The `+ toDecimal128('0.5', 18)` MUST be decimal, not a float 0.5, or
+        // the exact product promotes to Float64 and ties collapse downward. The
+        // `if(abs(x) >= 1e15, x, …)` guard short-circuits before the decimal
+        // branch to avoid Code 69 overflow for large |x| (where round(x,d)==x
+        // anyway — a double has no fractional bits past ~4.5e15).
+        [x, d] => Some(format!(
+            "if(abs({x}) >= 1e15, {x}, \
+             sign({x}) * floor(abs(toDecimal128(toString({x}), 18)) \
+             * toDecimal128(pow(10, {d}), 0) + toDecimal128('0.5', 18)) / pow(10, {d}))"
+        )),
+        // 3-arg round(x, d, 'MODE') and any other arity: fall through. CH's
+        // native round takes at most 2 args, so the 3-arg explicit-mode form
+        // fails LOUD (Code 42) — unsupported rather than silently mis-rounded.
+        _ => None,
+    }
+}
+
+/// Resolve a SQL function name to its active-dialect spelling via the function
+/// registry, falling back to `name` unchanged when it has no registry entry.
+///
+/// Lets the duplicate generic `ScalarFnCall` renderers (in `render_plan`) map
+/// dialect-divergent names (e.g. `tuple` -> Spark `struct`) without each one
+/// re-implementing the lookup. The canonical `RenderExpr::to_sql` arm already
+/// routes through the registry directly; this is the shared shim for the others.
+pub fn dialect_function_name(name: &str) -> String {
+    use super::function_registry::get_function_mapping;
+    match get_function_mapping(&name.to_lowercase()) {
+        // Only remap pure name-swaps. A registry entry with an `arg_transform`
+        // (e.g. `left`/`right` -> `substring(s, 1, n)`) also rewrites its
+        // arguments; this shim renders args itself and cannot apply that
+        // transform, so name-mapping such an entry would emit a wrong call.
+        // Leave those raw — they are handled correctly by the canonical
+        // `RenderExpr::to_sql` / `translate_scalar_function` paths.
+        Some(mapping) if mapping.arg_transform.is_none() => mapping
+            .name_for(crate::server::query_context::get_current_dialect())
+            .to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// #866: render `arrayFilter`/`arrayMap` (the list-comprehension lowering) for
+/// the duplicate generic `ScalarFnCall` renderers (Path C in `render_plan`,
+/// e.g. `cte_extraction`). These registry entries carry an `arg_transform`
+/// (the CH↔Spark arg swap), so `dialect_function_name` deliberately leaves them
+/// raw — this shim applies BOTH the dialect name and the transform, matching
+/// the canonical Path-A `RenderExpr::to_sql` arm. Returns `None` for any other
+/// function so the caller keeps its existing `dialect_function_name` path.
+/// `rendered_args` are already-rendered SQL strings (the transform operates on
+/// strings, like the Path-A `arg_transform` application).
+pub fn list_higher_order_fn_sql(fn_lower: &str, rendered_args: &[String]) -> Option<String> {
+    if fn_lower != "arrayfilter" && fn_lower != "arraymap" {
+        return None;
+    }
+    let mapping = super::function_registry::get_function_mapping(fn_lower)?;
+    let dialect = crate::server::query_context::get_current_dialect();
+    let args = match mapping.arg_transform {
+        Some(t) => t(rendered_args),
+        None => rendered_args.to_vec(),
+    };
+    Some(format!(
+        "{}({})",
+        mapping.name_for(dialect),
+        args.join(", ")
+    ))
+}
+
+/// Intercept the openCypher percentile aggregates and render them through
+/// `FunctionMapper::percentile_aggregate`, honoring the percentile argument
+/// (#639). Returns `Some(sql)` for `percentileCont`/`percentileDisc` called
+/// with exactly `(expr, percentile)`; `None` for any other function name or
+/// arity, so the caller falls through to its normal (loud) handling — we never
+/// emit a percentile call with a dropped or mis-placed argument.
+///
+/// `args_sql` are the already-rendered argument fragments in Cypher order:
+/// `args_sql[0]` = value expression, `args_sql[1]` = percentile.
+pub fn try_render_percentile(fn_name: &str, args_sql: &[String]) -> Option<String> {
+    let continuous = match fn_name.to_lowercase().as_str() {
+        "percentilecont" => true,
+        "percentiledisc" => false,
+        _ => return None,
+    };
+    // openCypher percentiles are strictly binary. A wrong arity is a genuine
+    // error — fall through so the raw call surfaces a loud database error
+    // rather than silently guessing.
+    if args_sql.len() != 2 {
+        return None;
+    }
+    let mapper = crate::sql_generator::function_mapper::current_function_mapper();
+    Some(mapper.percentile_aggregate(&args_sql[0], &args_sql[1], continuous))
+}
+
+#[cfg(test)]
+mod dialect_function_name_tests {
+    use super::dialect_function_name;
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    #[tokio::test]
+    async fn maps_pure_name_swaps_only() {
+        // tuple is a pure name-swap -> mapped per dialect.
+        assert_eq!(dialect_function_name("tuple"), "tuple"); // default = ClickHouse
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let dbx_tuple = with_query_context(ctx, async { dialect_function_name("tuple") }).await;
+        assert_eq!(dbx_tuple, "struct");
+
+        // left/right have an arg_transform (-> substring with rewritten args), so
+        // this shim must NOT name-map them — it would emit substring() without the
+        // transform. They stay raw on both dialects.
+        assert_eq!(dialect_function_name("left"), "left");
+        assert_eq!(dialect_function_name("right"), "right");
+        let ctx2 = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let dbx_left = with_query_context(ctx2, async { dialect_function_name("left") }).await;
+        assert_eq!(dbx_left, "left");
+
+        // Unknown functions fall through unchanged.
+        assert_eq!(dialect_function_name("some_native_fn"), "some_native_fn");
+    }
+}
+
+#[cfg(test)]
+mod try_render_percentile_tests {
+    use super::try_render_percentile;
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    #[test]
+    fn renders_parametric_quantile_on_clickhouse_default() {
+        // Default (no scope) = ClickHouse: parametric quantile forms (#639).
+        assert_eq!(
+            try_render_percentile("percentilecont", &["t.x".into(), "0.9".into()]),
+            Some("quantileExactInclusive(0.9)(t.x)".into())
+        );
+        assert_eq!(
+            try_render_percentile("percentiledisc", &["t.x".into(), "0.9".into()]),
+            Some(
+                "arrayElementOrNull(arraySort(groupArray(t.x)), greatest(1, toUInt32(ceil(0.9 * count(t.x)))))"
+                    .into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn renders_spark_forms_under_databricks() {
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let sql = with_query_context(ctx, async {
+            try_render_percentile("percentilecont", &["t.x".into(), "0.9".into()])
+        })
+        .await;
+        assert_eq!(sql, Some("percentile(t.x, 0.9)".into()));
+    }
+
+    #[test]
+    fn returns_none_for_non_percentile_or_wrong_arity() {
+        // Non-percentile name → None (caller handles it normally).
+        assert_eq!(try_render_percentile("avg", &["t.x".into()]), None);
+        // Wrong arity → None: never emit a percentile with a dropped/guessed
+        // arg — the caller falls through to a loud error (#639).
+        assert_eq!(
+            try_render_percentile("percentilecont", &["t.x".into()]),
+            None
+        );
+        assert_eq!(
+            try_render_percentile(
+                "percentiledisc",
+                &["t.x".into(), "0.9".into(), "extra".into()]
+            ),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod simple_case_sql_tests {
+    use super::simple_case_sql;
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    fn branches() -> Vec<(String, String)> {
+        vec![
+            ("'Alice'".into(), "'Admin'".into()),
+            ("'Bob'".into(), "'User'".into()),
+        ]
+    }
+
+    #[test]
+    fn clickhouse_default_uses_case_with_expression() {
+        // Default (no scope) = ClickHouse: the historical function form,
+        // byte-identical to what the pipeline emitted before this helper.
+        assert_eq!(
+            simple_case_sql("n.name", &branches(), "'Guest'"),
+            "caseWithExpression(n.name, 'Alice', 'Admin', 'Bob', 'User', 'Guest')"
+        );
+    }
+
+    #[tokio::test]
+    async fn databricks_uses_standard_case_syntax() {
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let sql = with_query_context(ctx, async {
+            simple_case_sql("n.name", &branches(), "'Guest'")
+        })
+        .await;
+        // Spark has no caseWithExpression; standard CASE-expr syntax instead.
+        assert_eq!(
+            sql,
+            "CASE n.name WHEN 'Alice' THEN 'Admin' WHEN 'Bob' THEN 'User' ELSE 'Guest' END"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reduce_fold_sql_tests {
+    use super::reduce_fold_sql;
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    #[test]
+    fn clickhouse_default_uses_array_fold() {
+        // Default (no scope) = ClickHouse. #950: the accumulator is the FIRST
+        // lambda parameter (`arrayFold(acc, x -> …)`), matching ClickHouse's
+        // fold semantics — the element-first form was silently wrong.
+        assert_eq!(
+            reduce_fold_sql("x", "acc", "acc + x", "[1, 2, 3]", "0"),
+            "arrayFold(acc, x -> acc + x, [1, 2, 3], 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn databricks_uses_aggregate() {
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let sql = with_query_context(ctx, async {
+            reduce_fold_sql("x", "acc", "acc + x", "[1, 2, 3]", "0")
+        })
+        .await;
+        // Spark has no arrayFold; the fold is `aggregate(list, init, (acc, x) -> expr)`.
+        assert_eq!(sql, "aggregate([1, 2, 3], 0, (acc, x) -> acc + x)");
+    }
+}
+
+#[cfg(test)]
+mod round_half_up_sql_tests {
+    use super::round_half_up_sql;
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    #[test]
+    fn clickhouse_one_arg_uses_math_round() {
+        // Default (no scope) = ClickHouse. Neo4j 1-arg round() = Math.round =
+        // floor(x + 0.5) (ties toward +∞). x is evaluated exactly once.
+        assert_eq!(
+            round_half_up_sql(&["u.x".to_string()]),
+            Some("floor(u.x + 0.5)".to_string())
+        );
+    }
+
+    #[test]
+    fn clickhouse_two_arg_precision_zero_uses_math_round() {
+        // Neo4j: round(x, 0) with precision literally 0 hits the SAME Math.round
+        // branch (precision == 0 && !explicitMode), NOT the HALF_UP setScale
+        // path — so it must emit floor(x + 0.5), not the away-from-zero decimal
+        // formula. This is why round(-2.5, 0) = -2, not -3.
+        assert_eq!(
+            round_half_up_sql(&["u.x".to_string(), "0".to_string()]),
+            Some("floor(u.x + 0.5)".to_string())
+        );
+    }
+
+    #[test]
+    fn clickhouse_two_arg_uses_decimal_half_up_formula() {
+        // Neo4j 2-arg (d != 0) = BigDecimal.setScale(d, HALF_UP) on the shortest
+        // decimal string: HALF_UP away-from-zero, scaled in the decimal domain
+        // via toDecimal128(toString(x)). The `+ toDecimal128('0.5', 18)` must be
+        // a DECIMAL literal (a float 0.5 would promote the product back to
+        // Float64 and collapse ties downward), and the `if(abs(x) >= 1e15, …)`
+        // guard avoids Code 69 overflow for large |x|.
+        assert_eq!(
+            round_half_up_sql(&["u.x".to_string(), "2".to_string()]),
+            Some(
+                "if(abs(u.x) >= 1e15, u.x, \
+                 sign(u.x) * floor(abs(toDecimal128(toString(u.x), 18)) \
+                 * toDecimal128(pow(10, 2), 0) + toDecimal128('0.5', 18)) / pow(10, 2))"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn clickhouse_three_arg_falls_through() {
+        // 3-arg explicit-mode form: fall through (None). CH native round takes
+        // at most 2 args, so this fails LOUD (Code 42) — unsupported rather than
+        // silently mis-rounded.
+        assert_eq!(
+            round_half_up_sql(&[
+                "u.x".to_string(),
+                "1".to_string(),
+                "'HALF_EVEN'".to_string()
+            ]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn databricks_stays_plain_round() {
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let (one, two, zero, three) = with_query_context(ctx, async {
+            (
+                round_half_up_sql(&["u.x".to_string()]),
+                round_half_up_sql(&["u.x".to_string(), "2".to_string()]),
+                round_half_up_sql(&["u.x".to_string(), "0".to_string()]),
+                round_half_up_sql(&["u.x".to_string(), "1".to_string(), "'HALF_UP'".to_string()]),
+            )
+        })
+        .await;
+        // Spark/Databricks round() already matches Neo4j — plain call, byte-identical.
+        assert_eq!(one, Some("round(u.x)".to_string()));
+        assert_eq!(two, Some("round(u.x, 2)".to_string()));
+        assert_eq!(zero, Some("round(u.x, 0)".to_string()));
+        // 3-arg still falls through so it isn't silently reshaped.
+        assert_eq!(three, None);
+    }
+}
+
+#[cfg(test)]
+mod string_predicate_tests {
+    use super::{ends_with_predicate, starts_with_predicate};
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    #[test]
+    fn clickhouse_default_uses_camelcase_functions() {
+        // Default (no scope) = ClickHouse: the historical camelCase spelling,
+        // byte-identical to what the pipeline emitted before these helpers.
+        assert_eq!(
+            starts_with_predicate("n.name", "'Al'"),
+            "startsWith(n.name, 'Al')"
+        );
+        assert_eq!(
+            ends_with_predicate("n.name", "'ce'"),
+            "endsWith(n.name, 'ce')"
+        );
+    }
+
+    #[tokio::test]
+    async fn databricks_uses_lowercase_builtins() {
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let (starts, ends) = with_query_context(ctx, async {
+            (
+                starts_with_predicate("n.name", "'Al'"),
+                ends_with_predicate("n.name", "'ce'"),
+            )
+        })
+        .await;
+        // Spark builtins are lowercase, same arg order.
+        assert_eq!(starts, "startswith(n.name, 'Al')");
+        assert_eq!(ends, "endswith(n.name, 'ce')");
+    }
+}
+
+/// #1171: Cypher `=~` is a WHOLE-string match; `match()`/`rlike()` are unanchored
+/// searches, so the pattern must be wrapped as `\A(?:<pattern>)\z`.
+#[cfg(test)]
+mod regex_match_tests {
+    use super::{can_skip_regex_group, regex_match_predicate, single_sql_string_literal_body};
+    use crate::server::query_context::{with_query_context, QueryContext};
+    use crate::sql_generator::SqlDialect;
+
+    #[test]
+    fn group_free_literal_is_anchored_with_a_leading_caret_1171() {
+        // The anchors are SQL string-literal text, so each backslash is doubled
+        // (`'\\z'` is the two characters `\z`). No group: ClickHouse can then extract
+        // a literal prefix for primary-key pruning.
+        assert_eq!(
+            regex_match_predicate("n.name", "'A.*'"),
+            r"match(n.name, '^A.*\\z')"
+        );
+        // A user's own leading `^` is kept, not doubled.
+        assert_eq!(
+            regex_match_predicate("n.name", "'^key12.*'"),
+            r"match(n.name, '^key12.*\\z')"
+        );
+    }
+
+    #[test]
+    fn alternation_stays_anchored_as_a_whole_1171() {
+        // `a|b` must be whole-string `a` or `b`; WITHOUT the group `^a|b\z` would
+        // match any value STARTING with `a` or ENDING with `b`.
+        assert_eq!(
+            regex_match_predicate("x", "'a|b'"),
+            r"match(x, '\\A(?:a|b)\\z')"
+        );
+        // Also when the user supplied their own `^`.
+        assert_eq!(
+            regex_match_predicate("x", "'^a|^b'"),
+            r"match(x, '\\A(?:^a|^b)\\z')"
+        );
+    }
+
+    #[test]
+    fn inline_flag_is_valid_without_a_group_1171() {
+        assert_eq!(
+            regex_match_predicate("x", "'(?i)atl.*'"),
+            r"match(x, '^(?i)atl.*\\z')"
+        );
+    }
+
+    #[test]
+    fn group_is_kept_when_dropping_it_could_change_the_pattern_1171() {
+        for body in ["a|b", "(a|b)c", r"\\Qa.b", r"\Qa.b", r"abc\\"] {
+            assert!(!can_skip_regex_group(body), "{body}");
+            assert!(
+                regex_match_predicate("x", &format!("'{body}'")).contains(r"\\A(?:"),
+                "{body}"
+            );
+        }
+        for body in ["A.*", "^key.*", "(?i)atl", r"\\d+", "a(b)c"] {
+            assert!(can_skip_regex_group(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn non_literal_pattern_goes_through_concat_1171() {
+        // A parameter / concatenation / column is NOT a single literal, so it
+        // cannot be folded or inspected: `concat` is constant whenever its parts
+        // are, and the grouped form is always used.
+        assert_eq!(
+            regex_match_predicate("x", "concat('A', 'tl.*')"),
+            r"match(x, concat('\\A(?:', concat('A', 'tl.*'), ')\\z'))"
+        );
+        // A quote at both ends does NOT make it one literal.
+        assert_eq!(
+            regex_match_predicate("x", "'a' || y || 'b'"),
+            r"match(x, concat('\\A(?:', 'a' || y || 'b', ')\\z'))"
+        );
+    }
+
+    #[test]
+    fn single_literal_scanner_is_exact_1171() {
+        assert_eq!(single_sql_string_literal_body("'abc'"), Some("abc"));
+        assert_eq!(single_sql_string_literal_body("''"), Some(""));
+        // `''` is an escaped quote INSIDE the literal; `\'` likewise.
+        assert_eq!(single_sql_string_literal_body("'it''s'"), Some("it''s"));
+        assert_eq!(single_sql_string_literal_body(r"'it\'s'"), Some(r"it\'s"));
+        // A backslash-escaped backslash must not swallow the closing quote.
+        assert_eq!(single_sql_string_literal_body(r"'a\\'"), Some(r"a\\"));
+        // Not exactly one literal: larger expression / unterminated / not quoted.
+        assert_eq!(single_sql_string_literal_body("'a' || 'b'"), None);
+        assert_eq!(single_sql_string_literal_body("'abc"), None);
+        assert_eq!(single_sql_string_literal_body("abc"), None);
+        assert_eq!(single_sql_string_literal_body("'a'x"), None);
+    }
+
+    #[tokio::test]
+    async fn databricks_uses_rlike_with_the_same_anchoring_1171() {
+        let ctx = QueryContext {
+            dialect: SqlDialect::Databricks,
+            ..QueryContext::default()
+        };
+        let (plain, alt) = with_query_context(ctx, async {
+            (
+                regex_match_predicate("n.name", "'A.*'"),
+                regex_match_predicate("n.name", "'A|B'"),
+            )
+        })
+        .await;
+        // Spark's rlike is ALSO an unanchored search; Java regex honours `^` and `\z`.
+        assert_eq!(plain, r"rlike(n.name, '^A.*\\z')");
+        assert_eq!(alt, r"rlike(n.name, '\\A(?:A|B)\\z')");
+    }
+}

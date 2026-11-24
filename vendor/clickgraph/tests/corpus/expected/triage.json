@@ -1,0 +1,117 @@
+{
+ "social_integration/test_622_named_chained_denorm_edge_aggregate_arg_resolves": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_622_named_chained_denorm_edge_property_resolves_to_node": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_622_standalone_named_denorm_edge_keeps_own_scan": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_graphrag_multi_type__TestMultiTypePropertyExtraction_test_missing_property_returns_empty": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "CG_ERROR"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_anchor_where_folds_into_join_on_597": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_chained_optional_where_second_clause_597": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_incoming_chained_optional_gate_611": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_mixed_anchor_and_optional_conjuncts_597": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_pattern_base_identical_conjunct_retained_611": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_two_optionals_each_anchor_gate_611": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_optional_match__TestOptionalWhereMandatoryVar_test_undirected_excluded_from_gate_597": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_property_pruning__test_property_requirements_in_filter": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "social_integration/test_schema_variations_comprehensive__TestSchemaInteractions_test_complex_union_with_filters": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "CG_ERROR"
+ },
+ "social_integration/test_schema_variations_comprehensive__TestSchemaInteractions_test_with_clause_type_preservation_across_union": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "CG_ERROR"
+ },
+ "social_integration/test_track_c_property_filtering__TestPropertyFilteringNodes_test_nonexistent_property_returns_empty": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "CG_ERROR"
+ },
+ "social_integration/test_vlp_aggregation__TestVLPAggregationEdgeCases_test_vlp_complex_where_with_aggregate": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "standard/test_616_fold_optional_bid_plain_predicate": {
+  "category": "EXTENSION",
+  "ref": "#1316",
+  "verdict": "CG_ERROR"
+ },
+ "standard/test_621_optional_vlp_anchor_gate_compound_range": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "standard/test_621_optional_vlp_anchor_gate_directed": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "standard/test_645_reversed_optional_vlp_anchor_gate": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "standard/test_645_reversed_optional_vlp_anchor_gate_compound": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "standard/test_647_end_anchored_optional_vlp_anchor_gate": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ },
+ "standard/test_647_end_anchored_optional_vlp_far_endpoint_filter": {
+  "category": "UNTYPED_BOOLEAN",
+  "ref": "#1316",
+  "verdict": "MISMATCH"
+ }
+}

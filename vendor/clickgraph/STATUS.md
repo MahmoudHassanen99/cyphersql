@@ -1,0 +1,131 @@
+# ClickGraph Status
+
+*Updated: July 30, 2026*
+
+## Current Version: v0.6.7-dev
+
+Cypher-to-ClickHouse SQL query engine with Neo4j Browser compatibility.
+Supports server mode, embedded (in-process chdb), remote ClickHouse, and SQL-only translation.
+**Embedded mode is now read-write** (v0.6.7+): `CREATE`, `SET`, `DELETE`, and `REMOVE` against ClickGraph-managed tables; server / remote / sql_only modes remain read-only and reject writes upstream.
+`cg` CLI tool for agent/script-oriented use (`clickgraph-tool` workspace crate).
+
+**Rust Tests**: ~2,145 passing (100%) — 1,604 lib + 504 integration (incl. the 210-case byte-exact golden matrix and the 1,082-query corpus translation-snapshot sweep) + ratchet + stats + doctests; `cargo test`, no live ClickHouse
+**Python Integration Tests**: ~3,480 passing against live CH (nightly full-suite workflow); 50-test `smoke` subset + a 2-file regression set gate every PR
+**Embedded Tests**: 152 passing (unit + integration + e2e)
+**Go Binding Tests**: 14 passing (100%)
+**openCypher TCK**: **402/402 read scenarios passing (100%)** — 0 failures. Write feature files (~205 scenarios across `Create*`/`Set*`/`Delete*`/`Remove*`) imported and partially lifted: 9 scenarios run end-to-end with counter assertions; remaining are `@wip` with per-scenario triage notes. See `clickgraph-tck/`.
+**LDBC SNB**: 36/37 queries passing at sf0.003 and sf1 (97%) — bi-16 blocked by CALL subquery
+**Benchmark**: 14/14 queries (100%)
+**E2E Tests**: Bolt 4/4, Cache 5/5 (100%)
+**Endurance**: 24h / 518M requests / 0 server errors / P50=1ms / 27 MB RSS (jemalloc) — [details](tests/stress/RESULTS.md)
+**Lint**: `cargo clippy --all-targets` — **0 warnings**
+
+### Active workstreams (see `docs/design/PRIORITIES.md` — canonical dispatch queue)
+
+- **Refactoring-safety plan** (`docs/design/REFACTORING_SAFETY_PLAN.md`):
+  **mission complete (2026-07-28)**. Phase 0 regression net (per-variation goldens
+  + corpus sweep + ratchet + CI smoke/nightly), Phases 1–2, and §7.1 (`build_chained`
+  5478→850, the accepted irreducible frame) plus every shippable §7.2 forward-
+  resolution slice are done. The §7.2 remainder (F2b-fold / F2c / F5) is
+  design-cycle/blocked and bug-driven only — not a standing lane.
+- **SQL-IR dialect-neutral rendering** (`docs/design/SQL_IR_DESIGN.md`):
+  shippable/mechanical work **complete (2026-07-30)**. Phase 1 leaf migrations
+  (simple-CASE #811, STARTS/ENDS WITH #813, RegexMatch→rlike #815) exhausted;
+  Phase 2 path-collapse retired Path B (#822), unified the dual `Operator` enums
+  (#818), deleted dead Path D (#820), and reconciled the one reachable Path C
+  quoting drift (#824, dotted-FK follow-up #826). Remaining: full Path C→A collapse
+  is a **design cycle** (CTE-build-stage timing), and Phases 3–4 stay deferred
+  behind it — its residual drift items are verified zero-corpus-leak, so nothing
+  is bleeding.
+- **Stats-informed SQL generation** (`docs/design/STATS_PLANNING.md`): Stage 1
+  **merged** (#651) — flag-gated (`CLICKGRAPH_STATS_ENABLED`, default off) table
+  row-count cache feeding `select_anchor()` tie-breaks; ordering-only, never
+  semantics. S2 (column selectivity) / S3 (feedback loop) open.
+- **Correctness bug lane**: silent-wrong / loud-error VLP + OPTIONAL-MATCH +
+  FK-edge + polymorphic shapes fixed continuously (recent: #689 bug 1
+  from-side-polymorphic VLP recursive arm, #828). The clean-pick pool is
+  near-exhausted; remaining open issues are design-cycle-sized (#827 polymorphic-
+  target UNION fan-out, #604/#627/#643/#673 composite/chained residue) or in the
+  systemic reverse-mapping class (documented + loud-gated, not per-shape patched).
+- **DeltaGraph (Databricks/Spark dialect)**: beta; SQL-IR dialect routing via
+  `FunctionMapper`. Live-workspace validation pending (`docs/deltagraph/GA_READINESS.md`).
+
+### Integration Test Breakdown
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Core query patterns | ~2,400 | Passing |
+| Matrix cross-schema | ~350 | Passing |
+| VLP / shortest path | ~150 | Passing |
+| GraphRAG / vector | ~80 | Passing |
+| Schema variations | ~90 | ~37 need schemas not in default config |
+| Environment-dependent | ~70 | Need specific ClickHouse tables/fixtures |
+
+## What Works
+
+- **Cypher queries**: MATCH, WHERE, RETURN, WITH, ORDER BY, LIMIT, SKIP, DISTINCT, OPTIONAL MATCH, UNWIND, UNION ALL
+- **Graph patterns**: Node/relationship patterns, variable-length paths (`*1..3`), shortest path, multi-hop traversals
+- **Path functions**: `length(p)`, `nodes(p)`, `relationships(p)`, `cost(p)` (weighted shortest path)
+- **Aggregations**: count, sum, avg, min, max, collect — with GROUP BY
+- **Functions**: String, numeric, date, type coercion, list operations, CASE expressions
+- **List comprehension**: `[x IN list WHERE cond | expr]` with `arrayCount()` optimization
+- **Pattern comprehension**: `size([(a)-[:R]->(b) | b.prop])` via pre-aggregated CTEs
+- **Multi-relationship**: `[:TYPE1|TYPE2]` with UNION SQL generation
+- **Map literals**: `collect({key: val})` with map property access (`top.score`)
+- **Variable Scope Resolution**: `VariableScope` correctly resolves variables across WITH barriers — CTE-scoped vars use CTE columns, table vars use schema columns; covers SELECT, WHERE, ORDER BY, GROUP BY, HAVING, JOINs
+- **Scope-Aware CTE/UNION Rendering**: Task-local `VariableRegistry` with `property_mapping` on `VariableSource::Cte` enables correct column resolution during SQL rendering; per-CTE save/restore; WITH barrier scope clearing; UNION branch recursion
+- **Anchor-Aware Join Generation**: Generic 64-line loop + 810-line module replaces ~1200 lines of per-strategy handlers; topological sort on schema-independent join graph; handles OPTIONAL MATCH shared-node patterns without cartesian products
+- **Unified Type Inference**: Single 4-phase pass (SchemaInference merged Feb 2026) with direction-aware UNION generation
+  - **Phase 0**: Relationship-based label inference
+  - **Phase 1**: Filter→GraphRel UNION with WHERE constraint extraction
+  - **Phase 2**: Untyped node UNION with direction validation
+  - **Phase 3**: ViewScan resolution (Empty → table scans, denormalized nodes deferred to render phase)
+- **Property pruning**: Untyped queries skip tables missing referenced properties (10x–50x speedup)
+- **Multi-schema**: USE clause, per-request schema selection, GLOBAL_SCHEMAS registry
+- **Multi-tenancy**: Parameterized views with `tenant_id`, session commands (`CALL sys.set`)
+- **Neo4j Bolt v5.8**: Browser click-to-expand, schema procedures, session commands, EXPLAIN handling. Browser 5.x compat (v0.6.7+): `CALL dbms.components()` answered with canonical `(name, versions, edition)`; bundled `count(n) UNION ALL count(r)` and `db.labels()/relationshipTypes()/propertyKeys()` queries short-circuited; ~12 read-only `SHOW` commands stubbed with the canonical 5.x field schema; element_id format unified across all paths so iterative click-to-expand dedupes correctly across endpoints.
+- **Schema variations**: Standard, denormalized, FK-edge, polymorphic, composite ID, multi-tenant
+- **Query cache**: Keyed by query + schema + tenant_id + view_parameters
+- **Observability / metrics endpoints** (server mode, v0.6.7+): `GET /metrics` (Prometheus exposition — query counters by type & error class, in-flight gauge, per-phase latency histograms for total/parse/plan/render/sqlgen/exec, result-row + ClickHouse byte counters, cache & connection-pool gauges; bounded labels only), `GET /stats` (JSON snapshot: uptime, counters, p50/p95/p99 per phase, cache hit-rate, pool stats, ClickHouse transfer bytes), `GET /stats/queries?recent&slowest` (bounded slow-query ring buffer incl. failed queries with latency; optional truncated query preview). Aggregate registry (`src/server/metrics.rs`) is hand-rolled atomics + fixed-bucket histograms (zero new deps); records both the HTTP `/query` and Bolt query paths. ClickHouse-side stats: bytes transferred always (Phase A); true `read_rows`/`read_bytes`/`elapsed` from the `X-ClickHouse-Summary` header are opt-in via `CLICKGRAPH_METRICS_CH_SUMMARY=true` (the `clickhouse` crate drops response headers, so the JSON read path runs via a direct request when enabled). Config: `CLICKGRAPH_METRICS_ENABLED` (default true), `CLICKGRAPH_SLOW_QUERY_CAPACITY` (128), `CLICKGRAPH_SLOW_QUERY_THRESHOLD_MS` (0), `CLICKGRAPH_METRICS_QUERY_PREVIEW` (false), `CLICKGRAPH_METRICS_CH_SUMMARY` (false). Docs: `docs/wiki/API-Reference-HTTP.md`.
+- **LLM-powered schema discovery**: Interactive schema generation from natural language via Anthropic/OpenAI
+- **GraphRAG structured output**: `format: "Graph"` returns deduplicated nodes, edges, and stats
+- **ClickHouse cluster load balancing**: `CLICKHOUSE_CLUSTER` for auto-discovery and load balancing
+- **Embedded mode** (`--features embedded`): `QueryExecutor` trait + `ChdbExecutor` + `clickgraph-embedded` crate — run Cypher queries in-process over Parquet/Iceberg/Delta/S3 without a ClickHouse server. Kuzu-compatible Rust API (`Database`, `Connection`, `QueryResult`). `source:` URI field in YAML schema. S3/GCS/Azure credential support via `StorageCredentials`. The `embedded` feature is **opt-in** (default off) so dependent crates can use sql_only/remote modes without pulling in chdb.
+- **Cypher writes (embedded mode)** (v0.6.7+): `CREATE`, `SET`, `DELETE` / `DETACH DELETE`, and `REMOVE` against ClickGraph-managed nodes. Translates to ClickHouse lightweight `INSERT` / `UPDATE` / `DELETE`. Writable tables get `enable_block_number_column = 1, enable_block_offset_column = 1` in DDL automatically. Per-node `id_generation` schema attribute (`uuid` default / `provided` / `snowflake`). Returns Neo4j-compatible counters (`nodes_created`, `properties_set`, `nodes_deleted`, `relationships_deleted`). Server / remote / sql_only modes reject writes before planning them (the embedded connection's executor check); `source:`-backed nodes/edges remain read-only. `MERGE`, relationship CREATE, `CREATE … RETURN`, edge-alias DELETE, `SET a += {…}` map-merge, and `REMOVE a:Label` are not implemented yet.
+- **Remote mode** (`Database::new_remote()`): Cypher translated locally, executed against external ClickHouse. No chdb required. Available without any feature flags.
+- **DeltaGraph: Databricks SQL Warehouse mode** (`--features databricks`, v0.6.7+): Cypher translated to Spark SQL locally and executed against a Databricks SQL Warehouse over the Statement Execution API. Dialect routing through `FunctionMapper` (`groupArray`→`collect_list`, `toInt64`→`bigint`, `Array(Int64)`→`ARRAY<BIGINT>`, etc.), including VLP / BFS shortestPath. PAT **or OAuth M2M** auth (service-principal client-credentials with token caching/refresh) with `Debug` redaction. Both `INLINE` and `EXTERNAL_LINKS` result dispositions (presigned chunk download + `next_chunk_index` pagination, no 25 MB cap). Transient-failure resilience: retry-with-backoff on 429/503/connect/timeout (honors `Retry-After`), 401 surfaced as `ExecutorError::Auth`. Per-query observability (`statement_id` + `duration_ms`/`polls`/`rows` on the `deltagraph::databricks` log target). `Database::new_databricks(schema, DatabricksConfig)` in `clickgraph-embedded`, `Database::open_databricks` over the FFI for Go/Python, `cg --dialect databricks` for SQL emission *and* execution (env PAT or `CG_DATABRICKS_CLIENT_ID`/`_SECRET`), `cg schema discover --dialect databricks` for LLM-assisted YAML drafts off a live warehouse (via `SHOW TABLES` + `DESCRIBE TABLE EXTENDED`), optional top-level `catalog:` YAML field for schemas that are permanently tied to one Unity Catalog (env/CLI still wins), and a dedicated **`deltagraph` server binary** (HTTP + Bolt, defaults to Databricks, ships under `cargo build --features databricks --bin deltagraph`). **Full client support across all three front-ends**: the `deltagraph` HTTP server renders `Pretty`/`PrettyCompact`/`CSV`/`CSVWithNames` text output client-side for Databricks (the Statement Execution API has no server-side pretty renderer, so the executor formats from the result manifest), and its `/schemas/introspect` + `/schemas/discover-prompt` endpoints drive `DatabricksProbe` (`SHOW TABLES` / `DESCRIBE TABLE EXTENDED`) when in Databricks mode — so the interactive **`clickgraph-client` REPL** works end-to-end against a DeltaGraph server (Cypher queries plus `:introspect`/`:discover`, catalog from `DATABRICKS_CATALOG`/YAML with the REPL argument as the Spark schema); the **`cg` CLI** (`cg query`/`cg schema discover --dialect databricks`) formats results itself from `execute_json` and was already wired to `DatabricksProbe`. Local validation: Spark/Delta docker (`tests/spark_smoke`, incl. 22/22 LDBC parity vs ClickHouse) + zeta-databricks cross-stack transport gate (`tests/zeta_integration`). Manual walkthrough in `docs/deltagraph/QUICKSTART.md`. Pending (need live workspace): MERGE/writes, real perf + soak, live-IdP OAuth + cloud-storage EXTERNAL_LINKS validation. See `docs/deltagraph/GA_READINESS.md` and `docs/design/DELTAGRAPH_PLAN.md`.
+- **Hybrid remote query + local storage**: `RemoteConfig` in `SystemConfig` enables embedded mode to query a remote ClickHouse cluster via `query_remote()` / `query_remote_graph()`, decompose results into `GraphResult` (nodes + edges), and store subgraphs locally via `store_subgraph()` for fast re-querying. `query_graph()` returns structured graph results for local queries. Available in Rust, Python, and Go.
+- **`cg` CLI tool** (`clickgraph-tool`): Agent/script-oriented CLI. `cg sql` (Cypher→SQL), `cg validate` (parse+plan), `cg query` (execute via remote CH), `cg nl` (NL→Cypher via LLM), `cg schema show/validate/discover/diff`. Config via `~/.config/cg/config.toml` or `CG_*` env vars. LLM: Anthropic default, any OpenAI-compatible endpoint. Does not require chdb or a running ClickGraph server.
+- **APOC Export Procedures**: Neo4j-compatible `CALL apoc.export.{csv|json|parquet}.query(cypher, destination, config)` — translates inner Cypher to SQL, resolves destination URI (local file, S3, GCS, Azure, HTTP), wraps in `INSERT INTO FUNCTION`. Works in server mode (HTTP + Bolt) and embedded mode.
+- **COPY TO Export Syntax**: Kuzu/DuckDB-compatible `COPY (MATCH ...) TO 'path' WITH (format='csv')` — alternative to APOC procedures for exporting query results. Supports CSV, JSON, Parquet, NDJSON. Works in server mode and embedded mode.
+- **Vector Search Procedure**: Neo4j-compatible `CALL db.index.vector.queryNodes('index-name', k, [embedding...]) YIELD node, score` — translates to ClickHouse's `cosineDistance()` / `L2Distance()`. Configured via `vector_indexes` section in schema YAML. Supports dimension validation and USE clause schema selection.
+- **Full-text Search Procedure**: Neo4j-compatible `CALL db.index.fulltext.queryNodes('index-name', 'search query') YIELD node, score` — translates to ClickHouse's `ngramDistance()`, `multiSearchAnyCaseInsensitive()`, and `hasToken()`. Supports three analyzers: standard (fuzzy + pre-filter), ngram (pure fuzzy), exact (token match). Multi-property search across multiple columns. Configured via `fulltext_indexes` section in schema YAML.
+- **Python bindings** (`clickgraph-py`): UniFFI-based Python package via `clickgraph-ffi` shared library. `Database`, `Connection`, `QueryResult` classes with dict-style and Kuzu-compatible tuple-style iteration. 72 Parquet-based chdb e2e tests + 40 sql_only tests.
+- **Go bindings** (`clickgraph-go`): UniFFI-generated Go package via `clickgraph-ffi` C ABI. `Open()`, `Connect()`, `Query()`, `QueryToSQL()`, `Export()`. Native Go types, cursor and bulk APIs.
+
+## Current Limitations
+
+See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
+
+- ✅ Write operations (CREATE, SET, DELETE, REMOVE) — embedded mode only (v0.6.7+); server / remote / sql_only modes remain read-only
+- ❌ `MERGE` clause — planned for v0.7.x
+- ❌ Relationship `CREATE`, `CREATE … RETURN`, edge-alias `DELETE r`, `SET a += {…}` map-merge, `REMOVE a:Label` — planned
+- ⚠️ CALL subquery not supported (blocks LDBC bi-16)
+- ⚠️ Shortest path may OOM on dense graphs — use bounded ranges `*1..5`
+- ⚠️ Multiple standalone UNWIND without MATCH partially supported (single UNWIND works)
+- ⚠️ Neo4j Desktop/NeoDash: works with `--neo4j-compat-mode`; `startNode`/`endNode` and `WITH *` now implemented for node expansion
+
+## Architecture
+
+```
+Cypher → Parser → Bind → Lower → SQL printer → ClickHouse / Databricks → Results
+```
+
+**Modules**: `open_cypher_parser/` (AST), `bound_plan/` (binding + lowering), `render_plan/` (the SQL IR), `sql_generator/` (printing, dialects), `graph_catalog/` (YAML schemas), `server/` (HTTP:7475 + Bolt:7687)
+
+## Documentation
+
+- [docs/wiki/](docs/wiki/) — User guide, API, Cypher reference, schema config
+- [DEVELOPMENT_PROCESS.md](DEVELOPMENT_PROCESS.md) — 5-phase workflow
+- [CHANGELOG.md](CHANGELOG.md) — Release history
+- [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — Active issues

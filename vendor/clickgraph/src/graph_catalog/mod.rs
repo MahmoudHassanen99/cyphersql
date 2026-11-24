@@ -1,0 +1,59 @@
+pub mod column_info;
+pub mod composite_key_utils;
+pub mod config;
+pub mod constraint_compiler;
+pub mod element_id;
+pub mod engine_detection;
+pub mod errors;
+pub mod expression_parser;
+pub mod filter_parser;
+pub mod graph_schema;
+pub mod llm_prompt;
+pub mod node_property_check;
+pub mod pattern_schema;
+pub mod schema_discovery;
+
+// DeltaGraph Phase 3: schema discovery against a Databricks SQL
+// Warehouse. Mirrors `schema_discovery` but drives the executor over
+// `SHOW TABLES IN catalog.schema` / `DESCRIBE TABLE EXTENDED` rather
+// than ClickHouse's `system.tables` / `system.columns`. Gated on the
+// `databricks` feature so the default build doesn't pull it in.
+#[cfg(feature = "databricks")]
+pub mod databricks_probe;
+pub mod schema_types;
+pub mod schema_validator;
+pub mod table_stats;
+
+#[cfg(test)]
+pub mod testing;
+
+#[cfg(test)]
+mod composite_id_tests;
+
+// Re-export commonly used types
+// Note: These are public re-exports for library users
+#[allow(unused_imports)]
+pub use column_info::{query_table_columns, ColumnDiscoveryTarget, ColumnInfo, DiscoveredColumns};
+#[allow(unused_imports)]
+pub use composite_key_utils::{
+    build_composite_key, extract_type_name, is_composite_key, CompositeKey, CompositeKeyError,
+};
+#[allow(unused_imports)]
+pub use config::{GraphSchemaConfig, GraphSchemaDefinition};
+pub use engine_detection::{detect_table_engine, TableEngine};
+pub use filter_parser::SchemaFilter;
+pub use graph_schema::{
+    classify_edge_table_pattern, edge_has_node_properties, is_fully_denormalized_edge_table,
+    is_node_denormalized_on_edge, Direction, EdgeTablePattern, GraphSchema, GraphSchemaElement,
+    NodeIdSchema, NodeSchema, RelationshipSchema,
+};
+pub use pattern_schema::{
+    EdgeAccessStrategy, JoinStrategy, NodeAccessStrategy, PatternSchemaContext,
+};
+#[allow(unused_imports)]
+pub use schema_discovery::{
+    extract_yaml_list_items, merge_batch_yaml, ColumnMetadata, DraftOptions, DraftRequest,
+    EdgeHint, FkEdgeHint, IntrospectResponse, NodeHint, SchemaDiscovery, Suggestion, TableMetadata,
+};
+#[allow(unused_imports)]
+pub use schema_validator::SchemaValidator;

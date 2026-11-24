@@ -1,0 +1,165 @@
+use crate::open_cypher_parser::ast::{CallArgument, CallClause, Expression};
+use crate::open_cypher_parser::common::ws;
+use crate::open_cypher_parser::errors::OpenCypherParsingError;
+use crate::open_cypher_parser::expression;
+use nom::branch::alt;
+use nom::bytes::complete::tag;
+use nom::character::complete::{alphanumeric1, char};
+use nom::combinator::opt;
+use nom::multi::separated_list0;
+use nom::sequence::delimited;
+use nom::{IResult, Parser};
+
+pub fn parse_call_clause<'a>(
+    input: &'a str,
+) -> IResult<&'a str, CallClause<'a>, OpenCypherParsingError<'a>> {
+    let (input, _) = ws(tag("CALL")).parse(input)?;
+
+    let (input, procedure_name) = parse_procedure_name.parse(input)?;
+
+    let (input, arguments) = opt(delimited(
+        ws(char('(')),
+        separated_list0(ws(char(',')), parse_call_argument),
+        ws(char(')')),
+    ))
+    .parse(input)?;
+
+    let arguments = arguments.unwrap_or_default();
+
+    // Parse optional YIELD clause
+    let (input, yield_items) = opt(parse_yield_clause).parse(input)?;
+
+    Ok((
+        input,
+        CallClause {
+            procedure_name,
+            arguments,
+            yield_items,
+        },
+    ))
+}
+
+fn parse_procedure_name<'a>(
+    input: &'a str,
+) -> IResult<&'a str, &'a str, OpenCypherParsingError<'a>> {
+    use nom::character::complete::{alphanumeric1, char};
+    use nom::combinator::recognize;
+    use nom::multi::many1;
+
+    // Parse procedure name that can contain alphanumeric characters and dots
+    ws(recognize(many1(nom::branch::alt((
+        alphanumeric1,
+        nom::combinator::recognize(char('.')),
+    )))))
+    .parse(input)
+}
+
+fn parse_call_argument<'a>(
+    input: &'a str,
+) -> IResult<&'a str, CallArgument<'a>, OpenCypherParsingError<'a>> {
+    // Named argument: `name: value` (traditional) or `name => value` (GDS style).
+    fn named_argument<'a>(
+        input: &'a str,
+    ) -> IResult<&'a str, CallArgument<'a>, OpenCypherParsingError<'a>> {
+        let (input, name) = ws(alphanumeric1).parse(input)?;
+        // Support both => (GDS style) and : (traditional) syntax
+        let (input, _) = ws(alt((tag("=>"), tag(":")))).parse(input)?;
+        let (input, value) = expression_parser(input)?;
+        Ok((input, CallArgument { name, value }))
+    }
+
+    // Positional argument: a bare expression with no name, e.g. the config map
+    // `{sample: 1000}` that APOC procedures such as `apoc.meta.schema(config)`
+    // take. Every Neo4j MCP server issues `apoc.meta.schema({sample: N})`, so
+    // rejecting positional args broke drop-in schema discovery. Downstream
+    // consumers match on `arg.name`, so an unnamed positional arg is simply not
+    // matched (the apoc.meta.schema stub ignores its config entirely). Tried
+    // after the named form, which still wins for `name: value` arguments.
+    fn positional_argument<'a>(
+        input: &'a str,
+    ) -> IResult<&'a str, CallArgument<'a>, OpenCypherParsingError<'a>> {
+        // Parse WITHOUT elevating a recoverable Error to Failure: an empty arg
+        // list (`db.labels()`) reaches here on the `)`, and `separated_list0`
+        // must be able to stop gracefully with zero arguments rather than abort.
+        let (input, value) = expression::parse_expression(input).map_err(|e| match e {
+            nom::Err::Incomplete(needed) => nom::Err::Incomplete(needed),
+            nom::Err::Error(err) => nom::Err::Error(OpenCypherParsingError::from(err)),
+            nom::Err::Failure(err) => nom::Err::Failure(OpenCypherParsingError::from(err)),
+        })?;
+        Ok((input, CallArgument { name: "", value }))
+    }
+
+    alt((named_argument, positional_argument)).parse(input)
+}
+
+fn expression_parser(input: &str) -> IResult<&str, Expression<'_>, OpenCypherParsingError<'_>> {
+    expression::parse_expression(input).map_err(|e| match e {
+        nom::Err::Incomplete(needed) => nom::Err::Incomplete(needed),
+        nom::Err::Error(err) => nom::Err::Failure(OpenCypherParsingError::from(err)),
+        nom::Err::Failure(err) => nom::Err::Failure(OpenCypherParsingError::from(err)),
+    })
+}
+
+fn parse_yield_clause<'a>(
+    input: &'a str,
+) -> IResult<&'a str, Vec<&'a str>, OpenCypherParsingError<'a>> {
+    use nom::multi::separated_list0;
+    let (input, _) = ws(tag("YIELD")).parse(input)?;
+    separated_list0(ws(char(',')), ws(alphanumeric1)).parse(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::open_cypher_parser::ast::{Expression, Literal};
+
+    #[test]
+    fn test_parse_call_clause_simple() {
+        let input = "CALL pagerank";
+        let result = parse_call_clause(input);
+        assert!(result.is_ok());
+        let (_, call) = result.unwrap();
+        assert_eq!(call.procedure_name, "pagerank");
+        assert!(call.arguments.is_empty());
+    }
+
+    #[test]
+    fn test_parse_call_clause_with_args() {
+        let input = "CALL pagerank(iterations: 10, damping: 0.85)";
+        let result = parse_call_clause(input);
+        assert!(result.is_ok());
+        let (_, call) = result.unwrap();
+        assert_eq!(call.procedure_name, "pagerank");
+        assert_eq!(call.arguments.len(), 2);
+        assert_eq!(call.arguments[0].name, "iterations");
+        assert_eq!(call.arguments[1].name, "damping");
+    }
+
+    #[test]
+    fn test_parse_call_clause_positional_map_arg() {
+        // APOC config-map form issued by every Neo4j MCP server:
+        //   CALL apoc.meta.schema({sample: 1000}) YIELD value RETURN value
+        // The argument is a positional map literal, not a named argument.
+        let input = "CALL apoc.meta.schema({sample: 1000}) YIELD value";
+        let result = parse_call_clause(input);
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
+        let (rest, call) = result.unwrap();
+        assert_eq!(call.procedure_name, "apoc.meta.schema");
+        assert_eq!(call.arguments.len(), 1);
+        assert_eq!(call.arguments[0].name, ""); // positional → no name
+        assert_eq!(rest.trim(), ""); // YIELD consumed, nothing left dangling
+    }
+
+    #[test]
+    fn test_parse_call_clause_with_arrow_syntax() {
+        let input = "CALL pagerank.graph(nodeLabels => 'User', maxIterations => 5)";
+        let result = parse_call_clause(input);
+        assert!(result.is_ok());
+        let (_, call) = result.unwrap();
+        assert_eq!(call.procedure_name, "pagerank.graph");
+        assert_eq!(call.arguments.len(), 2);
+        assert_eq!(call.arguments[0].name, "nodeLabels");
+        assert_eq!(call.arguments[1].name, "maxIterations");
+    }
+}

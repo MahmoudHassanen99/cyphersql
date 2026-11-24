@@ -1,0 +1,49 @@
+# OnTime Flight Data - Denormalized Edge Table Example
+# This schema demonstrates denormalized nodes where Airport properties
+# are embedded directly in the flights table (OnTime dataset pattern).
+
+name: ontime_flights
+version: "1.0"
+
+graph_schema:
+  nodes:
+    # Airport is a virtual node - all data comes from the flights table
+    - label: Airport
+      database: default
+      table: flights  # Same table as the edge!
+      node_id: code  # Logical property name for the airport code
+      property_mappings: {}  # Empty - all properties are denormalized
+      
+      # Properties when Airport appears as origin (from_node)
+      from_node_properties:
+        code: Origin
+        city: OriginCityName
+        state: OriginState
+      
+      # Properties when Airport appears as destination (to_node)
+      to_node_properties:
+        code: Dest
+        city: DestCityName
+        state: DestState
+
+  edges:
+    # Flight relationship - node properties declared in Airport node above
+    - type: FLIGHT
+      database: default
+      table: flights
+      from_id: Origin
+      to_id: Dest
+      from_node: Airport
+      to_node: Airport
+      
+      # Composite edge ID
+      edge_id: [flight_id, flight_number]
+      
+      # Edge properties (specific to the flight itself)
+      property_mappings:
+        flight_id: flight_id
+        flight_num: flight_number
+        carrier: airline
+        departure_time: dep_time
+        arrival_time: arr_time
+        distance: distance_miles

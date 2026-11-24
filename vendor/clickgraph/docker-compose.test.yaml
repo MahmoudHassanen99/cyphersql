@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  clickhouse-test:
+    image: clickhouse/clickhouse-server:25.8.12
+    container_name: clickhouse-test
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: brahmand
+      CLICKHOUSE_USER: test_user
+      CLICKHOUSE_PASSWORD: test_pass
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickgraph-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: clickgraph-test
+    ports:
+      - "7475:7475"
+      - "7687:7687"
+    environment:
+      GRAPH_CONFIG_PATH: /app/schemas/test/unified_test_multi_schema.yaml
+      CLICKHOUSE_URL: http://clickhouse-test:8123
+      CLICKHOUSE_USER: test_user
+      CLICKHOUSE_PASSWORD: test_pass
+      CLICKHOUSE_DATABASE: brahmand
+      RUST_LOG: info
+    volumes:
+      - ./schemas:/app/schemas:ro
+    depends_on:
+      clickhouse-test:
+        condition: service_healthy
+    command: ["--http-port", "7475", "--bolt-port", "7687"]
+
+networks:
+  default:
+    name: clickgraph-test-net

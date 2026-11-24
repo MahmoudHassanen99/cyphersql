@@ -1,0 +1,70 @@
+name: social_benchmark
+
+graph_schema:
+  nodes:
+    - label: User
+      database: social
+      table: users_bench
+      node_id: user_id
+      property_mappings:
+        user_id: user_id
+        name: full_name
+        email: email_address
+        registration_date: registration_date
+        is_active: is_active
+        country: country
+        city: city
+      # #854: declaring native temporal column types lets the render-site type
+      # classifier skip the epoch-millis wrap on Date/DateTime component access
+      # and duration arithmetic (`u.registration_date.year`,
+      # `u.registration_date + duration({days:7})`). Consumed by DDL generation
+      # and the classifier only — inert for existing translation goldens.
+      property_types:
+        registration_date: date
+
+    - label: Post
+      database: social
+      table: posts_bench
+      node_id: post_id
+      property_mappings:
+        post_id: post_id
+        title: post_title
+        content: post_content
+        date: post_date
+        author_id: author_id
+      property_types:
+        date: datetime
+
+  edges:
+    - type: FOLLOWS
+      database: social
+      table: user_follows_bench
+      from_id: follower_id
+      to_id: followed_id
+      # edge_id removed - follow_id column doesn't exist in table
+      # VLP will use default (follower_id, followed_id) tuple for path tracking
+      from_node: User
+      to_node: User
+      property_mappings:
+        follow_date: follow_date
+    
+    - type: AUTHORED
+      database: social
+      table: authored_bench
+      from_id: user_id
+      to_id: post_id
+      from_node: User
+      to_node: Post
+      property_mappings:
+        authored_date: authored_date
+    
+    - type: LIKED
+      database: social
+      table: post_likes_bench
+      from_id: user_id
+      to_id: post_id
+      from_node: User
+      to_node: Post
+      property_mappings:
+        like_date: like_date
+

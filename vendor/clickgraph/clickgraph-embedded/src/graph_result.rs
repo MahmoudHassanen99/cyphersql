@@ -1,0 +1,668 @@
+//! Graph output types for embedded mode.
+//!
+//! Provides `GraphNode`, `GraphEdge`, and `GraphResult` for structured graph
+//! output from `Connection::query_graph()`. The transformation logic mirrors
+//! the server's `transform_to_graph()` but uses the embedded `Value` type.
+
+use std::collections::{HashMap, HashSet};
+
+use serde_json::Value as JsonValue;
+
+use clickgraph::graph_catalog::element_id::node_element_id;
+use clickgraph::graph_catalog::graph_schema::GraphSchema;
+use clickgraph::server::bolt_protocol::result_transformer::{
+    transform_to_relationship, ReturnItemMetadata, ReturnItemType,
+};
+
+use super::value::Value;
+
+/// Statistics returned by `Connection::store_subgraph()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStats {
+    /// Number of nodes written to local tables.
+    pub nodes_stored: usize,
+    /// Number of edges written to local tables.
+    pub edges_stored: usize,
+}
+
+/// Parse an element ID string like `"Label:raw_id"` into `("Label", "raw_id")`.
+///
+/// Returns `None` if the string does not contain a `:` separator.
+pub fn parse_element_id(element_id: &str) -> Option<(&str, &str)> {
+    element_id.split_once(':')
+}
+
+/// A graph node with an element ID, labels, and properties.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphNode {
+    /// Unique element identifier (e.g., `"User:42"`).
+    pub id: String,
+    /// Node labels (e.g., `["Person"]`).
+    pub labels: Vec<String>,
+    /// Property key-value pairs using the embedded `Value` type.
+    pub properties: HashMap<String, Value>,
+}
+
+/// A graph edge (relationship) with endpoints and properties.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphEdge {
+    /// Unique element identifier for this edge.
+    pub id: String,
+    /// Relationship type (e.g., `"FOLLOWS"`).
+    pub type_name: String,
+    /// Element ID of the source node.
+    pub from_id: String,
+    /// Element ID of the target node.
+    pub to_id: String,
+    /// Property key-value pairs using the embedded `Value` type.
+    pub properties: HashMap<String, Value>,
+}
+
+/// Structured graph result containing deduplicated nodes and edges.
+#[derive(Debug, Clone)]
+pub struct GraphResult {
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+}
+
+impl GraphResult {
+    /// Return the list of nodes.
+    pub fn nodes(&self) -> &[GraphNode] {
+        &self.nodes
+    }
+
+    /// Return the list of edges.
+    pub fn edges(&self) -> &[GraphEdge] {
+        &self.edges
+    }
+
+    /// Return the number of nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Return the number of edges.
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Create an empty `GraphResult` with no nodes or edges.
+    pub fn empty() -> Self {
+        GraphResult {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+}
+
+/// Builder for constructing a `GraphResult` with deduplication.
+pub struct GraphResultBuilder {
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    seen_nodes: HashSet<String>,
+    seen_edges: HashSet<String>,
+}
+
+impl Default for GraphResultBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphResultBuilder {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            seen_nodes: HashSet::new(),
+            seen_edges: HashSet::new(),
+        }
+    }
+
+    /// Add a node, skipping if its element ID has already been seen.
+    pub fn add_node(&mut self, node: GraphNode) {
+        if self.seen_nodes.insert(node.id.clone()) {
+            self.nodes.push(node);
+        }
+    }
+
+    /// Add an edge, skipping if its element ID has already been seen.
+    pub fn add_edge(&mut self, edge: GraphEdge) {
+        if self.seen_edges.insert(edge.id.clone()) {
+            self.edges.push(edge);
+        }
+    }
+
+    /// Consume the builder and produce the final `GraphResult`.
+    pub fn build(self) -> GraphResult {
+        GraphResult {
+            nodes: self.nodes,
+            edges: self.edges,
+        }
+    }
+}
+
+/// Transform flat JSON result rows into a structured `GraphResult`.
+///
+/// `metadata` (from `cypher_to_sql_with_metadata`) classifies the return items
+/// as Node, Relationship, or Scalar; properties are extracted from each row.
+pub fn transform_rows_to_graph(
+    rows: &[JsonValue],
+    metadata: &[ReturnItemMetadata],
+    schema: &GraphSchema,
+) -> GraphResult {
+    let mut builder = GraphResultBuilder::new();
+
+    for row_value in rows {
+        let row_map: HashMap<String, JsonValue> = match row_value {
+            JsonValue::Object(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            _ => continue,
+        };
+
+        for meta in metadata {
+            if meta.is_null(&row_map) {
+                continue; // an element an OPTIONAL MATCH did not match
+            }
+            match &meta.item_type {
+                ReturnItemType::Node { labels } => {
+                    if let Some(node) = extract_node_from_row(
+                        &meta.entity_row(&row_map),
+                        &meta.field_name,
+                        labels,
+                        schema,
+                    ) {
+                        builder.add_node(node);
+                    }
+                }
+                ReturnItemType::Relationship {
+                    rel_types,
+                    from_label,
+                    to_label,
+                    ..
+                } => {
+                    if let Some(edge) = extract_edge_from_row(
+                        &meta.entity_row(&row_map),
+                        &meta.field_name,
+                        rel_types,
+                        from_label.as_deref(),
+                        to_label.as_deref(),
+                        schema,
+                    ) {
+                        builder.add_edge(edge);
+                    }
+                }
+                // A path or list of the bound-plan path: its nodes and edges.
+                ReturnItemType::Graph(ty) => {
+                    let value = meta.value(&row_map).cloned().unwrap_or(JsonValue::Null);
+                    let (mut nodes, mut rels) = (Vec::new(), Vec::new());
+                    if clickgraph::server::bolt_protocol::graph_values::elements(
+                        &value, ty, &mut nodes, &mut rels,
+                    )
+                    .is_ok()
+                    {
+                        let convert = |props: HashMap<String, JsonValue>| {
+                            props
+                                .into_iter()
+                                .map(|(k, v)| (k, Value::from(v)))
+                                .collect()
+                        };
+                        for n in nodes {
+                            builder.add_node(GraphNode {
+                                id: n.element_id,
+                                labels: n.labels,
+                                properties: convert(n.properties),
+                            });
+                        }
+                        for r in rels {
+                            builder.add_edge(GraphEdge {
+                                id: r.element_id,
+                                type_name: r.rel_type,
+                                from_id: r.start_node_element_id,
+                                to_id: r.end_node_element_id,
+                                properties: convert(r.properties),
+                            });
+                        }
+                    }
+                }
+                // Scalars, legacy paths, id functions -- skip for graph output
+                _ => {}
+            }
+        }
+    }
+
+    builder.build()
+}
+
+/// Extract a `GraphNode` from a result row.
+///
+/// Looks for columns prefixed with `{var_name}.` to build the property map.
+/// Determines the label from `__label__` columns or metadata.
+/// Generates an element ID from the schema's node ID columns.
+fn extract_node_from_row(
+    row: &HashMap<String, JsonValue>,
+    var_name: &str,
+    labels: &[String],
+    schema: &GraphSchema,
+) -> Option<GraphNode> {
+    let prefix = format!("{}.", var_name);
+    let mut properties = HashMap::new();
+
+    for (key, value) in row.iter() {
+        if let Some(prop_name) = key.strip_prefix(&prefix) {
+            // Skip internal metadata columns
+            if prop_name == "__label__"
+                || prop_name == "_label__"
+                || prop_name == "id"
+                || prop_name == "properties"
+            {
+                continue;
+            }
+            properties.insert(prop_name.to_string(), value.clone());
+        }
+    }
+
+    // The element id as SQL spells it, where an id part is one SQL alone
+    // spells (`NODE_ELEMENT_ID_KEY`, #1528): taken as is.
+    let sql_element_id = match properties.remove(clickgraph::bound_plan::lower::NODE_ELEMENT_ID_KEY)
+    {
+        Some(JsonValue::String(text)) => Some(text),
+        _ => None,
+    };
+
+    // Handle VLP CTE JSON properties blob
+    let vlp_props_col = format!("{}.properties", var_name);
+    if let Some(JsonValue::String(json_str)) = row.get(&vlp_props_col) {
+        if let Ok(parsed) = serde_json::from_str::<HashMap<String, JsonValue>>(json_str) {
+            for (k, v) in parsed {
+                let clean_key = if k.contains('.') {
+                    k.split('.').next_back().unwrap_or(&k).to_string()
+                } else {
+                    k
+                };
+                properties.entry(clean_key).or_insert(v);
+            }
+        }
+    }
+
+    // Resolve label: per-row __label__ > metadata labels > infer from schema
+    let label = resolve_node_label(row, var_name, labels, &properties, schema)?;
+
+    let node_schema = schema.node_schema_opt(&label)?;
+    let id_columns = node_schema.node_id.id.columns();
+
+    let element_id = match sql_element_id {
+        Some(element_id) => element_id,
+        None => {
+            // A composite id's part may be NULL (its element id's `\\N`); an
+            // id of no part that is not is no node's.
+            let id_values: Vec<Option<String>> = id_columns
+                .iter()
+                .map(|col_name| match properties.get(*col_name)? {
+                    JsonValue::Null if id_columns.len() > 1 => Some(None),
+                    v => json_value_to_string(v).map(Some),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if id_values.iter().all(Option::is_none) {
+                return None;
+            }
+
+            let id_value_refs: Vec<Option<&str>> = id_values.iter().map(|s| s.as_deref()).collect();
+            node_element_id(&label, &id_value_refs)
+        }
+    };
+
+    // Convert JSON properties to embedded Value properties
+    let embedded_properties: HashMap<String, Value> = properties
+        .into_iter()
+        .map(|(k, v)| (k, Value::from(v)))
+        .collect();
+
+    // Its label, then the union labels it carries (a Post is also a Message).
+    let unions: Vec<String> = schema
+        .union_labels_of(&label)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    Some(GraphNode {
+        id: element_id,
+        labels: std::iter::once(label).chain(unions).collect(),
+        properties: embedded_properties,
+    })
+}
+
+/// Resolve the label for a node from row data and metadata.
+fn resolve_node_label(
+    row: &HashMap<String, JsonValue>,
+    var_name: &str,
+    labels: &[String],
+    properties: &HashMap<String, JsonValue>,
+    schema: &GraphSchema,
+) -> Option<String> {
+    // Priority 1: per-row {alias}.__label__
+    if let Some(label_value) = row.get(&format!("{}.__label__", var_name)) {
+        if let Some(label_str) = json_value_to_string(label_value) {
+            if label_str != "Unknown" {
+                return Some(label_str);
+            }
+        }
+    }
+
+    // Priority 2: metadata labels
+    if let Some(l) = labels.first() {
+        return Some(l.clone());
+    }
+
+    // Priority 3: global __label__
+    if let Some(label_value) = row.get("__label__") {
+        if let Some(label_str) = json_value_to_string(label_value) {
+            if label_str != "Unknown" {
+                return Some(label_str);
+            }
+        }
+    }
+
+    // Priority 4: infer from schema by matching ID columns in properties
+    infer_node_label(properties, schema)
+}
+
+/// Infer a node label by matching schema ID columns against available properties.
+fn infer_node_label(
+    properties: &HashMap<String, JsonValue>,
+    schema: &GraphSchema,
+) -> Option<String> {
+    for (label, node_schema) in schema.all_node_schemas() {
+        let id_columns = node_schema.node_id.id.columns();
+        let has_id = id_columns
+            .iter()
+            .any(|col| properties.get(*col).is_some_and(|v| !v.is_null()));
+        if has_id {
+            return Some(label.clone());
+        }
+    }
+    None
+}
+
+/// Extract a `GraphEdge` from a result row: the server's relationship of its
+/// columns (`transform_to_relationship`), so its element id (with its
+/// `edge_id`, #1334) and its ends' are the ones Bolt and the HTTP graph
+/// output give it.
+fn extract_edge_from_row(
+    row: &HashMap<String, JsonValue>,
+    var_name: &str,
+    rel_types: &[String],
+    from_label: Option<&str>,
+    to_label: Option<&str>,
+    schema: &GraphSchema,
+) -> Option<GraphEdge> {
+    let rel = transform_to_relationship(row, var_name, rel_types, from_label, to_label, schema)
+        .map_err(|e| log::debug!("Skipping relationship '{var_name}' in graph output: {e}"))
+        .ok()?;
+    Some(GraphEdge {
+        id: rel.element_id,
+        type_name: rel.rel_type,
+        from_id: rel.start_node_element_id,
+        to_id: rel.end_node_element_id,
+        properties: rel
+            .properties
+            .into_iter()
+            .map(|(k, v)| (k, Value::from(v)))
+            .collect(),
+    })
+}
+
+/// Convert a `serde_json::Value` to a `String` for ID extraction.
+fn json_value_to_string(v: &JsonValue) -> Option<String> {
+    match v {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Number(n) => Some(n.to_string()),
+        JsonValue::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path of the bound-plan path (Neo4j's JSON form) adds its nodes and
+    /// edges, once each.
+    #[test]
+    fn a_path_value_adds_its_nodes_and_edges() {
+        use clickgraph::bound_plan::lower::GraphType;
+        let node = |id: u32| serde_json::json!({"elementId": format!("User:{id}-"), "labels": ["User"], "properties": {"user_id": id}});
+        let rel = |a: u32, b: u32| {
+            serde_json::json!({
+                "elementId": format!("FOLLOWS:{a}->{b}-"),
+                "startNodeElementId": format!("User:{a}-"),
+                "endNodeElementId": format!("User:{b}-"),
+                "type": "FOLLOWS",
+                "properties": {}
+            })
+        };
+        let rows = vec![
+            serde_json::json!({"p": [node(1), rel(1, 2), node(2), rel(2, 1), node(1)]}),
+            serde_json::json!({"p": null}),
+        ];
+        let meta = vec![ReturnItemMetadata {
+            field_name: "p".to_string(),
+            item_type: ReturnItemType::Graph(GraphType::Path),
+            columns: Some(vec![("p".to_string(), "p".to_string())]),
+        }];
+        let schema = GraphSchema::build(1, "db".to_string(), HashMap::new(), HashMap::new());
+        let result = transform_rows_to_graph(&rows, &meta, &schema);
+        assert_eq!((result.node_count(), result.edge_count()), (2, 2));
+        let edge = result
+            .edges()
+            .iter()
+            .find(|e| e.id == "FOLLOWS:2->1-")
+            .unwrap();
+        assert_eq!(
+            (edge.from_id.as_str(), edge.to_id.as_str()),
+            ("User:2-", "User:1-")
+        );
+        assert_eq!(
+            result.nodes()[0].properties.get("user_id"),
+            Some(&Value::Int64(1))
+        );
+    }
+
+    /// A returned relationship's edge is the server's: parallel ones are two
+    /// edges by the element ids the SQL spells from their `edge_id` (#1334), a
+    /// composite end its whole id.
+    #[test]
+    fn returned_relationships_are_the_servers() {
+        const YAML: &str = r#"
+name: parallel
+graph_schema:
+  nodes:
+    - {label: U, database: db, table: u, node_id: [t, id], property_mappings: {name: name}}
+  edges:
+    - {type: F, database: db, table: f, from_node: U, to_node: U, from_id: [ta, a],
+       to_id: [tb, b], edge_id: fid, property_mappings: {w: w}}
+"#;
+        let schema = clickgraph::graph_catalog::config::GraphSchemaConfig::from_yaml_str(YAML)
+            .unwrap()
+            .to_graph_schema()
+            .unwrap();
+        let keys = [
+            "#fromId_1",
+            "#fromId_2",
+            "#toId_1",
+            "#toId_2",
+            "w",
+            clickgraph::bound_plan::lower::REL_ELEMENT_ID_KEY,
+        ];
+        let meta = vec![ReturnItemMetadata {
+            field_name: "r".to_string(),
+            item_type: ReturnItemType::Relationship {
+                rel_types: vec!["F".to_string()],
+                from_label: Some("U".to_string()),
+                to_label: Some("U".to_string()),
+                direction: Some("Outgoing".to_string()),
+            },
+            columns: Some(
+                keys.iter()
+                    .map(|k| (k.to_string(), format!("r.{}", k.trim_start_matches('#'))))
+                    .collect(),
+            ),
+        }];
+        let row = |fid: u32| {
+            serde_json::json!({
+                "r.fromId_1": "t", "r.fromId_2": 6, "r.toId_1": "t", "r.toId_2": 7,
+                "r.elementId": format!("F:{fid}:t|6->t|7-"), "r.w": 1
+            })
+        };
+        let result = transform_rows_to_graph(&[row(10), row(11), row(10)], &meta, &schema);
+        let mut ids: Vec<&str> = result.edges().iter().map(|e| e.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["F:10:t|6->t|7-", "F:11:t|6->t|7-"]);
+        let edge = &result.edges()[0];
+        assert_eq!(
+            (edge.from_id.as_str(), edge.to_id.as_str()),
+            ("U:t|6-", "U:t|7-")
+        );
+        assert_eq!(edge.properties.keys().collect::<Vec<_>>(), vec!["w"]);
+    }
+
+    /// #1528: the node's element id spelled in SQL is taken as it is.
+    #[test]
+    fn a_node_takes_its_element_id_from_sql() {
+        let schema = clickgraph::graph_catalog::config::GraphSchemaConfig::from_yaml_str(
+            "graph_schema:\n  name: t\n  nodes:\n    - {label: Fs, database: d, table: t, node_id: code, property_mappings: {code: code}}\n",
+        )
+        .unwrap()
+        .to_graph_schema()
+        .unwrap();
+        let key = clickgraph::bound_plan::lower::NODE_ELEMENT_ID_KEY;
+        let row: HashMap<String, JsonValue> = [
+            ("n.code".to_string(), serde_json::json!("ab\u{0}\u{0}")),
+            (format!("n.{key}"), serde_json::json!("Fs:ab-")),
+        ]
+        .into();
+        let node = extract_node_from_row(&row, "n", &["Fs".to_string()], &schema).unwrap();
+        assert_eq!(node.id, "Fs:ab-");
+        assert!(!node.properties.contains_key(key));
+    }
+
+    #[test]
+    fn test_graph_node_construction() {
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), Value::String("Alice".to_string()));
+        props.insert("age".to_string(), Value::Int64(30));
+
+        let node = GraphNode {
+            id: "Person:42".to_string(),
+            labels: vec!["Person".to_string()],
+            properties: props,
+        };
+
+        assert_eq!(node.id, "Person:42");
+        assert_eq!(node.labels, vec!["Person"]);
+        assert_eq!(
+            node.properties.get("name"),
+            Some(&Value::String("Alice".to_string()))
+        );
+        assert_eq!(node.properties.get("age"), Some(&Value::Int64(30)));
+    }
+
+    #[test]
+    fn test_graph_edge_construction() {
+        let mut props = HashMap::new();
+        props.insert("since".to_string(), Value::Int64(2020));
+
+        let edge = GraphEdge {
+            id: "FOLLOWS:1:2".to_string(),
+            type_name: "FOLLOWS".to_string(),
+            from_id: "User:1".to_string(),
+            to_id: "User:2".to_string(),
+            properties: props,
+        };
+
+        assert_eq!(edge.id, "FOLLOWS:1:2");
+        assert_eq!(edge.type_name, "FOLLOWS");
+        assert_eq!(edge.from_id, "User:1");
+        assert_eq!(edge.to_id, "User:2");
+        assert_eq!(edge.properties.get("since"), Some(&Value::Int64(2020)));
+    }
+
+    #[test]
+    fn test_graph_result_deduplication() {
+        let mut builder = GraphResultBuilder::new();
+
+        let node1 = GraphNode {
+            id: "Person:1".to_string(),
+            labels: vec!["Person".to_string()],
+            properties: HashMap::new(),
+        };
+        let node1_dup = node1.clone();
+        let node2 = GraphNode {
+            id: "Person:2".to_string(),
+            labels: vec!["Person".to_string()],
+            properties: HashMap::new(),
+        };
+
+        builder.add_node(node1);
+        builder.add_node(node1_dup);
+        builder.add_node(node2);
+
+        let edge1 = GraphEdge {
+            id: "KNOWS:1:2".to_string(),
+            type_name: "KNOWS".to_string(),
+            from_id: "Person:1".to_string(),
+            to_id: "Person:2".to_string(),
+            properties: HashMap::new(),
+        };
+        let edge1_dup = edge1.clone();
+
+        builder.add_edge(edge1);
+        builder.add_edge(edge1_dup);
+
+        let result = builder.build();
+        assert_eq!(result.node_count(), 2, "duplicate node should be skipped");
+        assert_eq!(result.edge_count(), 1, "duplicate edge should be skipped");
+    }
+
+    #[test]
+    fn test_graph_result_empty() {
+        let builder = GraphResultBuilder::new();
+        let result = builder.build();
+        assert_eq!(result.node_count(), 0);
+        assert_eq!(result.edge_count(), 0);
+        assert!(result.nodes().is_empty());
+        assert!(result.edges().is_empty());
+    }
+
+    #[test]
+    fn test_parse_element_id_node() {
+        let (label, id) = parse_element_id("User:42").unwrap();
+        assert_eq!(label, "User");
+        assert_eq!(id, "42");
+    }
+
+    #[test]
+    fn test_parse_element_id_string_id() {
+        let (label, id) = parse_element_id("Person:abc-def").unwrap();
+        assert_eq!(label, "Person");
+        assert_eq!(id, "abc-def");
+    }
+
+    #[test]
+    fn test_parse_element_id_no_colon() {
+        assert!(parse_element_id("nocolon").is_none());
+    }
+
+    #[test]
+    fn test_parse_element_id_empty() {
+        assert!(parse_element_id("").is_none());
+    }
+
+    #[test]
+    fn test_store_stats_default() {
+        let stats = StoreStats {
+            nodes_stored: 5,
+            edges_stored: 10,
+        };
+        assert_eq!(stats.nodes_stored, 5);
+        assert_eq!(stats.edges_stored, 10);
+    }
+}

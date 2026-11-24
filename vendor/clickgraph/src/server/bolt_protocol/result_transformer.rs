@@ -1,0 +1,3600 @@
+//! Result Transformer for Neo4j Bolt Protocol
+//!
+//! This module transforms ClickHouse query results into Neo4j Bolt 5.x graph objects.
+//! It handles the conversion of flat result rows into typed Node, Relationship, and Path
+//! structures with elementId support.
+//!
+//! # Architecture
+//!
+//! 1. **Metadata Extraction**: Analyze query logical plan and variable registry to determine
+//!    which return items are graph entities (Node/Relationship/Path) vs scalars
+//!
+//! 2. **Result Transformation**: Convert flat result rows into appropriate graph objects
+//!    or scalar values based on metadata
+//!
+//! 3. **ElementId Generation**: Use the element_id module to create Neo4j-compatible
+//!    element IDs for all graph entities
+//!
+//! # Example
+//!
+//! ```text
+//! Query: MATCH (n:User) WHERE n.user_id = 1 RETURN n
+//!
+//! Metadata: [ReturnItemMetadata { field_name: "n", item_type: Node { labels: ["User"] } }]
+//!
+//! Input Row: {"n.user_id": 123, "n.name": "Alice", "n.email": "alice@example.com"}
+//!
+//! Output: Node {
+//!     id: 0,
+//!     labels: ["User"],
+//!     properties: {"user_id": 123, "name": "Alice", "email": "alice@example.com"},
+//!     element_id: "User:123"
+//! }
+//! ```
+
+use crate::bound_plan::lower::{REL_FROM_ID_KEY, REL_TO_ID_KEY};
+use crate::{
+    graph_catalog::{
+        element_id::{
+            generate_node_element_id, generate_relationship_element_id, node_element_id,
+            node_element_id_of_text, node_id_text, parse_node_element_id,
+        },
+        graph_schema::GraphSchema,
+    },
+    server::bolt_protocol::{
+        graph_objects::{Node, Path, Relationship},
+        messages::BoltValue,
+    },
+};
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// Metadata about a single return item
+#[derive(Debug, Clone)]
+pub struct ReturnItemMetadata {
+    /// Field name in results (e.g., "n", "r", "n.name")
+    pub field_name: String,
+    /// Type of return item
+    pub item_type: ReturnItemType,
+    /// The result columns holding the item, as (key, column), when the
+    /// translation knows them exactly (the bound-plan path): a value's key is
+    /// its name, an entity's keys are `#fromId` / `#toId` (the internal ends,
+    /// which no property name can equal) and its property names. `None`: the
+    /// legacy convention, where a value is the column `field_name` and an
+    /// entity is every column prefixed `field_name.` (which also collects
+    /// another item named `n.name_2` or `n.age + 1`).
+    pub columns: Option<Vec<(String, String)>>,
+}
+
+impl ReturnItemMetadata {
+    /// The value of a scalar or `id()` item.
+    pub fn value<'r>(&self, row: &'r HashMap<String, Value>) -> Option<&'r Value> {
+        match &self.columns {
+            Some(columns) => columns.first().and_then(|(_, c)| row.get(c)),
+            None => row.get(&self.field_name),
+        }
+    }
+
+    /// Every column of the item is NULL: a node or relationship an OPTIONAL
+    /// MATCH did not match, which is NULL as a whole. Known only with
+    /// explicit columns (a matched element's identity is never NULL).
+    pub fn is_null(&self, row: &HashMap<String, Value>) -> bool {
+        self.columns.as_ref().is_some_and(|columns| {
+            columns
+                .iter()
+                .all(|(_, c)| row.get(c).is_none_or(Value::is_null))
+        })
+    }
+
+    /// The row as an entity transform reads it (`{field_name}.{key}`). With
+    /// explicit columns: only this item's columns, under those names.
+    pub fn entity_row<'r>(
+        &self,
+        row: &'r HashMap<String, Value>,
+    ) -> std::borrow::Cow<'r, HashMap<String, Value>> {
+        match &self.columns {
+            None => std::borrow::Cow::Borrowed(row),
+            Some(columns) => std::borrow::Cow::Owned(
+                columns
+                    .iter()
+                    .filter_map(|(key, c)| {
+                        row.get(c)
+                            .map(|v| (format!("{}.{}", self.field_name, key), v.clone()))
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Type of a return item
+#[derive(Debug, Clone)]
+pub enum ReturnItemType {
+    /// Whole node entity - needs transformation to Node struct
+    Node {
+        /// Node labels from variable registry
+        labels: Vec<String>,
+    },
+    /// Whole relationship entity - needs transformation to Relationship struct
+    Relationship {
+        /// Relationship types from variable registry
+        rel_types: Vec<String>,
+        /// From node label (for polymorphic relationships)
+        from_label: Option<String>,
+        /// To node label (for polymorphic relationships)
+        to_label: Option<String>,
+        /// Relationship direction: "Outgoing", "Incoming", or "Either"
+        /// Used to determine if start/end nodes should be swapped for undirected queries
+        direction: Option<String>,
+    },
+    /// Path variable - needs transformation to Path struct
+    Path {
+        /// Start node alias (for looking up component data)
+        start_alias: Option<String>,
+        /// End node alias
+        end_alias: Option<String>,
+        /// Relationship alias
+        rel_alias: Option<String>,
+        /// Start node labels (from variable registry lookup)
+        start_labels: Vec<String>,
+        /// End node labels (from variable registry lookup)
+        end_labels: Vec<String>,
+        /// Relationship types (from variable registry lookup)
+        rel_types: Vec<String>,
+        /// Whether this is a VLP (variable-length path)
+        is_vlp: bool,
+        /// Relationship direction: "Outgoing", "Incoming", or "Either"
+        /// Used to determine if nodes should be swapped in undirected paths
+        direction: Option<String>,
+    },
+    /// Neo4j id() function - compute encoded ID from element_id at result time
+    IdFunction {
+        /// The variable alias (e.g., "u" in id(u))
+        alias: String,
+        /// Labels for the entity (if known)
+        labels: Vec<String>,
+    },
+    /// A column holding an element id (`TYPE:from->to` of a relationship,
+    /// P-4c S11l `id(r)`): returned as Bolt's number for it
+    /// (`IdMapper::compute_deterministic_id`), NULL as NULL.
+    ElementIdNumber,
+    /// Scalar value (property access, expression, aggregate) - return as-is
+    Scalar,
+    /// A value holding nodes, relationships or paths in Neo4j's JSON form
+    /// (`elementId`, `labels`, `properties`, …; a path is the list of its
+    /// nodes and relationships in turn), of this type: the bound-plan path's
+    /// paths and lists (`bound_plan::lower::value`).
+    Graph(crate::bound_plan::lower::GraphType),
+}
+
+/// Bolt's number for an element id held as text (`ReturnItemType::
+/// ElementIdNumber`, P-4c S11l): the id Bolt gives that element; NULL stays
+/// NULL. The server's HTTP JSON results and the library return the same.
+pub fn element_id_number(value: Value) -> Value {
+    match value {
+        Value::String(element_id) => {
+            Value::Number(super::id_mapper::IdMapper::compute_deterministic_id(&element_id).into())
+        }
+        other => other,
+    }
+}
+
+/// Transform a single result row using return metadata
+///
+/// Converts flat ClickHouse result row into Neo4j Bolt format, transforming
+/// graph entities into Node/Relationship/Path structs and leaving scalars as-is.
+///
+/// # Arguments
+///
+/// * `row` - Raw result row as HashMap (column_name → value)
+/// * `metadata` - Metadata for each return item
+/// * `schema` - Graph schema for ID column lookup
+///
+/// # Returns
+///
+/// Vector of Values in the same order as metadata, where graph entities are
+/// packstream-encoded Node/Relationship/Path structs
+///
+/// # Example
+///
+/// ```text
+/// Input row: {"n.user_id": 123, "n.name": "Alice"}
+/// Metadata: [Node { labels: ["User"] }]
+///
+/// Output: [Node { id: 0, labels: ["User"], properties: {...}, element_id: "User:123" }]
+/// ```
+pub fn transform_row(
+    row: HashMap<String, Value>,
+    metadata: &[ReturnItemMetadata],
+    schema: &GraphSchema,
+    id_mapper: &mut super::id_mapper::IdMapper,
+) -> Result<Vec<BoltValue>, String> {
+    log::info!(
+        "🔍 transform_row called with {} columns: {:?}",
+        row.len(),
+        row.keys().collect::<Vec<_>>()
+    );
+    log::trace!(
+        "🔍 Metadata has {} items: {:?}",
+        metadata.len(),
+        metadata
+            .iter()
+            .map(|m| (&m.field_name, &m.item_type))
+            .collect::<Vec<_>>()
+    );
+
+    // Check for multi-label scan results (has {alias}_label, {alias}_id, {alias}_properties columns)
+    // A translation that names every item's columns has none.
+    if metadata.iter().any(|m| m.columns.is_none()) {
+        if let Some(transformed) = try_transform_multi_label_row(&row, metadata, id_mapper)? {
+            return Ok(transformed);
+        }
+    }
+
+    let mut result = Vec::new();
+
+    for meta in metadata {
+        if meta.is_null(&row) {
+            result.push(BoltValue::Json(Value::Null));
+            continue;
+        }
+        match &meta.item_type {
+            ReturnItemType::Node { labels } => {
+                // Strip ".*" suffix from field_name if present (wildcard expansion)
+                let var_name = meta
+                    .field_name
+                    .strip_suffix(".*")
+                    .unwrap_or(&meta.field_name);
+                let mut node = transform_to_node(&meta.entity_row(&row), var_name, labels, schema)?;
+                // Assign session-scoped integer ID from id_mapper
+                node.id = id_mapper.get_or_assign(&node.element_id);
+                // Use the Node's packstream encoding
+                let packstream_bytes = node.to_packstream();
+                result.push(BoltValue::PackstreamBytes(packstream_bytes));
+            }
+            ReturnItemType::Relationship {
+                rel_types,
+                from_label,
+                to_label,
+                direction,
+            } => {
+                // Strip ".*" suffix from field_name if present (wildcard expansion)
+                let var_name = meta
+                    .field_name
+                    .strip_suffix(".*")
+                    .unwrap_or(&meta.field_name);
+                let mut rel = transform_to_relationship(
+                    &meta.entity_row(&row),
+                    var_name,
+                    rel_types,
+                    from_label.as_deref(),
+                    to_label.as_deref(),
+                    schema,
+                )?;
+                // If relationship direction is "Incoming" or "Either", we may need to swap start/end nodes
+                // This handles undirected patterns like (a)--(b) where we need to match query semantics
+                if let Some(dir) = direction {
+                    if dir == "Incoming" || dir == "Either" {
+                        // Swap start and end nodes to match query pattern semantics
+                        std::mem::swap(
+                            &mut rel.start_node_element_id,
+                            &mut rel.end_node_element_id,
+                        );
+                        log::debug!(
+                            "Swapped relationship direction for undirected pattern: {} (was {}->{})",
+                            var_name,
+                            rel.end_node_element_id,
+                            rel.start_node_element_id
+                        );
+                    }
+                }
+                // Assign session-scoped integer IDs from id_mapper
+                rel.id = id_mapper.get_or_assign(&rel.element_id);
+                rel.start_node_id = id_mapper.get_or_assign(&rel.start_node_element_id);
+                rel.end_node_id = id_mapper.get_or_assign(&rel.end_node_element_id);
+                // Use the Relationship's packstream encoding
+                let packstream_bytes = rel.to_packstream();
+                result.push(BoltValue::PackstreamBytes(packstream_bytes));
+            }
+            ReturnItemType::Path {
+                start_alias,
+                end_alias,
+                rel_alias,
+                start_labels,
+                end_labels,
+                rel_types,
+                is_vlp,
+                direction,
+            } => {
+                // Transform fixed-hop path to Neo4j Path structure
+                // For now, we support fixed single-hop paths: (a)-[r]->(b)
+                //
+                // The SQL returns: tuple('fixed_path', start_alias, end_alias, rel_alias)
+                // We use the metadata (labels, types) from query planning
+
+                if *is_vlp {
+                    // VLP paths: the SQL returns a tuple column with path data.
+                    // Tuple shape depends on whether the CTE is standard
+                    // (single-type, 3 fields) or multi-type (9 fields) — see
+                    // #486 and `transform_vlp_path`'s doc comment.
+                    let mut path = transform_vlp_path(
+                        &row,
+                        &meta.field_name,
+                        schema,
+                        start_labels,
+                        end_labels,
+                        rel_types,
+                    )?;
+
+                    // Assign session-scoped integer IDs
+                    for node in &mut path.nodes {
+                        node.id = id_mapper.get_or_assign(&node.element_id);
+                    }
+                    for rel in &mut path.relationships {
+                        rel.id = id_mapper.get_or_assign(&rel.element_id);
+                        rel.start_node_id = id_mapper.get_or_assign(&rel.start_node_element_id);
+                        rel.end_node_id = id_mapper.get_or_assign(&rel.end_node_element_id);
+                    }
+
+                    let packstream_bytes = path.to_packstream();
+                    result.push(BoltValue::PackstreamBytes(packstream_bytes));
+                    continue;
+                }
+
+                // For fixed-hop paths, construct path using known metadata
+                let mut path = transform_to_path(
+                    &row,
+                    &meta.field_name,
+                    start_alias.as_deref(),
+                    end_alias.as_deref(),
+                    rel_alias.as_deref(),
+                    start_labels,
+                    end_labels,
+                    rel_types,
+                    schema,
+                    metadata,
+                )?;
+
+                // If relationship direction is "Incoming" or "Either", swap nodes in path
+                // This handles undirected patterns like (a)--(b) where we need to match query semantics
+                if let Some(dir) = direction {
+                    if dir == "Incoming" || dir == "Either" {
+                        // Swap start and end nodes in the path to match query pattern semantics
+                        if path.nodes.len() >= 2 {
+                            path.nodes.swap(0, 1);
+                            log::debug!(
+                                "Swapped path nodes for undirected pattern (nodes now: {} -> {})",
+                                path.nodes[0]
+                                    .labels
+                                    .first()
+                                    .map(String::as_str)
+                                    .unwrap_or("?"),
+                                path.nodes[1]
+                                    .labels
+                                    .first()
+                                    .map(String::as_str)
+                                    .unwrap_or("?")
+                            );
+                        }
+                        // Also swap the relationship's start/end node element IDs
+                        for rel in &mut path.relationships {
+                            std::mem::swap(
+                                &mut rel.start_node_element_id,
+                                &mut rel.end_node_element_id,
+                            );
+                        }
+                    }
+                }
+
+                // Assign session-scoped integer IDs to all nodes and relationships in path
+                for node in &mut path.nodes {
+                    node.id = id_mapper.get_or_assign(&node.element_id);
+                }
+                for rel in &mut path.relationships {
+                    rel.id = id_mapper.get_or_assign(&rel.element_id);
+                    rel.start_node_id = id_mapper.get_or_assign(&rel.start_node_element_id);
+                    rel.end_node_id = id_mapper.get_or_assign(&rel.end_node_element_id);
+                }
+
+                // Use the Path's packstream encoding
+                let packstream_bytes = path.to_packstream();
+                result.push(BoltValue::PackstreamBytes(packstream_bytes));
+            }
+            ReturnItemType::IdFunction { alias, labels } => {
+                // For id() function, we need to compute the encoded ID from the element_id
+                // The element_id is constructed from the label and ID column value
+                log::debug!(
+                    "IdFunction handler: alias={}, labels={:?}, field_name={}",
+                    alias,
+                    labels,
+                    meta.field_name
+                );
+
+                // Find the node/relationship data in the row to build element_id
+                let label = labels
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                // First, try to get the id value from the field_name (the SQL column alias)
+                // When "id(u) as uid" is queried, SQL is "SELECT u.user_id AS uid"
+                // and row contains {"uid": 1}, so we look for field_name first
+                let element_id = if let Some(id_val) = meta.value(&row) {
+                    let id_str = match id_val {
+                        Value::Number(n) => n.to_string(),
+                        Value::String(s) => s.clone(),
+                        _ => format!("{:?}", id_val),
+                    };
+                    node_element_id_of_text(&label, &id_str)
+                } else {
+                    // Fallback: try alias.id_col format (when node is also returned)
+                    let id_col = schema
+                        .node_schema(&label)
+                        .map(|ns| {
+                            ns.node_id
+                                .columns()
+                                .first()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "id".to_string())
+                        })
+                        .unwrap_or_else(|_| "id".to_string());
+                    let id_column_key = format!("{}.{}", alias, id_col);
+
+                    if let Some(id_val) = row.get(&id_column_key) {
+                        let id_str = match id_val {
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => s.clone(),
+                            _ => format!("{:?}", id_val),
+                        };
+                        node_element_id_of_text(&label, &id_str)
+                    } else {
+                        // Last fallback: try to construct from any property that looks like an ID
+                        let prefix = format!("{}.", alias);
+                        let mut element_id = None;
+                        for (key, value) in row.iter() {
+                            if let Some(prop) = key.strip_prefix(&prefix) {
+                                if prop.ends_with("_id") || prop == "id" {
+                                    let id_str = match value {
+                                        Value::Number(n) => n.to_string(),
+                                        Value::String(s) => s.clone(),
+                                        _ => continue,
+                                    };
+                                    element_id = Some(node_element_id_of_text(&label, &id_str));
+                                    break;
+                                }
+                            }
+                        }
+                        element_id.unwrap_or_else(|| format!("{}:unknown", label))
+                    }
+                };
+
+                // IdMapper's deterministic ID computation. A hash of the key
+                // is assigned in the session, so `WHERE id(n) = N` reads the
+                // number back (ELEMENT_IDENTITY.md I5a); a key's bits need not
+                // be.
+                let encoded_id = if super::id_mapper::IdMapper::holds_key_bits(schema, &element_id)
+                {
+                    super::id_mapper::IdMapper::compute_deterministic_id(&element_id)
+                } else {
+                    id_mapper.get_or_assign(&element_id)
+                };
+                log::debug!("id() encoded: {} -> {}", element_id, encoded_id);
+                result.push(BoltValue::Json(Value::Number(encoded_id.into())));
+            }
+            ReturnItemType::ElementIdNumber => {
+                // Assigned in the session, so that `id(r) = N` of the number
+                // reads it back (#1410). A node's number that holds its key's
+                // bits (`id(n)` of a node of several labels, I5b) reads back
+                // from the number alone: nothing is kept for it.
+                let value = match meta.value(&row).cloned().unwrap_or(Value::Null) {
+                    Value::String(element_id) => {
+                        let number =
+                            if super::id_mapper::IdMapper::holds_key_bits(schema, &element_id) {
+                                super::id_mapper::IdMapper::compute_deterministic_id(&element_id)
+                            } else {
+                                id_mapper.get_or_assign(&element_id)
+                            };
+                        Value::Number(number.into())
+                    }
+                    other => other,
+                };
+                result.push(BoltValue::Json(value));
+            }
+            ReturnItemType::Scalar => {
+                // For scalars, just extract the value and wrap in BoltValue::Json
+                let value = meta.value(&row).cloned().unwrap_or(Value::Null);
+                result.push(BoltValue::Json(value));
+            }
+            ReturnItemType::Graph(ty) => {
+                let value = meta.value(&row).cloned().unwrap_or(Value::Null);
+                result.push(BoltValue::PackstreamBytes(super::graph_values::packstream(
+                    &value, ty, id_mapper,
+                )?));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Transform flat result row into a Node struct
+///
+/// Extracts properties, determines ID columns from schema, and generates elementId
+pub(crate) fn transform_to_node(
+    row: &HashMap<String, Value>,
+    var_name: &str,
+    labels: &[String],
+    schema: &GraphSchema,
+) -> Result<Node, String> {
+    // Extract properties for this variable
+    // Columns like "n.user_id", "n.name" → properties { user_id: 123, name: "Alice" }
+    let prefix = format!("{}.", var_name);
+    let mut properties = HashMap::new();
+
+    // VLP/CTE result rows carry a `{var}.properties` JSON blob (parsed below)
+    // and a `{var}.id` id column that are internal plumbing, not real
+    // properties. In that mode they must be skipped. But in the NON-VLP whole-
+    // node path there is no `{var}.properties` column, and `{var}.id` is the
+    // node's genuine id property — for a schema whose node-id column is named
+    // `id` (`node_id: id`), dropping it would leave both element_id lookup AND
+    // label inference (which match the schema id column against this map) unable
+    // to find the id, so the node fails to render in Neo4j Browser. Only drop
+    // `id` when we're actually in VLP mode.
+    let is_vlp_row = row.contains_key(&format!("{}.properties", var_name));
+
+    for (key, value) in row.iter() {
+        if let Some(prop_name) = key.strip_prefix(&prefix) {
+            // Skip internal __label__ and VLP metadata columns from properties
+            if prop_name != "__label__"
+                && prop_name != "_label__"
+                && prop_name != "properties"
+                && !(is_vlp_row && prop_name == "id")
+            {
+                properties.insert(prop_name.to_string(), value.clone());
+            }
+        }
+    }
+
+    // The node's element id as SQL spells it, where an id part is one SQL
+    // alone spells (`NODE_ELEMENT_ID_KEY`, #1528): taken as is, whatever the
+    // properties are.
+    let sql_element_id = properties
+        .remove(crate::bound_plan::lower::NODE_ELEMENT_ID_KEY)
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        });
+
+    // VLP CTE results: o.properties is a JSON blob, o.id is the ID string
+    // Parse JSON properties and merge into the properties map
+    let _vlp_id_col = format!("{}.id", var_name);
+    let vlp_props_col = format!("{}.properties", var_name);
+    if let Some(props_val) = row.get(&vlp_props_col) {
+        match props_val {
+            Value::String(json_str) => {
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, Value>>(json_str) {
+                    for (k, v) in parsed {
+                        // #1024: the pattern_union CTE keys node-property blobs with a
+                        // role-unique `_s_`/`_e_` prefix (to dodge the User→User self-loop
+                        // key collision). Strip that prefix FIRST, then apply the existing
+                        // table-alias `.`-qualifier strip — this order is byte-identical to
+                        // the pre-#1024 behavior for every UNPREFIXED key (the prefix strip
+                        // is a no-op), and for a prefixed key it just removes `_s_`/`_e_`
+                        // before the same `.`-reduction runs. Mirrors `clean_property_keys()`.
+                        let mut clean_key = k;
+                        for prefix in &["_s_", "_e_", "_r_"] {
+                            if let Some(stripped) = clean_key.strip_prefix(prefix) {
+                                clean_key = stripped.to_string();
+                                break;
+                            }
+                        }
+                        // Strip table alias prefix from JSON keys (e.g., "a_1.user_id" →
+                        // "user_id"). ClickHouse adds these when JOINs create ambiguous
+                        // column names.
+                        if clean_key.contains('.') {
+                            clean_key = clean_key
+                                .split('.')
+                                .next_back()
+                                .unwrap_or(&clean_key)
+                                .to_string();
+                        }
+                        properties.entry(clean_key).or_insert(v);
+                    }
+                } else {
+                    log::debug!(
+                        "VLP: Failed to parse JSON properties for {}: {}",
+                        var_name,
+                        json_str
+                    );
+                }
+            }
+            other => {
+                log::debug!(
+                    "VLP: properties column for {} is not a string: {:?}",
+                    var_name,
+                    other
+                );
+            }
+        }
+    } else {
+        log::debug!(
+            "VLP: No {}.properties column found. Row keys: {:?}",
+            var_name,
+            row.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Get primary label
+    // Priority: 1. Per-row {alias}.__label__ (VLP/UNION), 2. Provided labels (metadata), 3. __label__, 4. Infer
+    let label = if let Some(label_value) = row.get(&format!("{}.__label__", var_name)) {
+        // VLP multi-type queries: {alias}.__label__ has the correct per-row label
+        let row_label = value_to_string(label_value).ok_or_else(|| {
+            format!(
+                "Invalid {}.__label__ value for node: {}",
+                var_name, var_name
+            )
+        })?;
+        if row_label != "Unknown" {
+            row_label
+        } else if let Some(l) = labels.first() {
+            l.clone()
+        } else {
+            infer_node_label_from_properties(&properties, schema)
+                .ok_or_else(|| format!("No label for node variable: {}", var_name))?
+        }
+    } else if let Some(l) = labels.first() {
+        l.clone()
+    } else if let Some(label_value) = row.get("__label__") {
+        let label_str = value_to_string(label_value)
+            .ok_or_else(|| format!("Invalid __label__ value for node variable: {}", var_name))?;
+        // Skip "Unknown" — it's the outer VLP query's default label, not the node's actual label
+        if label_str == "Unknown" {
+            infer_node_label_from_properties(&properties, schema)
+                .ok_or_else(|| format!("No label for node variable: {}", var_name))?
+        } else {
+            label_str
+        }
+    } else {
+        // Fallback: infer label from properties by matching schema ID columns
+        infer_node_label_from_properties(&properties, schema)
+            .ok_or_else(|| format!("No label for node variable: {}", var_name))?
+    };
+
+    // Get node schema
+    let node_schema = schema
+        .node_schema_opt(&label)
+        .ok_or_else(|| format!("Node schema not found for label: {}", label))?;
+
+    // Get ID column names from schema
+    let id_columns = node_schema.node_id.id.columns();
+
+    // Extract ID values for the element_id.
+    //
+    // The `properties` map intentionally drops the literal keys `id` and
+    // `properties` (above), because in VLP results `{var}.id` is the node's
+    // id-string column and `{var}.properties` is a JSON blob — VLP-internal
+    // columns, not real properties. But a schema whose node-id column is
+    // literally named `id` (e.g. `node_id: id`, extremely common — most
+    // Databricks/ClickHouse tables use an `id` primary key) then has its id
+    // value dropped, so `properties.get("id")` misses and the node fails to
+    // render in Neo4j Browser ("Missing ID column 'id'"). Fall back to the raw
+    // row column (`{var}.{col}`) so the id value is recovered regardless.
+    //
+    // A composite id's part may be NULL (`None`, its element id's `\\N`); an
+    // id of no part that is not is no node's.
+    let element_id = match sql_element_id {
+        // Spelled in SQL (#1528).
+        Some(element_id) => element_id,
+        None => {
+            let id_values: Vec<Option<String>> = id_columns
+                .iter()
+                .map(|col_name| {
+                    let missing =
+                        || format!("Missing ID column '{}' for node '{}'", col_name, var_name);
+                    match properties
+                        .get(*col_name)
+                        .or_else(|| row.get(&format!("{}.{}", var_name, col_name)))
+                    {
+                        Some(Value::Null) if id_columns.len() > 1 => Ok(None),
+                        Some(v) => value_to_string(v).map(Some).ok_or_else(missing),
+                        None => Err(missing()),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if id_values.iter().all(Option::is_none) {
+                return Err(format!("Missing ID columns for node '{}'", var_name));
+            }
+
+            // Generate elementId using Phase 3 function
+            let id_value_refs: Vec<Option<&str>> = id_values.iter().map(|s| s.as_deref()).collect();
+            node_element_id(&label, &id_value_refs)
+        }
+    };
+
+    // Derive integer ID from element_id (ensures uniqueness across labels)
+    let id: i64 = generate_id_from_element_id(&element_id);
+    log::debug!("🔢 Node created: element_id={}, id={}", element_id, id);
+
+    // Create Node struct
+    // Use the resolved label (from per-row __label__ or inference) as the definitive label.
+    // This is more accurate than metadata labels for UNION queries where node types vary per row.
+    // Then the union labels it carries (a Post is also a Message).
+    let unions: Vec<String> = schema
+        .union_labels_of(&label)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let final_labels: Vec<String> = std::iter::once(label).chain(unions).collect();
+
+    Ok(Node {
+        id,
+        labels: final_labels,
+        properties,
+        element_id,
+    })
+}
+
+/// Infer node label from properties by matching against schema
+///
+/// Finds which node schema has the ID column present in the properties.
+/// This is used for unlabeled queries like `MATCH (n) RETURN n`.
+fn infer_node_label_from_properties(
+    properties: &HashMap<String, Value>,
+    schema: &GraphSchema,
+) -> Option<String> {
+    // For each node schema, check if its ID column is present and non-null
+    for (label, node_schema) in schema.all_node_schemas() {
+        let id_columns = node_schema.node_id.id.columns();
+
+        // Check if ANY of the ID columns is present with a non-null value
+        let has_id = id_columns
+            .iter()
+            .any(|col| properties.get(*col).is_some_and(|v| !v.is_null()));
+
+        if has_id {
+            return Some(label.clone());
+        }
+    }
+    None
+}
+
+/// Transform raw result row fields into a Relationship struct
+///
+/// Extracts relationship properties, from/to node IDs, and generates elementIds
+/// for the relationship and connected nodes.
+///
+/// # Arguments
+///
+/// * `row` - Raw result row (column_name → value)
+/// * `var_name` - Relationship variable name (e.g., "r")
+/// * `rel_types` - Relationship types (e.g., ["FOLLOWS"])
+/// * `from_label` - Optional from node label (for polymorphic)
+/// * `to_label` - Optional to node label (for polymorphic)
+/// * `schema` - Graph schema for ID column lookup
+///
+/// # Returns
+///
+/// Relationship struct with properties and generated elementIds
+pub fn transform_to_relationship(
+    row: &HashMap<String, Value>,
+    var_name: &str,
+    rel_types: &[String],
+    from_label: Option<&str>,
+    to_label: Option<&str>,
+    schema: &GraphSchema,
+) -> Result<Relationship, String> {
+    // Extract properties for this relationship variable
+    // Columns like "r.follow_date", "r.weight" → properties
+    let prefix = format!("{}.", var_name);
+    let mut properties = HashMap::new();
+
+    for (key, value) in row.iter() {
+        if let Some(prop_name) = key.strip_prefix(&prefix) {
+            properties.insert(prop_name.to_string(), value.clone());
+        }
+    }
+    // Its element id as the SQL spells it, where the bound plan returns it
+    // (a relationship whose schema declares an `edge_id`): no property's.
+    let sql_element_id = properties
+        .remove(crate::bound_plan::lower::REL_ELEMENT_ID_KEY)
+        .and_then(|v| v.as_str().map(str::to_string));
+
+    // 🔧 FIX: Check for multi-type CTE column pattern
+    // Multi-type CTEs return: r.type, r.properties, r.start_id, r.end_id
+    // where r.type and r.properties are ARRAYS that need unwrapping
+    let has_cte_columns = properties.contains_key("type")
+        && properties.contains_key("properties")
+        && properties.contains_key("start_id")
+        && properties.contains_key("end_id");
+
+    let rel_type = if has_cte_columns {
+        // Multi-type CTE case: extract from arrays
+        log::info!(
+            "🎯 Detected multi-type CTE columns for relationship '{}'",
+            var_name
+        );
+
+        // Extract relationship type from array: ['FOLLOWS'] → "FOLLOWS"
+        let type_value = properties
+            .get("type")
+            .ok_or_else(|| format!("Missing type column for CTE relationship '{}'", var_name))?;
+
+        let rel_type_str = extract_first_from_array(type_value).ok_or_else(|| {
+            format!(
+                "Could not extract relationship type from array: {:?}",
+                type_value
+            )
+        })?;
+
+        // Parse relationship properties from JSON array: ['{"follow_date":"..."}'] → {follow_date: ...}
+        // Save start_id and end_id before parsing
+        let start_id = properties.get("start_id").cloned();
+        let end_id = properties.get("end_id").cloned();
+        // Also preserve schema-natural FK projections (1-hop multi-type VLP).
+        let r_from_id = properties.get("r_from_id").cloned();
+        let r_to_id = properties.get("r_to_id").cloned();
+
+        if let Some(props_value) = properties.get("properties") {
+            if let Some(json_str) = extract_first_from_array(props_value) {
+                // Parse JSON string to get actual properties
+                match serde_json::from_str::<HashMap<String, Value>>(&json_str) {
+                    Ok(parsed_props) => {
+                        log::info!(
+                            "✅ Parsed {} relationship properties from CTE JSON",
+                            parsed_props.len()
+                        );
+                        // Replace properties with parsed ones
+                        properties = parsed_props;
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️ Failed to parse relationship properties JSON: {}", e);
+                        // Clear properties on parse error
+                        properties.clear();
+                    }
+                }
+            }
+        }
+
+        // Add back start_id and end_id (they were not in the JSON properties)
+        if let Some(sid) = start_id {
+            properties.insert("start_id".to_string(), sid);
+        }
+        if let Some(eid) = end_id {
+            properties.insert("end_id".to_string(), eid);
+        }
+        if let Some(v) = r_from_id {
+            properties.insert("r_from_id".to_string(), v);
+        }
+        if let Some(v) = r_to_id {
+            properties.insert("r_to_id".to_string(), v);
+        }
+        rel_type_str
+    } else {
+        // Standard case: relationship type from rel_types parameter
+        rel_types
+            .first()
+            .ok_or_else(|| format!("No relationship type for variable: {}", var_name))?
+            .clone()
+    };
+
+    // Get primary relationship type (already extracted above for CTE case)
+
+    // Get relationship schema: of the definition between the given labels
+    // (a type's definitions have their own id columns).
+    let rel_schema = schema
+        .rel_schemas_for_type(&rel_type)
+        .into_iter()
+        .find(|rs| {
+            Some(rs.from_node.as_str()) == from_label && Some(rs.to_node.as_str()) == to_label
+        })
+        .or_else(|| schema.get_relationships_schema_opt(&rel_type))
+        .ok_or_else(|| format!("Relationship schema not found for type: {}", rel_type))?;
+
+    // Get from/to node labels (use provided or schema defaults)
+    // For polymorphic edges ($any), resolve actual label from row's start_type/end_type
+    let schema_from_label = from_label.unwrap_or(&rel_schema.from_node);
+    let schema_to_label = to_label.unwrap_or(&rel_schema.to_node);
+
+    let resolved_from_label: String;
+    let resolved_to_label: String;
+
+    if schema_from_label == "$any" || schema_to_label == "$any" {
+        // Polymorphic edge: actual node types are in the row's start_type/end_type columns
+        resolved_from_label = if schema_from_label == "$any" {
+            properties
+                .get("start_type")
+                .and_then(value_to_string)
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "Polymorphic relationship missing 'start_type' column; \
+                         falling back to first node type in schema"
+                    );
+                    schema
+                        .all_node_schemas()
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+        } else {
+            schema_from_label.to_string()
+        };
+        resolved_to_label = if schema_to_label == "$any" {
+            properties
+                .get("end_type")
+                .and_then(value_to_string)
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "Polymorphic relationship missing 'end_type' column; \
+                         falling back to first node type in schema"
+                    );
+                    schema
+                        .all_node_schemas()
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+        } else {
+            schema_to_label.to_string()
+        };
+        // Remove start_type/end_type from properties so they don't leak as rel properties
+        properties.remove("start_type");
+        properties.remove("end_type");
+    } else {
+        resolved_from_label = schema_from_label.to_string();
+        resolved_to_label = schema_to_label.to_string();
+    }
+
+    let from_node_label: &str = &resolved_from_label;
+    let to_node_label: &str = &resolved_to_label;
+
+    // Prefer schema-natural FK projections when the SQL gen provided them.
+    // The multi-type VLP CTE projects `r_from_id` / `r_to_id` for 1-hop
+    // queries; these carry the schema's natural from→to direction regardless
+    // of which CTE branch (Outgoing/Incoming) the row came from. When
+    // present, they make element_id construction direction-canonical, which
+    // dedupes same-label directed relationships across expansions from
+    // either endpoint (e.g., FOLLOWS:9->17 from User:9's expand and from
+    // User:17's expand both yield the same element_id).
+    let canonical_from = properties
+        .get("r_from_id")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty());
+    let canonical_to = properties
+        .get("r_to_id")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty());
+    properties.remove("r_from_id");
+    properties.remove("r_to_id");
+
+    // Capture the traversal-direction endpoint ids (start = the bound anchor,
+    // end = the other node) before they are stripped from `properties` below.
+    // These let us re-pair the schema-canonical ids (`canonical_from`/
+    // `canonical_to`) with the correct node label further down — see the
+    // element_id construction near the end of this function.
+    let start_id_val = properties.get("start_id").and_then(value_to_string);
+    let end_id_val = properties.get("end_id").and_then(value_to_string);
+    // Capture the OTHER (end-side, `o`) node's ACTUAL label from its
+    // `<other_alias>.__label__` projection — this is exactly how the returned
+    // end node is labeled, so the relationship's endpoint element_ids must use it.
+    // The multi-type (vlp/pattern_union) outer projection renames end_type →
+    // `o.__label__` and DROPS start_type, so start_type/end_type are not available
+    // as columns; `o.__label__` is the reliable source. The anchor (start-side)
+    // label is derived below as the schema from/to label that isn't the o-side's.
+    let other_label = row.iter().find_map(|(key, value)| {
+        key.strip_suffix(".__label__")
+            .filter(|rest| *rest != var_name)
+            .and_then(|_| value_to_string(value))
+    });
+
+    // Detect when the SQL's `start_id`/`end_id` projection is reversed from the
+    // schema's natural from→to direction. This happens for undirected matches
+    // like `(a)-[r]-(o)` where `a` is bound to the schema's *to-side* (e.g.,
+    // expanding from a Post yields LIKED rows whose SQL projects start_id =
+    // post_id and end_id = user_id, but LIKED's schema is User→Post).
+    //
+    // The other alias's label gets projected as `<alias>.__label__` (e.g.,
+    // `o.__label__`). If that label matches the schema's from_label (and the
+    // schema's from/to labels differ), then the *o-side* is the schema's
+    // from-side and the projection is reversed: we must source from_id values
+    // from end_id and to_id values from start_id. Otherwise the constructed
+    // node element_ids pair the wrong labels with the wrong ids (e.g.,
+    // producing "User:1" where 1 is actually a post_id).
+    let projection_reversed = if resolved_from_label != resolved_to_label {
+        row.iter().any(|(key, value)| {
+            // Match any `<other_alias>.__label__` column where alias is not us.
+            if let Some(rest) = key.strip_suffix(".__label__") {
+                if rest != var_name {
+                    let label = value_to_string(value);
+                    return label.as_deref() == Some(&resolved_from_label[..]);
+                }
+            }
+            false
+        })
+    } else {
+        false
+    };
+    // start_type/end_type may have been left in properties by the non-polymorphic
+    // branch above; clean them up so they don't leak as relationship properties.
+    properties.remove("start_type");
+    properties.remove("end_type");
+
+    let (from_fallback_a, from_fallback_b) = if projection_reversed {
+        ("end_id", REL_TO_ID_KEY)
+    } else {
+        ("start_id", REL_FROM_ID_KEY)
+    };
+    let (to_fallback_a, to_fallback_b) = if projection_reversed {
+        ("start_id", REL_FROM_ID_KEY)
+    } else {
+        ("end_id", REL_TO_ID_KEY)
+    };
+    let from_composite_prefix = if projection_reversed {
+        REL_TO_ID_KEY.to_string() + "_"
+    } else {
+        REL_FROM_ID_KEY.to_string() + "_"
+    };
+    let to_composite_prefix = if projection_reversed {
+        REL_FROM_ID_KEY.to_string() + "_"
+    } else {
+        REL_TO_ID_KEY.to_string() + "_"
+    };
+
+    // Extract from_id values using relationship's FK columns (e.g., follower_id, followed_id)
+    let from_rel_id_columns = rel_schema.from_id.columns();
+    // An end's id as its node's element id spells it (`node_id_text`).
+    let from_id_str: String = if let Some(ref s) = canonical_from {
+        // Schema-natural projection wins: the id's text as it is.
+        s.clone()
+    } else {
+        from_rel_id_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col_name)| {
+                // First try: FK column from relationship schema (e.g., follower_id)
+                properties
+                    .get(*col_name)
+                    // Second try: generic CTE column names (direction-aware)
+                    .or_else(|| properties.get(from_fallback_a))
+                    .or_else(|| properties.get(from_fallback_b))
+                    // Third try: composite variants
+                    .or_else(|| properties.get(&format!("{}{}", from_composite_prefix, i + 1)))
+                    .and_then(value_to_string)
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing from_id column '{}' for relationship '{}'",
+                            col_name, var_name
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| {
+                let parts: Vec<Option<&str>> = values.iter().map(|v| Some(v.as_str())).collect();
+                node_id_text(&parts)
+            })?
+    };
+
+    // Extract to_id values using relationship's FK columns
+    let to_rel_id_columns = rel_schema.to_id.columns();
+    let to_id_str: String = if let Some(ref s) = canonical_to {
+        s.clone()
+    } else {
+        to_rel_id_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col_name)| {
+                // First try: FK column from relationship schema (e.g., followed_id)
+                properties
+                    .get(*col_name)
+                    // Second try: generic CTE column names (direction-aware)
+                    .or_else(|| properties.get(to_fallback_a))
+                    .or_else(|| properties.get(to_fallback_b))
+                    // Third try: composite variants
+                    .or_else(|| properties.get(&format!("{}{}", to_composite_prefix, i + 1)))
+                    .and_then(value_to_string)
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing to_id column '{}' for relationship '{}'",
+                            col_name, var_name
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| {
+                let parts: Vec<Option<&str>> = values.iter().map(|v| Some(v.as_str())).collect();
+                node_id_text(&parts)
+            })?
+    };
+
+    // Remove internal ID keys from properties (they're FK columns, not user properties)
+    properties.remove(REL_FROM_ID_KEY);
+    properties.remove(REL_TO_ID_KEY);
+    properties.remove("start_id");
+    properties.remove("end_id");
+    // Remove relationship FK columns and composite variants
+    for col in &from_rel_id_columns {
+        properties.remove(*col);
+    }
+    for col in &to_rel_id_columns {
+        properties.remove(*col);
+    }
+    // Remove any composite ID variants (from_id_1, from_id_2, to_id_1, to_id_2, ...)
+    let composite_id_keys: Vec<String> = properties
+        .keys()
+        .filter(|k| {
+            k.starts_with(&format!("{}_", REL_FROM_ID_KEY))
+                || k.starts_with(&format!("{}_", REL_TO_ID_KEY))
+        })
+        .cloned()
+        .collect();
+    for key in composite_id_keys {
+        properties.remove(&key);
+    }
+
+    // Generate relationship elementId: "FOLLOWS:1->2" or "BELONGS_TO:tenant1|user1->tenant1|org1";
+    // the SQL's where it spells it (a relationship with an `edge_id`, #1334).
+    let element_id = sql_element_id
+        .unwrap_or_else(|| generate_relationship_element_id(&rel_type, &from_id_str, &to_id_str));
+
+    // Re-pair endpoint labels with the schema-canonical ids.
+    //
+    // For a polymorphic multi-type 1-hop expand the CTE projects the node
+    // *labels* (`start_type`/`end_type` → `resolved_from_label`/
+    // `resolved_to_label`) in *traversal* order (start = the bound anchor `a`)
+    // but projects `r_from_id`/`r_to_id` (→ `canonical_from`/`canonical_to`) in
+    // the schema's from→to order. For an undirected `(a)-[r]-(o)` match that
+    // binds the anchor to the schema *to-side* (e.g. a Post→User branch where
+    // `a` is the User), these two orders disagree: pairing
+    // `resolved_from_label` with `canonical_from` mislabels the endpoint (the
+    // anchor's label gets the *other* node's id, e.g. "User:<post_id>"), so the
+    // relationship's endpoint element_ids no longer equal the returned nodes'
+    // element_ids and Neo4j Browser cannot attach the relationship to its nodes.
+    //
+    // Re-pair each canonical id with the label of the physical node
+    // (start-side or end-side) that actually carries that id. Only applies when
+    // both schema-canonical ids are present (multi-type 1-hop); otherwise fall
+    // back to the traversal-order labels unchanged (the fixed-schema and
+    // reversal-detection paths already agree in that case).
+    let (from_node_label, to_node_label): (String, String) =
+        if canonical_from.is_some() && canonical_to.is_some() {
+            // Pick the label of the node that actually carries each schema-canonical
+            // id, so the relationship's endpoint element_ids equal the returned
+            // nodes' element_ids (else Neo4j Browser can't attach the rel → crash).
+            //   * The end-side (`o`) node's REAL label is `o.__label__` (captured as
+            //     `other_label`) — the multi-type outer projection renames end_type
+            //     to `o.__label__` and drops start_type, so the schema from/to labels
+            //     are NOT a reliable substitute (they coincide only for polymorphic
+            //     edges; for a concrete edge whose anchor sits on the schema to-side,
+            //     e.g. expanding a Domain over REQUESTED (IP→Domain), they diverge).
+            //   * The start-side (anchor `a`) label is the schema from/to label that
+            //     isn't the o-side's.
+            let o_label = other_label.clone();
+            let anchor_label = match o_label.as_deref() {
+                Some(ol) if ol == resolved_from_label => resolved_to_label.clone(),
+                Some(ol) if ol == resolved_to_label => resolved_from_label.clone(),
+                // o's label matches neither (or labels equal, e.g. User↔User) —
+                // the from-side schema label is the safe choice.
+                _ => resolved_from_label.clone(),
+            };
+            let label_for = |canon: &str| -> String {
+                let matches_start = start_id_val.as_deref() == Some(canon);
+                let matches_end = end_id_val.as_deref() == Some(canon);
+                if matches_end && !matches_start {
+                    // end-side (`o`) node — use its actual projected label.
+                    o_label.clone().unwrap_or_else(|| resolved_to_label.clone())
+                } else {
+                    // start-side (anchor `a`), or self-loop (start_id == end_id).
+                    anchor_label.clone()
+                }
+            };
+            (
+                label_for(canonical_from.as_deref().unwrap_or("")),
+                label_for(canonical_to.as_deref().unwrap_or("")),
+            )
+        } else {
+            (from_node_label.to_string(), to_node_label.to_string())
+        };
+
+    // The start and end nodes' element ids, of their ids' texts.
+    let start_node_element_id = node_element_id_of_text(&from_node_label, &from_id_str);
+    let end_node_element_id = node_element_id_of_text(&to_node_label, &to_id_str);
+
+    // Derive integer IDs from element_ids (ensures uniqueness across labels)
+    let rel_id = generate_id_from_element_id(&element_id);
+    let start_node_id = generate_id_from_element_id(&start_node_element_id);
+    let end_node_id = generate_id_from_element_id(&end_node_element_id);
+
+    log::info!(
+        "🔗 Bolt Relationship BEFORE: var_name={}, rel_type={}, from_label={}, to_label={}, from_id_str={}, to_id_str={}",
+        var_name,
+        rel_type,
+        from_node_label,
+        to_node_label,
+        from_id_str,
+        to_id_str
+    );
+
+    log::debug!(
+        "🔗 Bolt Relationship DEBUG: type={}, from_label={}, to_label={}, from_id_str={}, to_id_str={}, from_node_element_id={}, to_node_element_id={}",
+        rel_type,
+        from_node_label,
+        to_node_label,
+        from_id_str,
+        to_id_str,
+        start_node_element_id,
+        end_node_element_id
+    );
+
+    log::debug!(
+        "🔗 Bolt Relationship: type={}, start={}({}) end={}({}), element_id={}",
+        rel_type,
+        start_node_element_id,
+        start_node_id,
+        end_node_element_id,
+        end_node_id,
+        element_id
+    );
+
+    // Create Relationship struct
+    Ok(Relationship {
+        id: rel_id,
+        start_node_id,
+        end_node_id,
+        rel_type: rel_type.to_string(),
+        properties,
+        element_id,
+        start_node_element_id,
+        end_node_element_id,
+    })
+}
+
+/// Transform fixed-hop path data to Neo4j Path structure
+///
+/// For a path p = (a)-[r]->(b), this function:
+/// 1. Uses known labels/types from query planning metadata
+/// 2. Tries to find actual data in the row, falls back to metadata-based nodes
+/// 3. Constructs a Path with proper structure for Neo4j visualization
+///
+/// # Arguments
+///
+/// * `row` - The result row from ClickHouse
+/// * `path_name` - The path variable name (e.g., "p")
+/// * `start_alias` - Alias of the start node
+/// * `end_alias` - Alias of the end node
+/// * `rel_alias` - Alias of the relationship
+/// * `start_labels` - Known labels for start node from query planning
+/// * `end_labels` - Known labels for end node from query planning
+/// * `rel_types` - Known relationship types from query planning
+/// * `schema` - Graph schema for type information
+/// * `return_metadata` - Metadata for all return items (to find component info)
+///
+/// # Returns
+///
+/// Path struct with nodes, relationships, and indices
+#[allow(clippy::too_many_arguments)]
+fn transform_to_path(
+    row: &HashMap<String, Value>,
+    path_name: &str,
+    start_alias: Option<&str>,
+    end_alias: Option<&str>,
+    rel_alias: Option<&str>,
+    start_labels: &[String],
+    end_labels: &[String],
+    rel_types: &[String],
+    schema: &GraphSchema,
+    return_metadata: &[ReturnItemMetadata],
+) -> Result<Path, String> {
+    let start_alias = start_alias.unwrap_or("_start");
+    let end_alias = end_alias.unwrap_or("_end");
+    let rel_alias = rel_alias.unwrap_or("_rel");
+
+    log::debug!(
+        "transform_to_path: path={}, start={}({:?}), end={}({:?}), rel={}({:?})",
+        path_name,
+        start_alias,
+        start_labels,
+        end_alias,
+        end_labels,
+        rel_alias,
+        rel_types
+    );
+
+    // Check for JSON format first (UNION path queries)
+    // Format: _start_properties, _end_properties, _rel_properties, __rel_type__, __start_label__, __end_label__
+    if row.contains_key("_start_properties") && row.contains_key("_end_properties") {
+        log::trace!("🎯 Detected JSON format for path - using explicit type/label columns");
+        return transform_path_from_json(row, schema);
+    }
+
+    // For polymorphic UNION path queries, use __start_label__ and __end_label__ columns
+    let effective_start_labels = if start_labels.is_empty() {
+        if let Some(label_val) = row.get("__start_label__").and_then(value_to_string) {
+            if label_val != "Unknown" {
+                log::debug!("Using __start_label__ column: {}", label_val);
+                vec![label_val]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    } else {
+        start_labels.to_vec()
+    };
+
+    let effective_end_labels = if end_labels.is_empty() {
+        if let Some(label_val) = row.get("__end_label__").and_then(value_to_string) {
+            if label_val != "Unknown" {
+                log::debug!("Using __end_label__ column: {}", label_val);
+                vec![label_val]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    } else {
+        end_labels.to_vec()
+    };
+
+    // If labels are still empty, infer from relationship schema
+    let effective_start_labels = if effective_start_labels.is_empty() && !rel_types.is_empty() {
+        if let Some(rel_schema) = schema.get_relationships_schema_opt(&rel_types[0]) {
+            if rel_schema.from_node != "$any" {
+                log::debug!(
+                    "Inferred start label '{}' from rel schema '{}'",
+                    rel_schema.from_node,
+                    rel_types[0]
+                );
+                vec![rel_schema.from_node.clone()]
+            } else {
+                effective_start_labels
+            }
+        } else {
+            effective_start_labels
+        }
+    } else {
+        effective_start_labels
+    };
+
+    let effective_end_labels = if effective_end_labels.is_empty() && !rel_types.is_empty() {
+        if let Some(rel_schema) = schema.get_relationships_schema_opt(&rel_types[0]) {
+            if rel_schema.to_node != "$any" {
+                log::debug!(
+                    "Inferred end label '{}' from rel schema '{}'",
+                    rel_schema.to_node,
+                    rel_types[0]
+                );
+                vec![rel_schema.to_node.clone()]
+            } else {
+                effective_end_labels
+            }
+        } else {
+            effective_end_labels
+        }
+    } else {
+        effective_end_labels
+    };
+
+    // Original format: individual columns for each property
+    // Extract start node - require either metadata lookup success or known labels
+    let start_node = find_node_in_row_with_label(
+        row,
+        start_alias,
+        &effective_start_labels,
+        return_metadata,
+        schema,
+    )
+    .or_else(|| {
+        // If we have a known label, create node with that label
+        effective_start_labels.first().map(|label| {
+            log::debug!("Creating start node with known label: {}", label);
+            create_node_with_label(label, 0)
+        })
+    })
+    .ok_or_else(|| {
+        format!(
+            "Internal error: Cannot resolve start node '{}' for path '{}'. \
+                     No label metadata available and node not found in row. \
+                     start_labels={:?}, row_keys={:?}",
+            start_alias,
+            path_name,
+            effective_start_labels,
+            row.keys().collect::<Vec<_>>()
+        )
+    })?;
+
+    // Extract end node - require either metadata lookup success or known labels
+    let end_node = find_node_in_row_with_label(
+        row,
+        end_alias,
+        &effective_end_labels,
+        return_metadata,
+        schema,
+    )
+    .or_else(|| {
+        // If we have a known label, create node with that label
+        effective_end_labels.first().map(|label| {
+            log::debug!("Creating end node with known label: {}", label);
+            create_node_with_label(label, 1)
+        })
+    })
+    .ok_or_else(|| {
+        format!(
+            "Internal error: Cannot resolve end node '{}' for path '{}'. \
+                     No label metadata available and node not found in row. \
+                     end_labels={:?}, row_keys={:?}",
+            end_alias,
+            path_name,
+            effective_end_labels,
+            row.keys().collect::<Vec<_>>()
+        )
+    })?;
+
+    // Determine correct node order for the relationship based on schema direction
+    // The relationship should ALWAYS follow schema direction (from -> to), regardless of query order
+    let (from_node, to_node, needs_swap) = {
+        // Check if there's a schema relationship from start_labels -> end_labels
+        let forward_match = rel_types.iter().any(|rel_type| {
+            if let Some(rel_schema) = schema.get_relationships_schema_opt(rel_type) {
+                (rel_schema.from_node == "$any" || start_labels.contains(&rel_schema.from_node))
+                    && (rel_schema.to_node == "$any" || end_labels.contains(&rel_schema.to_node))
+            } else {
+                false
+            }
+        });
+
+        if forward_match {
+            // Query order matches schema direction
+            (start_node.clone(), end_node.clone(), false)
+        } else {
+            // Try reverse direction
+            let reverse_match = rel_types.iter().any(|rel_type| {
+                if let Some(rel_schema) = schema.get_relationships_schema_opt(rel_type) {
+                    (rel_schema.from_node == "$any" || end_labels.contains(&rel_schema.from_node))
+                        && (rel_schema.to_node == "$any"
+                            || start_labels.contains(&rel_schema.to_node))
+                } else {
+                    false
+                }
+            });
+
+            if reverse_match {
+                // Need to swap nodes to match schema direction
+                log::debug!(
+                    "Swapping nodes for path: schema expects {:?}->{:?}, but query gave {:?}->{:?}",
+                    end_labels,
+                    start_labels,
+                    start_labels,
+                    end_labels
+                );
+                (end_node.clone(), start_node.clone(), true)
+            } else {
+                // Can't determine - use query order (fallback)
+                (start_node.clone(), end_node.clone(), false)
+            }
+        }
+    };
+
+    // Extract relationship with schema-order nodes
+    let relationship = find_relationship_in_row_with_type(
+        row,
+        rel_alias,
+        &from_node.element_id,
+        &to_node.element_id,
+        rel_types,
+        &from_node.labels,
+        &to_node.labels,
+        return_metadata,
+        schema,
+    )
+    .or_else(|| {
+        // If we have a known type, create relationship with that type
+        rel_types.first().map(|rel_type| {
+            log::debug!("Creating relationship with known type: {}", rel_type);
+            create_relationship_with_type(rel_type, &from_node.element_id, &to_node.element_id)
+        })
+    })
+    .ok_or_else(|| {
+        format!(
+            "Internal error: Cannot resolve relationship '{}' for path '{}'. \
+             No type metadata available and relationship not found in row. \
+             rel_types={:?}, row_keys={:?}",
+            rel_alias,
+            path_name,
+            rel_types,
+            row.keys().collect::<Vec<_>>()
+        )
+    })?;
+
+    log::info!(
+        "Path created: start_node.labels={:?}, end_node.labels={:?}, rel.type={}, node_swap={}",
+        from_node.labels,
+        to_node.labels,
+        relationship.rel_type,
+        needs_swap
+    );
+
+    // Create Path with single-hop structure
+    // Indices for single hop: [1, 1] means "relationship index 1, then node index 1"
+    // (Neo4j uses 1-based indexing in path indices)
+    Ok(Path::single_hop(from_node, relationship, to_node))
+}
+
+/// Transform path from JSON format (UNION path queries)
+/// Parses _start_properties, _end_properties, _rel_properties JSON strings
+/// Used for UNION path queries where each row has explicit type columns:
+/// __start_label__, __end_label__, __rel_type__
+fn transform_path_from_json(
+    row: &HashMap<String, Value>,
+    schema: &GraphSchema,
+) -> Result<Path, String> {
+    // Parse start node properties from JSON
+    let start_props: HashMap<String, Value> = match row.get("_start_properties") {
+        Some(Value::String(json_str)) => {
+            serde_json::from_str(json_str).unwrap_or_else(|_| HashMap::new())
+        }
+        _ => HashMap::new(),
+    };
+
+    // Parse end node properties from JSON
+    let end_props: HashMap<String, Value> = match row.get("_end_properties") {
+        Some(Value::String(json_str)) => {
+            serde_json::from_str(json_str).unwrap_or_else(|_| HashMap::new())
+        }
+        _ => HashMap::new(),
+    };
+
+    // Parse relationship properties from JSON
+    let rel_props: HashMap<String, Value> = match row.get("_rel_properties") {
+        Some(Value::String(json_str)) => {
+            if json_str == "{}" {
+                HashMap::new() // Empty for denormalized relationships
+            } else {
+                serde_json::from_str(json_str).unwrap_or_else(|_| HashMap::new())
+            }
+        }
+        _ => HashMap::new(),
+    };
+
+    log::info!(
+        "📦 Parsed JSON: start_props keys={:?}, end_props keys={:?}, rel_props keys={:?}",
+        start_props.keys().collect::<Vec<_>>(),
+        end_props.keys().collect::<Vec<_>>(),
+        rel_props.keys().collect::<Vec<_>>()
+    );
+
+    // Get explicit node labels from __start_label__ and __end_label__ columns (required for JSON format)
+    let start_label = match row.get("__start_label__") {
+        Some(Value::String(explicit_label)) if !explicit_label.is_empty() => explicit_label.clone(),
+        _ => {
+            return Err(
+                "Missing __start_label__ column in path JSON format - this is a bug".to_string(),
+            );
+        }
+    };
+    let end_label = match row.get("__end_label__") {
+        Some(Value::String(explicit_label)) if !explicit_label.is_empty() => explicit_label.clone(),
+        _ => {
+            return Err(
+                "Missing __end_label__ column in path JSON format - this is a bug".to_string(),
+            );
+        }
+    };
+
+    // Get relationship type from explicit __rel_type__ column (required for JSON format)
+    // JSON format is only used for UNION path queries, and we always add __rel_type__ there
+    let rel_type = match row.get("__rel_type__") {
+        Some(Value::String(explicit_type)) if !explicit_type.is_empty() => explicit_type.clone(),
+        _ => {
+            return Err(
+                "Missing __rel_type__ column in path JSON format - this is a bug".to_string(),
+            );
+        }
+    };
+
+    // Create start node - element_id is source of truth, integer id derived from it
+    let start_id_str = extract_id_string_from_props(&start_props, Some(schema), Some(&start_label));
+    let start_element_id = generate_node_element_id(&start_label, &[&start_id_str]);
+    let start_id = generate_id_from_element_id(&start_element_id);
+    // Clean property keys (remove table alias prefix like "t1_0.")
+    let start_props_clean = clean_property_keys(start_props);
+    let start_node = Node::new(
+        start_id,
+        vec![start_label.clone()],
+        start_props_clean,
+        start_element_id.clone(),
+    );
+
+    // Create end node - element_id is source of truth, integer id derived from it
+    let end_id_str = extract_id_string_from_props(&end_props, Some(schema), Some(&end_label));
+    let end_element_id = generate_node_element_id(&end_label, &[&end_id_str]);
+    let end_id = generate_id_from_element_id(&end_element_id);
+    // Clean property keys
+    let end_props_clean = clean_property_keys(end_props);
+    let end_node = Node::new(
+        end_id,
+        vec![end_label.clone()],
+        end_props_clean,
+        end_element_id.clone(),
+    );
+
+    // Determine correct node order based on schema direction
+    // The relationship should ALWAYS follow schema direction (from -> to), regardless of query order
+    let (from_node, to_node, from_id_str, to_id_str) =
+        {
+            // Check if there's a schema relationship from start_label -> end_label
+            let forward_match =
+                if let Some(rel_schema) = schema.get_relationships_schema_opt(&rel_type) {
+                    (rel_schema.from_node == "$any" || rel_schema.from_node == start_label)
+                        && (rel_schema.to_node == "$any" || rel_schema.to_node == end_label)
+                } else {
+                    false
+                };
+
+            if forward_match {
+                // Query order matches schema direction
+                (
+                    start_node.clone(),
+                    end_node.clone(),
+                    start_id_str.clone(),
+                    end_id_str.clone(),
+                )
+            } else {
+                // Try reverse direction
+                let reverse_match =
+                    if let Some(rel_schema) = schema.get_relationships_schema_opt(&rel_type) {
+                        (rel_schema.from_node == "$any" || rel_schema.from_node == end_label)
+                            && (rel_schema.to_node == "$any" || rel_schema.to_node == start_label)
+                    } else {
+                        false
+                    };
+
+                if reverse_match {
+                    // Need to swap nodes to match schema direction
+                    log::debug!(
+                    "Swapping nodes for path: schema expects {:?}->{:?}, but query gave {:?}->{:?}",
+                    end_label, start_label,
+                    start_label, end_label
+                );
+                    (
+                        end_node.clone(),
+                        start_node.clone(),
+                        end_id_str.clone(),
+                        start_id_str.clone(),
+                    )
+                } else {
+                    // Can't determine - use query order (fallback)
+                    (
+                        start_node.clone(),
+                        end_node.clone(),
+                        start_id_str.clone(),
+                        end_id_str.clone(),
+                    )
+                }
+            }
+        };
+
+    // Create relationship with schema-order nodes
+    let rel_element_id = generate_relationship_element_id(&rel_type, &from_id_str, &to_id_str);
+    let rel_id = generate_id_from_element_id(&rel_element_id);
+    let rel_props_clean = clean_property_keys(rel_props);
+    let relationship = Relationship::new(
+        rel_id,
+        from_node.id, // from_node_id - derived from from_element_id
+        to_node.id,   // to_node_id - derived from to_element_id
+        rel_type.clone(),
+        rel_props_clean,
+        rel_element_id,
+        from_node.element_id.clone(),
+        to_node.element_id.clone(),
+    );
+
+    log::info!(
+        "✅ Path from JSON: from={} ({}), to={} ({}), rel={}",
+        from_node.labels[0],
+        from_node.id,
+        to_node.labels[0],
+        to_node.id,
+        relationship.rel_type
+    );
+
+    Ok(Path::single_hop(from_node, relationship, to_node))
+}
+
+/// Transform a VLP path from its tuple representation.
+///
+/// Dispatches on the tuple's field count because the shape depends on
+/// which VLP CTE strategy produced it (#486):
+///   - Standard (single-type) VLP CTE: 3 fields —
+///     `tuple(path_nodes, path_relationships, hop_count)` (see
+///     `select_builder.rs::expand_path_variable`, #469). No per-node/
+///     per-relationship property data is carried in this shape.
+///   - Multi-type VLP CTE: 9 fields (see `transform_vlp_path_multi_type`).
+///
+/// `transform_vlp_path` previously hardcoded the 9-field expectation for
+/// every VLP path, so `RETURN p` on a standard single-type VLP (the common
+/// case) failed with a graceful "expected 9 tuple fields, got 3" error
+/// instead of returning a Path.
+fn transform_vlp_path(
+    row: &HashMap<String, Value>,
+    path_field: &str,
+    schema: &GraphSchema,
+    start_labels: &[String],
+    end_labels: &[String],
+    rel_types: &[String],
+) -> Result<Path, String> {
+    // The tuple is returned as a JSON array
+    let tuple_val = row.get(path_field).ok_or_else(|| {
+        format!(
+            "VLP path column '{}' not found in row. Available: {:?}",
+            path_field,
+            row.keys().collect::<Vec<_>>()
+        )
+    })?;
+
+    let fields = match tuple_val {
+        Value::Array(arr) => arr,
+        other => {
+            return Err(format!(
+                "VLP path '{}': expected Array tuple, got {:?}",
+                path_field, other
+            ));
+        }
+    };
+
+    match fields.len() {
+        3 => transform_vlp_path_standard(fields, path_field, start_labels, end_labels, rel_types),
+        n if n >= 9 => transform_vlp_path_multi_type(fields, path_field, schema),
+        n => Err(format!(
+            "VLP path '{}': expected 3 (standard VLP) or 9 (multi-type VLP) tuple fields, got {}",
+            path_field, n
+        )),
+    }
+}
+
+/// Transform a standard (single-type) VLP path from its 3-field tuple:
+/// `tuple(path_nodes, path_relationships, hop_count)` (#469, #486).
+///
+/// This tuple shape carries only node id values and relationship type
+/// strings — no property data — so the resulting Path's nodes/relationship
+/// are built with correct ids/labels/types but EMPTY properties. Labels come
+/// from static query metadata (`start_labels`/`end_labels`/`rel_types`),
+/// which is safe because a standard (non-multi-type) VLP is homogeneous by
+/// construction: transitivity requires FROM/TO node-type overlap across the
+/// whole chain (see `vlp_transitivity_check.rs`).
+///
+/// Only the overall start/end nodes are materialized (`path_nodes[0]` and
+/// `path_nodes[last]`) — intermediate nodes for `hop_count > 1` are not yet
+/// serialized to Bolt Path objects, mirroring the pre-existing multi-hop
+/// truncation behavior in `transform_vlp_path_multi_type` below.
+fn transform_vlp_path_standard(
+    fields: &[Value],
+    path_field: &str,
+    start_labels: &[String],
+    end_labels: &[String],
+    rel_types: &[String],
+) -> Result<Path, String> {
+    let path_nodes = match &fields[0] {
+        Value::Array(arr) => arr,
+        other => {
+            return Err(format!(
+                "VLP path '{}': expected path_nodes array, got {:?}",
+                path_field, other
+            ));
+        }
+    };
+    let path_rel_types = match &fields[1] {
+        Value::Array(arr) => arr,
+        other => {
+            return Err(format!(
+                "VLP path '{}': expected path_relationships array, got {:?}",
+                path_field, other
+            ));
+        }
+    };
+    let hop_count = fields[2]
+        .as_i64()
+        .or_else(|| fields[2].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(1);
+
+    if path_nodes.len() < 2 {
+        return Err(format!(
+            "VLP path '{}': path_nodes has {} element(s), expected at least 2 (start + end)",
+            path_field,
+            path_nodes.len()
+        ));
+    }
+
+    if hop_count > 1 {
+        log::warn!(
+            "VLP path '{}' with hop_count={} truncated to single hop (start->end) for Bolt serialization",
+            path_field,
+            hop_count
+        );
+    }
+
+    let start_id_str = value_to_id_string(&path_nodes[0]);
+    let end_id_str = value_to_id_string(
+        path_nodes
+            .last()
+            .expect("a path node list has at least the first node"),
+    );
+
+    let start_label = start_labels
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    let end_label = end_labels
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    let rel_type = path_rel_types
+        .first()
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| rel_types.first().cloned())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+
+    let start_element_id = generate_node_element_id(&start_label, &[&start_id_str]);
+    let start_id = generate_id_from_element_id(&start_element_id);
+    let start_node = Node::new(
+        start_id,
+        vec![start_label],
+        HashMap::new(),
+        start_element_id.clone(),
+    );
+
+    let end_element_id = generate_node_element_id(&end_label, &[&end_id_str]);
+    let end_id = generate_id_from_element_id(&end_element_id);
+    let end_node = Node::new(
+        end_id,
+        vec![end_label],
+        HashMap::new(),
+        end_element_id.clone(),
+    );
+
+    let rel_element_id = generate_relationship_element_id(&rel_type, &start_id_str, &end_id_str);
+    let rel_id = generate_id_from_element_id(&rel_element_id);
+    let relationship = Relationship::new(
+        rel_id,
+        start_node.id,
+        end_node.id,
+        rel_type,
+        HashMap::new(),
+        rel_element_id,
+        start_node.element_id.clone(),
+        end_node.element_id.clone(),
+    );
+
+    Ok(Path::single_hop(start_node, relationship, end_node))
+}
+
+/// Transform a VLP multi-type path from its tuple representation.
+///
+/// The VLP CTE returns a tuple column with these fields (in order):
+/// [0] start_properties (JSON string)
+/// [1] end_properties (JSON string)
+/// [2] rel_properties (array of JSON strings, one per hop)
+/// [3] path_relationships (array of rel type strings, e.g., ["FOLLOWS"])
+/// [4] start_id (string)
+/// [5] end_id (string)
+/// [6] hop_count (integer)
+/// [7] start_type (string, e.g., "User")
+/// [8] end_type (string, e.g., "Post")
+fn transform_vlp_path_multi_type(
+    fields: &[Value],
+    _path_field: &str,
+    _schema: &GraphSchema,
+) -> Result<Path, String> {
+    // Extract fields from the tuple
+    let start_props_json = fields[0].as_str().unwrap_or("{}");
+    let end_props_json = fields[1].as_str().unwrap_or("{}");
+
+    // rel_properties is an array of JSON strings (one per hop)
+    let rel_props_json = match &fields[2] {
+        Value::Array(arr) => arr.first().and_then(|v| v.as_str()).unwrap_or("{}"),
+        Value::String(s) => s.as_str(),
+        _ => "{}",
+    };
+
+    // path_relationships is an array of relationship type strings
+    let rel_type = match &fields[3] {
+        Value::Array(arr) => arr
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN")
+            .to_string(),
+        Value::String(s) => s.clone(),
+        _ => "UNKNOWN".to_string(),
+    };
+
+    let start_id_str = value_to_id_string(&fields[4]);
+    let end_id_str = value_to_id_string(&fields[5]);
+    let hop_count = fields[6]
+        .as_i64()
+        .or_else(|| fields[6].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(1);
+    let start_type = fields[7].as_str().unwrap_or("Unknown").to_string();
+    let end_type = fields[8].as_str().unwrap_or("Unknown").to_string();
+
+    log::debug!(
+        "VLP path: {}:{} -[{}]-> {}:{}",
+        start_type,
+        start_id_str,
+        rel_type,
+        end_type,
+        end_id_str
+    );
+
+    // Parse property JSON blobs
+    let start_props: HashMap<String, Value> =
+        serde_json::from_str(start_props_json).unwrap_or_default();
+    let end_props: HashMap<String, Value> =
+        serde_json::from_str(end_props_json).unwrap_or_default();
+    let rel_props: HashMap<String, Value> =
+        serde_json::from_str(rel_props_json).unwrap_or_default();
+
+    // Build start node
+    let start_element_id = generate_node_element_id(&start_type, &[&start_id_str]);
+    let start_id = generate_id_from_element_id(&start_element_id);
+    let start_node = Node::new(
+        start_id,
+        vec![start_type.clone()],
+        clean_property_keys(start_props),
+        start_element_id.clone(),
+    );
+
+    // Build end node
+    let end_element_id = generate_node_element_id(&end_type, &[&end_id_str]);
+    let end_id = generate_id_from_element_id(&end_element_id);
+    let end_node = Node::new(
+        end_id,
+        vec![end_type.clone()],
+        clean_property_keys(end_props),
+        end_element_id.clone(),
+    );
+
+    // Determine correct node order based on schema direction
+    // The relationship should ALWAYS follow schema direction (from -> to), regardless of query order
+    let (from_node, to_node, from_id_str, to_id_str) =
+        {
+            // Check if there's a schema relationship from start_type -> end_type
+            let forward_match =
+                if let Some(rel_schema) = _schema.get_relationships_schema_opt(&rel_type) {
+                    (rel_schema.from_node == "$any" || rel_schema.from_node == start_type)
+                        && (rel_schema.to_node == "$any" || rel_schema.to_node == end_type)
+                } else {
+                    false
+                };
+
+            if forward_match {
+                // Query order matches schema direction
+                (
+                    start_node.clone(),
+                    end_node.clone(),
+                    start_id_str.clone(),
+                    end_id_str.clone(),
+                )
+            } else {
+                // Try reverse direction
+                let reverse_match =
+                    if let Some(rel_schema) = _schema.get_relationships_schema_opt(&rel_type) {
+                        (rel_schema.from_node == "$any" || rel_schema.from_node == end_type)
+                            && (rel_schema.to_node == "$any" || rel_schema.to_node == start_type)
+                    } else {
+                        false
+                    };
+
+                if reverse_match {
+                    // Need to swap nodes to match schema direction
+                    log::debug!(
+                    "Swapping VLP path nodes: schema expects {:?}->{:?}, but query gave {:?}->{:?}",
+                    end_type, start_type,
+                    start_type, end_type
+                );
+                    (
+                        end_node.clone(),
+                        start_node.clone(),
+                        end_id_str.clone(),
+                        start_id_str.clone(),
+                    )
+                } else {
+                    // Can't determine - use query order (fallback)
+                    (
+                        start_node.clone(),
+                        end_node.clone(),
+                        start_id_str.clone(),
+                        end_id_str.clone(),
+                    )
+                }
+            }
+        };
+
+    // Build relationship with schema-order nodes
+    let rel_element_id = generate_relationship_element_id(&rel_type, &from_id_str, &to_id_str);
+    let rel_id = generate_id_from_element_id(&rel_element_id);
+    let relationship = Relationship::new(
+        rel_id,
+        from_node.id,
+        to_node.id,
+        rel_type,
+        clean_property_keys(rel_props),
+        rel_element_id,
+        from_node.element_id.clone(),
+        to_node.element_id.clone(),
+    );
+
+    log::debug!(
+        "VLP Path: from={} (id={}), to={} (id={}), rel={}",
+        from_node.labels[0],
+        from_node.id,
+        to_node.labels[0],
+        to_node.id,
+        relationship.rel_type
+    );
+
+    // Currently only single-hop VLP paths are serialized to Bolt Path objects.
+    // Multi-hop paths (hop_count > 1) would need to construct full Path with
+    // all intermediate nodes — not yet implemented for browser expand queries
+    // which only use *1 (implicit single-hop) patterns.
+    if hop_count > 1 {
+        log::warn!(
+            "VLP path with hop_count={} truncated to single hop for Bolt serialization",
+            hop_count
+        );
+    }
+
+    Ok(Path::single_hop(from_node, relationship, to_node))
+}
+
+/// Clean property keys by removing:
+/// 1. Table alias prefixes (e.g., "t1_0.city" -> "city")  
+/// 2. JSON uniqueness prefixes (e.g., "_s_city" -> "city", "_e_name" -> "name", "_r_from_id" -> "from_id")
+fn clean_property_keys(props: HashMap<String, Value>) -> HashMap<String, Value> {
+    props
+        .into_iter()
+        .map(|(k, v)| {
+            let mut clean_key = k.clone();
+
+            // Remove table alias prefix like "t1_0." or "t2_3."
+            if let Some(dot_pos) = clean_key.find('.') {
+                clean_key = clean_key[dot_pos + 1..].to_string();
+            }
+
+            // Remove JSON uniqueness prefixes: _s_, _e_, _r_
+            for prefix in &["_s_", "_e_", "_r_"] {
+                if clean_key.starts_with(prefix) {
+                    clean_key = clean_key[prefix.len()..].to_string();
+                    break;
+                }
+            }
+
+            (clean_key, v)
+        })
+        .collect()
+}
+
+/// Extract ID string from properties HashMap for element_id generation
+/// Tries common ID field names and returns the string representation
+fn extract_id_string_from_props(
+    props: &HashMap<String, Value>,
+    schema: Option<&GraphSchema>,
+    label: Option<&str>,
+) -> String {
+    // Try schema-defined ID columns first (most reliable)
+    if let (Some(schema), Some(label)) = (schema, label) {
+        if let Some(node_schema) = schema.node_schema_opt(label) {
+            let id_columns = node_schema.node_id.id.columns();
+            let id_values: Vec<String> = id_columns
+                .iter()
+                .filter_map(|col| {
+                    props
+                        .get(*col)
+                        .or_else(|| {
+                            // Try prefixed variants (_s_, _e_)
+                            ["_s_", "_e_"]
+                                .iter()
+                                .find_map(|pfx| props.get(&format!("{}{}", pfx, col)))
+                        })
+                        .and_then(value_to_string)
+                })
+                .collect();
+            if id_values.len() == id_columns.len() {
+                let parts: Vec<Option<&str>> = id_values.iter().map(|v| Some(v.as_str())).collect();
+                return node_id_text(&parts);
+            }
+        }
+    }
+
+    // Fallback: common ID column names
+    let id_fields = [
+        "user_id",
+        "post_id",
+        "id",
+        "code",
+        "node_id",
+        "origin_code",
+        "dest_code",
+        "airport_code",
+        "flight_id",
+    ];
+
+    for id_field in &id_fields {
+        if let Some(val) = props.get(*id_field) {
+            if let Some(str_val) = value_to_string(val) {
+                return str_val;
+            }
+        }
+    }
+
+    // Try prefixed match (_s_, _e_, _r_ prefixes)
+    for id_field in &id_fields {
+        for prefix in &["_s_", "_e_", "_r_"] {
+            let prefixed_key = format!("{}{}", prefix, id_field);
+            if let Some(val) = props.get(&prefixed_key) {
+                if let Some(str_val) = value_to_string(val) {
+                    return str_val;
+                }
+            }
+        }
+    }
+
+    // Last resort: any key that looks like an ID
+    for (key, val) in props {
+        let key_lower = key.to_lowercase();
+        if key_lower.ends_with("_id") || key_lower.ends_with("id") || key_lower == "code" {
+            if let Some(str_val) = value_to_string(val) {
+                return str_val;
+            }
+        }
+    }
+
+    "0".to_string()
+}
+
+/// Generate a unique integer node ID from element_id
+/// This ensures round-trip: element_id is the source of truth, integer id is derived from it
+/// Generate a deterministic ID from an element_id using the single source of truth.
+/// This ensures "User:1" and "Post:1" have different IDs by encoding the label.
+fn generate_id_from_element_id(element_id: &str) -> i64 {
+    // Delegate to IdMapper's compute_deterministic_id for consistent encoding
+    super::id_mapper::IdMapper::compute_deterministic_id(element_id)
+}
+
+/// Extract first element from a ClickHouse array value
+///
+/// Multi-type CTE queries return arrays with single elements:
+/// - ['FOLLOWS'] → "FOLLOWS"
+/// - ['{"follow_date":"2024-02-11"}'] → "{\"follow_date\":\"2024-02-11\"}"
+///
+/// # Arguments
+///
+/// * `val` - JSON Value that should be an array
+///
+/// # Returns
+///
+/// First element as String, or None if not an array or empty
+fn extract_first_from_array(val: &Value) -> Option<String> {
+    match val {
+        Value::Array(arr) if !arr.is_empty() => scalar_to_string(&arr[0]),
+        // Databricks serializes array-typed columns (e.g. the multi-type CTE
+        // `type` / `properties` columns) as a JSON-array *string* like
+        // `["FOLLOWS"]` rather than a native array. ClickHouse returns a real
+        // array. Parse the string back into JSON so both dialects yield the
+        // same scalar. Without this, node-expand in Neo4j Browser (which fires
+        // multi-type `(a)-[r]-(o)` queries) fails on Databricks with
+        // "Could not extract relationship type from array".
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('[') {
+                if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed) {
+                    return arr.first().and_then(scalar_to_string);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Render a JSON scalar (string/number/bool) as a plain string. Returns `None`
+/// for nested arrays/objects/null.
+fn scalar_to_string(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Find a node in the result row by its alias, using known labels
+fn find_node_in_row_with_label(
+    row: &HashMap<String, Value>,
+    alias: &str,
+    known_labels: &[String],
+    return_metadata: &[ReturnItemMetadata],
+    schema: &GraphSchema,
+) -> Option<Node> {
+    log::info!(
+        "🔍 find_node_in_row_with_label: alias='{}', known_labels={:?}, row_keys={:?}",
+        alias,
+        known_labels,
+        row.keys().collect::<Vec<_>>()
+    );
+
+    // First try the return metadata approach
+    for meta in return_metadata {
+        if meta.field_name == alias {
+            if let ReturnItemType::Node { labels } = &meta.item_type {
+                return transform_to_node(row, alias, labels, schema).ok();
+            }
+        }
+    }
+
+    // Check if there are properties in the row with this alias prefix
+    let prefix = format!("{}.", alias);
+    let mut properties = HashMap::new();
+
+    for (key, value) in row.iter() {
+        if let Some(prop_name) = key.strip_prefix(&prefix) {
+            properties.insert(prop_name.to_string(), value.clone());
+        }
+    }
+
+    log::info!(
+        "🔍 Found {} properties for alias '{}' with prefix '{}'",
+        properties.len(),
+        alias,
+        prefix
+    );
+
+    if properties.is_empty() {
+        return None;
+    }
+
+    // Use the known label from path metadata (already extracted from composite keys)
+    // Fall back to __label__ column from UNION queries if known_labels is empty
+    let label = if let Some(l) = known_labels.first() {
+        l.clone()
+    } else if let Some(label_val) = row.get("__label__").and_then(value_to_string) {
+        log::debug!("Using __label__ column for node '{}': {}", alias, label_val);
+        label_val
+    } else {
+        return None;
+    };
+
+    // Get node schema
+    let node_schema = schema.node_schema_opt(&label)?;
+
+    // Get ID columns from schema
+    let id_columns = node_schema.node_id.id.columns();
+    let id_values: Vec<String> = id_columns
+        .iter()
+        .filter_map(|col| properties.get(*col).and_then(value_to_string))
+        .collect();
+
+    if id_values.is_empty() {
+        log::warn!(
+            "No ID values found for node '{}' with label '{}'",
+            alias,
+            label
+        );
+        return None;
+    }
+
+    let element_id = generate_node_element_id(
+        &label,
+        &id_values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    // Derive integer ID from element_id (ensures uniqueness across labels)
+    let id: i64 = generate_id_from_element_id(&element_id);
+
+    log::info!(
+        "✅ Found node '{}' in row: label={}, properties={}, element_id={}",
+        alias,
+        label,
+        properties.len(),
+        element_id
+    );
+
+    Some(Node {
+        id,
+        labels: vec![label.clone()],
+        properties,
+        element_id,
+    })
+}
+
+/// Find or reconstruct a relationship in the result row using its alias, path metadata,
+/// and the start/end node element IDs.
+#[allow(clippy::too_many_arguments)] // path-result reconstruction needs row + alias + both endpoint ids + (rel_types, from_labels, to_labels) for polymorphic resolution + return metadata + schema
+fn find_relationship_in_row_with_type(
+    row: &HashMap<String, Value>,
+    alias: &str,
+    start_element_id: &str,
+    end_element_id: &str,
+    known_rel_types: &[String],
+    from_labels: &[String],
+    to_labels: &[String],
+    return_metadata: &[ReturnItemMetadata],
+    schema: &GraphSchema,
+) -> Option<Relationship> {
+    // First try return metadata
+    for meta in return_metadata {
+        if meta.field_name == alias {
+            if let ReturnItemType::Relationship {
+                rel_types,
+                from_label,
+                to_label,
+                direction: _,
+            } = &meta.item_type
+            {
+                return transform_to_relationship(
+                    row,
+                    alias,
+                    rel_types,
+                    from_label.as_deref(),
+                    to_label.as_deref(),
+                    schema,
+                )
+                .ok();
+            }
+        }
+    }
+
+    // Check if there are properties in the row with this alias prefix
+    let prefix = format!("{}.", alias);
+    let mut properties = HashMap::new();
+
+    for (key, value) in row.iter() {
+        if let Some(prop_name) = key.strip_prefix(&prefix) {
+            properties.insert(prop_name.to_string(), value.clone());
+        }
+    }
+
+    if properties.is_empty() {
+        return None;
+    }
+
+    // Use the known relationship type from path metadata
+    let rel_type = known_rel_types.first()?;
+    let _from_label = from_labels.first()?;
+    let _to_label = to_labels.first()?;
+
+    log::info!(
+        "✅ Found relationship '{}' in row: type={}, properties={}",
+        alias,
+        rel_type,
+        properties.len()
+    );
+
+    // Node IDs are derived from element_id hash (same as the nodes themselves)
+    let start_id = generate_id_from_element_id(start_element_id);
+    let end_id = generate_id_from_element_id(end_element_id);
+
+    // Generate relationship element_id using bare scalar IDs extracted from the
+    // node element_ids. This matches the canonical format used everywhere else
+    // (e.g., `LIKED:2->43-`) so Browser dedupes correctly across expansions.
+    let from_bare_id = parse_node_element_id(start_element_id)
+        .map(|(_, id)| id)
+        .unwrap_or_else(|_| start_element_id.to_string());
+    let to_bare_id = parse_node_element_id(end_element_id)
+        .map(|(_, id)| id)
+        .unwrap_or_else(|_| end_element_id.to_string());
+    let rel_element_id = generate_relationship_element_id(rel_type, &from_bare_id, &to_bare_id);
+    let rel_id = generate_id_from_element_id(&rel_element_id);
+
+    // Remove internal from_id/to_id keys from properties (FK columns, not user properties)
+    properties.remove(REL_FROM_ID_KEY);
+    properties.remove(REL_TO_ID_KEY);
+    // Remove composite variants
+    let composite_keys: Vec<String> = properties
+        .keys()
+        .filter(|k| {
+            (k.starts_with(&format!("{}_", REL_FROM_ID_KEY))
+                || k.starts_with(&format!("{}_", REL_TO_ID_KEY)))
+                && k.rsplit('_')
+                    .next()
+                    .is_some_and(|s| s.parse::<usize>().is_ok())
+        })
+        .cloned()
+        .collect();
+    for key in composite_keys {
+        properties.remove(&key);
+    }
+
+    // Create relationship with extracted properties
+    Some(Relationship {
+        id: rel_id,
+        start_node_id: start_id,
+        end_node_id: end_id,
+        rel_type: rel_type.clone(),
+        properties,
+        element_id: rel_element_id,
+        start_node_element_id: start_element_id.to_string(),
+        end_node_element_id: end_element_id.to_string(),
+    })
+}
+
+/// Create a node with a known label but no data
+fn create_node_with_label(label: &str, idx: i64) -> Node {
+    let element_id = format!("{}:{}", label, idx);
+    let id = generate_id_from_element_id(&element_id);
+    Node {
+        id,
+        labels: vec![label.to_string()],
+        properties: std::collections::HashMap::new(),
+        element_id,
+    }
+}
+
+/// Create a relationship with a known type but no data
+fn create_relationship_with_type(
+    rel_type: &str,
+    start_element_id: &str,
+    end_element_id: &str,
+) -> Relationship {
+    // Generate element_id using bare scalar IDs extracted from the node
+    // element_ids — same canonical format used elsewhere (`LIKED:2->43-`).
+    let from_bare_id = parse_node_element_id(start_element_id)
+        .map(|(_, id)| id)
+        .unwrap_or_else(|_| start_element_id.to_string());
+    let to_bare_id = parse_node_element_id(end_element_id)
+        .map(|(_, id)| id)
+        .unwrap_or_else(|_| end_element_id.to_string());
+    let element_id = generate_relationship_element_id(rel_type, &from_bare_id, &to_bare_id);
+    let id = generate_id_from_element_id(&element_id);
+    let start_node_id = generate_id_from_element_id(start_element_id);
+    let end_node_id = generate_id_from_element_id(end_element_id);
+
+    Relationship {
+        id,
+        start_node_id,
+        end_node_id,
+        rel_type: rel_type.to_string(),
+        properties: std::collections::HashMap::new(),
+        element_id,
+        start_node_element_id: start_element_id.to_string(),
+        end_node_element_id: end_element_id.to_string(),
+    }
+}
+
+/// Convert a JSON Value to a String for elementId generation
+///
+/// Handles String, Number, Boolean types. Returns None for complex types.
+/// Extract an ID value from a JSON Value, handling both strings and numbers.
+/// ClickHouse may return tuple elements as their native types (integer for numeric columns),
+/// so we must handle both Value::String("16") and Value::Number(16).
+fn value_to_id_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => "0".to_string(),
+    }
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => None,
+        _ => None, // Arrays and Objects not supported for IDs
+    }
+}
+
+/// Try to transform a multi-label scan result row
+///
+/// Multi-label scan results have columns in the format: {alias}_label, {alias}_id, {alias}_properties
+/// This function detects these columns and transforms them into proper Node objects.
+///
+/// Returns None if this is not a multi-label scan result.
+fn try_transform_multi_label_row(
+    row: &HashMap<String, Value>,
+    metadata: &[ReturnItemMetadata],
+    id_mapper: &mut super::id_mapper::IdMapper,
+) -> Result<Option<Vec<BoltValue>>, String> {
+    // Find return items that might be multi-label nodes
+    // Multi-label results have columns: {alias}_label, {alias}_id, {alias}_properties
+    let mut result = Vec::new();
+    let mut found_multi_label = false;
+
+    for meta in metadata {
+        // Check if we have the special multi-label columns for this alias
+        let label_col = format!("{}_label", meta.field_name);
+        let id_col = format!("{}_id", meta.field_name);
+        let props_col = format!("{}_properties", meta.field_name);
+
+        if row.contains_key(&label_col) && row.contains_key(&id_col) && row.contains_key(&props_col)
+        {
+            found_multi_label = true;
+
+            // Extract label
+            let label = match row.get(&label_col) {
+                Some(Value::String(l)) => l.clone(),
+                Some(v) => v.to_string().trim_matches('"').to_string(),
+                None => return Err(format!("Missing {} column", label_col)),
+            };
+
+            // Extract ID
+            let id = match row.get(&id_col) {
+                Some(Value::String(i)) => i.clone(),
+                Some(v) => v.to_string().trim_matches('"').to_string(),
+                None => return Err(format!("Missing {} column", id_col)),
+            };
+
+            // Extract and parse properties JSON
+            let properties: HashMap<String, Value> = match row.get(&props_col) {
+                Some(Value::String(json_str)) => {
+                    serde_json::from_str(json_str).unwrap_or_else(|_| HashMap::new())
+                }
+                Some(Value::Object(map)) => {
+                    // Already parsed as object
+                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                }
+                _ => HashMap::new(),
+            };
+
+            // Generate element_id
+            let element_id = generate_node_element_id(&label, &[&id]);
+
+            // Get session-scoped integer ID from id_mapper
+            let numeric_id = id_mapper.get_or_assign(&element_id);
+
+            // Create Node with mapped integer ID
+            let node = Node::new(numeric_id, vec![label], properties, element_id);
+            let packstream_bytes = node.to_packstream();
+            result.push(BoltValue::PackstreamBytes(packstream_bytes));
+        } else {
+            // Not a multi-label column set, check for regular handling
+            match &meta.item_type {
+                ReturnItemType::Scalar => {
+                    let value = row.get(&meta.field_name).cloned().unwrap_or(Value::Null);
+                    result.push(BoltValue::Json(value));
+                }
+                _ => {
+                    // If we've found some multi-label results but this one isn't,
+                    // we can't use this code path
+                    if found_multi_label {
+                        return Err(format!(
+                            "Mixed multi-label and regular results not supported for field: {}",
+                            meta.field_name
+                        ));
+                    }
+                    // Not a multi-label result at all
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    if found_multi_label {
+        Ok(Some(result))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph_catalog::config::Identifier;
+    use crate::graph_catalog::schema_types::SchemaType;
+
+    #[test]
+    fn test_value_to_string_integer() {
+        let value = Value::Number(123.into());
+        assert_eq!(value_to_string(&value), Some("123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_first_from_native_array() {
+        // ClickHouse path: real JSON array.
+        let value = Value::Array(vec![Value::String("FOLLOWS".to_string())]);
+        assert_eq!(
+            extract_first_from_array(&value),
+            Some("FOLLOWS".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_from_stringified_array_databricks() {
+        // Databricks path: array column serialized as a JSON-array string.
+        let value = Value::String("[\"FOLLOWS\"]".to_string());
+        assert_eq!(
+            extract_first_from_array(&value),
+            Some("FOLLOWS".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_from_stringified_props_array_databricks() {
+        // The multi-type CTE `properties` column is an array whose single
+        // element is itself a JSON object string. On Databricks the outer array
+        // arrives stringified; the inner element must survive intact for the
+        // caller's serde_json::from_str of the relationship properties.
+        let value = Value::String("[\"{\\\"follow_date\\\":\\\"2021-01-01\\\"}\"]".to_string());
+        assert_eq!(
+            extract_first_from_array(&value),
+            Some("{\"follow_date\":\"2021-01-01\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_from_empty_and_scalar() {
+        assert_eq!(extract_first_from_array(&Value::Array(vec![])), None);
+        assert_eq!(
+            extract_first_from_array(&Value::String("FOLLOWS".to_string())),
+            None,
+            "a bare non-array string is not a valid array payload"
+        );
+        assert_eq!(extract_first_from_array(&Value::Null), None);
+    }
+
+    #[test]
+    fn test_value_to_string_string() {
+        let value = Value::String("alice".to_string());
+        assert_eq!(value_to_string(&value), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn test_value_to_string_boolean() {
+        let value = Value::Bool(true);
+        assert_eq!(value_to_string(&value), Some("true".to_string()));
+    }
+
+    #[test]
+    fn test_value_to_string_null() {
+        let value = Value::Null;
+        assert_eq!(value_to_string(&value), None);
+    }
+
+    #[test]
+    fn test_create_relationship_with_type_uses_canonical_format() {
+        // Regression: create_relationship_with_type used to format the
+        // element_id as `LIKED:User:2-->Post:43-` (full node element_ids
+        // pasted in). Other code paths produced the canonical
+        // `LIKED:2->43-` form, so Browser saw them as two distinct edges
+        // and drew duplicate links between the same pair. Lock in the
+        // canonical bare-id format here.
+        let rel = create_relationship_with_type("LIKED", "User:2-", "Post:43-");
+        assert_eq!(rel.element_id, "LIKED:2->43-");
+        assert_eq!(rel.start_node_element_id, "User:2-");
+        assert_eq!(rel.end_node_element_id, "Post:43-");
+    }
+
+    #[test]
+    #[ignore] // TODO: Fix test - needs proper row data mapping from relationship columns to node ID columns
+    fn test_transform_to_relationship_basic() {
+        use crate::graph_catalog::graph_schema::RelationshipSchema;
+        use std::collections::HashMap;
+
+        // Create a minimal schema
+        let mut schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+
+        // Add relationship schema for FOLLOWS
+        schema.insert_relationship_schema(
+            "FOLLOWS".to_string(),
+            RelationshipSchema {
+                column_types: Default::default(),
+                from_node_id_part_types: Vec::new(),
+                to_node_id_part_types: Vec::new(),
+                closed_properties: false,
+                database: "test".to_string(),
+                table_name: "follows".to_string(),
+                column_names: vec![
+                    "follower_id".to_string(),
+                    "followed_id".to_string(),
+                    "follow_date".to_string(),
+                ],
+                from_node: "User".to_string(),
+                to_node: "User".to_string(),
+                from_node_table: "users".to_string(),
+                to_node_table: "users".to_string(),
+                from_id: Identifier::from("follower_id"),
+                to_id: Identifier::from("followed_id"),
+                from_node_id_dtype: SchemaType::Integer,
+                to_node_id_dtype: SchemaType::Integer,
+                property_mappings: HashMap::new(),
+                view_parameters: None,
+                engine: None,
+                use_final: None,
+                filter: None,
+                edge_id: None,
+                type_column: None,
+                from_label_column: None,
+                to_label_column: None,
+                from_label_values: None,
+                to_label_values: None,
+                from_node_properties: None,
+                to_node_properties: None,
+                is_fk_edge: false,
+                constraints: None,
+                edge_id_types: None,
+                source: None,
+                property_types: HashMap::new(),
+            },
+        );
+
+        // Create test row data
+        let mut row = HashMap::new();
+        row.insert("r.follower_id".to_string(), Value::Number(1.into()));
+        row.insert("r.followed_id".to_string(), Value::Number(2.into()));
+        row.insert(
+            "r.follow_date".to_string(),
+            Value::String("2024-01-15".to_string()),
+        );
+
+        // Transform
+        let result = transform_to_relationship(
+            &row,
+            "r",
+            &["FOLLOWS".to_string()],
+            Some("User"),
+            Some("User"),
+            &schema,
+        );
+
+        assert!(result.is_ok());
+        let rel = result.unwrap();
+        assert_eq!(rel.rel_type, "FOLLOWS");
+        // Uses relationship's FK columns: follower_id=1, followed_id=2
+        assert_eq!(rel.element_id, "FOLLOWS:1->2");
+        assert_eq!(rel.start_node_element_id, "User:1");
+        assert_eq!(rel.end_node_element_id, "User:2");
+        assert_eq!(
+            rel.properties.get("follow_date").unwrap(),
+            &Value::String("2024-01-15".to_string())
+        );
+    }
+
+    /// Regression: polymorphic multi-type EXPAND where the anchor `User` appears
+    /// on BOTH the from-side and the to-side across interaction types.
+    ///
+    /// For an undirected `(a)-[r]-(o)` expand the multi-type CTE projects node
+    /// *labels* (start_type/end_type) in traversal order (start = the bound
+    /// anchor `a`) but projects r_from_id/r_to_id in the schema's from→to order.
+    /// When a branch binds the anchor to the schema *to-side* (e.g. a Post→User
+    /// interaction where `a` is the User) these disagree, and before the fix the
+    /// relationship's endpoint element_ids paired the wrong label with the wrong
+    /// id (e.g. "User:<post_id>" / "Post:<user_id>"), so neither equalled the
+    /// returned nodes' element_ids and Neo4j Browser could not attach the
+    /// relationship to its nodes ("node separated from its link").
+    ///
+    /// Asserts each relationship endpoint element_id EXACTLY equals the
+    /// element_id of the corresponding node (built via generate_node_element_id),
+    /// for User-from (User→Post), User-to (Post→User), and User→User branches.
+    #[test]
+    fn test_polymorphic_multi_type_expand_endpoint_element_ids_match_nodes() {
+        use crate::graph_catalog::graph_schema::RelationshipSchema;
+        use std::collections::HashMap;
+
+        // Build a polymorphic ("$any") relationship schema, registered under the
+        // interaction type names — mirrors build_polymorphic_edge_schemas().
+        let mut schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+        let make_poly_rel = || RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "brahmand".to_string(),
+            table_name: "interactions".to_string(),
+            column_names: vec![REL_FROM_ID_KEY.to_string(), REL_TO_ID_KEY.to_string()],
+            from_node: "$any".to_string(),
+            to_node: "$any".to_string(),
+            from_node_table: "$any".to_string(),
+            to_node_table: "$any".to_string(),
+            from_id: Identifier::from(REL_FROM_ID_KEY),
+            to_id: Identifier::from(REL_TO_ID_KEY),
+            from_node_id_dtype: SchemaType::Integer,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: Some("interaction_type".to_string()),
+            from_label_column: Some("from_type".to_string()),
+            to_label_column: Some("to_type".to_string()),
+            from_label_values: None,
+            to_label_values: None,
+            from_node_properties: None,
+            to_node_properties: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+        for ty in ["AUTHORED", "COMMENTED", "FOLLOWS"] {
+            schema.insert_relationship_schema(ty.to_string(), make_poly_rel());
+        }
+
+        // Build one multi-type-CTE result row for a 1-hop expand, matching the
+        // outer projection column names (`r.` prefix). `start_type`/`end_type`/
+        // `start_id`/`end_id` are traversal order (start = anchor `a`);
+        // `r_from_id`/`r_to_id` are schema from→to order (toString → String).
+        let make_row = |start_type: &str,
+                        end_type: &str,
+                        start_id: i64,
+                        end_id: i64,
+                        r_from_id: &str,
+                        r_to_id: &str|
+         -> HashMap<String, Value> {
+            let mut row = HashMap::new();
+            row.insert("r.start_type".to_string(), Value::String(start_type.into()));
+            row.insert("r.end_type".to_string(), Value::String(end_type.into()));
+            // Native ints, as the CTE projects the anchor/other node ids.
+            row.insert("r.start_id".to_string(), Value::Number(start_id.into()));
+            row.insert("r.end_id".to_string(), Value::Number(end_id.into()));
+            // Schema-natural FK ids, projected via toString() → String.
+            row.insert("r.r_from_id".to_string(), Value::String(r_from_id.into()));
+            row.insert("r.r_to_id".to_string(), Value::String(r_to_id.into()));
+            row
+        };
+
+        // For a row, assert both endpoints exactly equal the corresponding node
+        // element_ids. The from-endpoint must match the node carrying the
+        // schema-from id (r_from_id); the to-endpoint the schema-to id (r_to_id).
+        let assert_endpoints = |rel_type: &str,
+                                row: &HashMap<String, Value>,
+                                expected_start: &str,
+                                expected_end: &str| {
+            let rel = transform_to_relationship(
+                row,
+                "r",
+                &[rel_type.to_string()],
+                None, // polymorphic: labels come from start_type/end_type
+                None,
+                &schema,
+            )
+            .expect("transform should succeed");
+
+            // The two returned/known nodes, element_id'd exactly like transform_to_node.
+            let start_type = value_to_string(row.get("r.start_type").unwrap()).unwrap();
+            let end_type = value_to_string(row.get("r.end_type").unwrap()).unwrap();
+            let start_id = value_to_string(row.get("r.start_id").unwrap()).unwrap();
+            let end_id = value_to_string(row.get("r.end_id").unwrap()).unwrap();
+            let node_a = generate_node_element_id(&start_type, &[start_id.as_str()]);
+            let node_o = generate_node_element_id(&end_type, &[end_id.as_str()]);
+
+            assert_eq!(
+                rel.start_node_element_id, expected_start,
+                "rel_type={rel_type}: start endpoint element_id mismatch"
+            );
+            assert_eq!(
+                rel.end_node_element_id, expected_end,
+                "rel_type={rel_type}: end endpoint element_id mismatch"
+            );
+            // Every endpoint must be attachable to one of the two nodes.
+            assert!(
+                rel.start_node_element_id == node_a || rel.start_node_element_id == node_o,
+                "rel_type={rel_type}: start endpoint {} matches neither node ({node_a} / {node_o})",
+                rel.start_node_element_id
+            );
+            assert!(
+                rel.end_node_element_id == node_a || rel.end_node_element_id == node_o,
+                "rel_type={rel_type}: end endpoint {} matches neither node ({node_a} / {node_o})",
+                rel.end_node_element_id
+            );
+        };
+
+        let user4 = generate_node_element_id("User", &["4"]);
+        let post2 = generate_node_element_id("Post", &["2"]);
+        let post9 = generate_node_element_id("Post", &["9"]);
+        let user7 = generate_node_element_id("User", &["7"]);
+
+        // (i) User→Post, User is the schema FROM-side (outgoing, not reversed):
+        //     schema from=User(a=4), to=Post(o=2). Endpoints: User:4 → Post:2.
+        let row_i = make_row("User", "Post", 4, 2, "4", "2");
+        assert_endpoints("AUTHORED", &row_i, &user4, &post2);
+
+        // (ii) Post→User, User is the schema TO-side (reversed branch):
+        //      traversal a(User:4)→o(Post:9); schema from=Post(o=9), to=User(a=4).
+        //      Endpoints must be Post:9 (from) → User:4 (to). Before the fix this
+        //      produced "User:9" / "Post:4" — matching NEITHER node.
+        let row_ii = make_row("User", "Post", 4, 9, "9", "4");
+        assert_endpoints("COMMENTED", &row_ii, &post9, &user4);
+
+        // (iii) User→User, anchor is the followed (to-side) — labels agree, only
+        //       direction is reversed. Endpoints: User:7 (from) → User:4 (to).
+        let row_iii = make_row("User", "User", 4, 7, "7", "4");
+        assert_endpoints("FOLLOWS", &row_iii, &user7, &user4);
+    }
+
+    /// Regression: for a CONCRETE-label multi-type expand where the anchor sits on
+    /// the schema's TO-side, the relationship endpoint labels must come from the
+    /// TRAVERSAL node labels (start_type/end_type), not the schema from/to labels.
+    /// (zeek_dns_graph: REQUESTED is IP→Domain; expanding a Domain yields
+    /// start_type=Domain/end_type=IP but r_from_id=<ip>/r_to_id=<domain>. Using the
+    /// schema labels mislabels the endpoint as "Domain:<ip>", so the relationship no
+    /// longer matches the IP node and Neo4j Browser detaches it / crashes.)
+    #[test]
+    fn test_concrete_multi_type_expand_to_side_anchor_endpoint_labels_match_nodes() {
+        use crate::graph_catalog::graph_schema::RelationshipSchema;
+        use std::collections::HashMap;
+
+        let mut schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+        // REQUESTED: concrete IP -> Domain, edge table with string ids.
+        schema.insert_relationship_schema(
+            "REQUESTED".to_string(),
+            RelationshipSchema {
+                column_types: Default::default(),
+                from_node_id_part_types: Vec::new(),
+                to_node_id_part_types: Vec::new(),
+                closed_properties: false,
+                database: "zeek".to_string(),
+                table_name: "dns_log".to_string(),
+                column_names: vec!["id.orig_h".to_string(), "query".to_string()],
+                from_node: "IP".to_string(),
+                to_node: "Domain".to_string(),
+                from_node_table: "all_ips".to_string(),
+                to_node_table: "dns_log".to_string(),
+                from_id: Identifier::from("id.orig_h"),
+                to_id: Identifier::from("query"),
+                from_node_id_dtype: SchemaType::String,
+                to_node_id_dtype: SchemaType::String,
+                property_mappings: HashMap::new(),
+                view_parameters: None,
+                engine: None,
+                use_final: None,
+                filter: None,
+                edge_id: None,
+                type_column: None,
+                from_label_column: None,
+                to_label_column: None,
+                from_label_values: None,
+                to_label_values: None,
+                from_node_properties: None,
+                to_node_properties: None,
+                is_fk_edge: false,
+                constraints: None,
+                edge_id_types: None,
+                source: None,
+                property_types: HashMap::new(),
+            },
+        );
+
+        // Expanding Domain `cloudflare.com` (schema to-side): traversal start=Domain,
+        // end=IP; schema-from id = the IP, schema-to id = the domain. This mirrors the
+        // REAL vlp_multi_type outer projection: start_id/end_id in traversal order,
+        // r_from_id/r_to_id in schema from→to order, and the end node's label as
+        // `o.__label__` — start_type is NOT projected (so we must read the label from
+        // o.__label__, not from a nonexistent start_type/end_type column).
+        let mut row = HashMap::new();
+        row.insert(
+            "r.start_id".to_string(),
+            Value::String("cloudflare.com".into()),
+        );
+        row.insert("r.end_id".to_string(), Value::String("192.168.1.30".into()));
+        row.insert(
+            "r.r_from_id".to_string(),
+            Value::String("192.168.1.30".into()),
+        );
+        row.insert(
+            "r.r_to_id".to_string(),
+            Value::String("cloudflare.com".into()),
+        );
+        // The other (end-side) node `o` is the IP — projected as o.__label__ / o.id.
+        row.insert("o.__label__".to_string(), Value::String("IP".into()));
+        row.insert("o.id".to_string(), Value::String("192.168.1.30".into()));
+
+        let rel =
+            transform_to_relationship(&row, "r", &["REQUESTED".to_string()], None, None, &schema)
+                .expect("transform should succeed");
+
+        // The returned nodes are IP:192.168.1.30 (o) and Domain:cloudflare.com (a).
+        let node_ip = generate_node_element_id("IP", &["192.168.1.30"]);
+        let node_domain = generate_node_element_id("Domain", &["cloudflare.com"]);
+        // REQUESTED is IP→Domain: from-endpoint = the IP node, to-endpoint = the Domain.
+        assert_eq!(
+            rel.start_node_element_id, node_ip,
+            "from-endpoint must equal the IP node (not Domain:<ip>)"
+        );
+        assert_eq!(
+            rel.end_node_element_id, node_domain,
+            "to-endpoint must equal the Domain node"
+        );
+    }
+
+    // Integration-style test (requires more setup)
+    // TODO: Add full transform_to_node test with mock schema
+
+    /// I6b: a composite id's parts are escaped in its node's element id, a
+    /// NULL one `\\N`, and a relationship's ends are spelled as its nodes'
+    /// ids, so Browser ties them.
+    #[test]
+    fn a_composite_ids_element_id_is_escaped_and_its_ends_agree() {
+        use crate::graph_catalog::config::GraphSchemaConfig;
+        let schema = GraphSchemaConfig::from_yaml_str(
+            r#"
+graph_schema:
+  name: t
+  nodes:
+    - label: Acct
+      database: test
+      table: acct
+      node_id: [bank, num]
+      property_mappings: {bank: bank, num: num, owner: owner}
+  relationships:
+    - type: SENT
+      database: test
+      table: sent
+      from_node: Acct
+      to_node: Acct
+      from_id: [fb, fnum]
+      to_id: [tb, tnum]
+      property_mappings: {}
+"#,
+        )
+        .expect("parse schema")
+        .to_graph_schema()
+        .expect("to graph schema");
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("a.bank".to_string(), Value::from("b|1"));
+        row.insert("a.num".to_string(), Value::from(7));
+        row.insert("a.owner".to_string(), Value::from("x"));
+        let a = transform_to_node(&row, "a", &["Acct".to_string()], &schema).unwrap();
+        assert_eq!(a.element_id, "Acct:b\\|1|7-");
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("b.bank".to_string(), Value::from("c"));
+        row.insert("b.num".to_string(), Value::Null);
+        let b = transform_to_node(&row, "b", &["Acct".to_string()], &schema).unwrap();
+        assert_eq!(b.element_id, "Acct:c|\\N-");
+
+        // An id of no part that is not NULL is no node's.
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("c.bank".to_string(), Value::Null);
+        row.insert("c.num".to_string(), Value::Null);
+        assert!(transform_to_node(&row, "c", &["Acct".to_string()], &schema).is_err());
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("r.#fromId_1".to_string(), Value::from("b|1"));
+        row.insert("r.#fromId_2".to_string(), Value::from(7));
+        row.insert("r.#toId_1".to_string(), Value::from("c:d"));
+        row.insert("r.#toId_2".to_string(), Value::from(8));
+        let r = transform_to_relationship(
+            &row,
+            "r",
+            &["SENT".to_string()],
+            Some("Acct"),
+            Some("Acct"),
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(r.start_node_element_id, a.element_id);
+        assert_eq!(r.end_node_element_id, "Acct:c\\:d|8-");
+        assert_eq!(r.element_id, "SENT:b\\|1|7->c\\:d|8-");
+    }
+
+    /// Regression: a node whose schema id column is literally named `id`
+    /// (extremely common — most tables use an `id` primary key) must still
+    /// render. The property map intentionally drops the `id`/`properties` keys
+    /// (VLP-internal columns), so the id value is recovered from the raw row
+    /// column. Before the fix this returned `Err("Missing ID column 'id'")` and
+    /// the node never appeared in Neo4j Browser.
+    #[test]
+    fn test_transform_to_node_with_id_named_id_column() {
+        use crate::graph_catalog::config::GraphSchemaConfig;
+        let schema = GraphSchemaConfig::from_yaml_str(
+            r#"
+graph_schema:
+  name: t
+  nodes:
+    - label: Person
+      database: test
+      table: Person
+      node_id: id
+      property_mappings:
+        id: id
+        firstName: firstName
+  relationships: []
+"#,
+        )
+        .expect("parse schema")
+        .to_graph_schema()
+        .expect("to graph schema");
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("p.id".to_string(), Value::from(7));
+        row.insert("p.firstName".to_string(), Value::from("Alice"));
+
+        // Labeled path (e.g. `MATCH (p:Person) RETURN p`).
+        let node = transform_to_node(&row, "p", &["Person".to_string()], &schema)
+            .expect("node should transform even when id column is named 'id'");
+        assert_eq!(node.element_id, "Person:7-");
+        assert_eq!(node.labels, vec!["Person".to_string()]);
+        // The mapped `id` property is kept (non-VLP), so it shows in the Browser.
+        assert_eq!(node.properties.get("id"), Some(&Value::from(7)));
+
+        // Unlabeled path (e.g. `MATCH (n) RETURN n`): the label must be inferred
+        // from the schema id column, which also needs the `id` value present.
+        let inferred = transform_to_node(&row, "p", &[], &schema)
+            .expect("unlabeled node should infer its label from the 'id' id column");
+        assert_eq!(inferred.element_id, "Person:7-");
+        assert_eq!(inferred.labels, vec!["Person".to_string()]);
+    }
+
+    /// An item with explicit columns (the bound-plan path) reads only its own
+    /// columns: another item's `n.name` (renamed `n.name_2`) or `n.age + 1`
+    /// is not a property of `n`, and a value is read from its own column.
+    #[test]
+    fn test_transform_row_reads_only_the_items_own_columns() {
+        use crate::graph_catalog::config::GraphSchemaConfig;
+        let schema = GraphSchemaConfig::from_yaml_str(
+            r#"
+graph_schema:
+  name: t
+  nodes:
+    - label: Person
+      database: test
+      table: Person
+      node_id: id
+      property_mappings:
+        id: id
+        name: name
+  relationships: []
+"#,
+        )
+        .expect("parse schema")
+        .to_graph_schema()
+        .expect("to graph schema");
+        // `RETURN m.name AS `n.name`, n, n.age + 1` over two persons: the
+        // node's `name` column is the renamed one.
+        let row: HashMap<String, Value> = [
+            ("n.name", Value::from("Bob")),
+            ("n.id", Value::from(7)),
+            ("n.name_2", Value::from("Alice")),
+            ("n.age + 1", Value::from(29)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let pairs = |p: &[(&str, &str)]| {
+            Some(
+                p.iter()
+                    .map(|(k, c)| (k.to_string(), c.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let metadata = vec![
+            ReturnItemMetadata {
+                field_name: "n.name".to_string(),
+                item_type: ReturnItemType::Scalar,
+                columns: pairs(&[("n.name", "n.name")]),
+            },
+            ReturnItemMetadata {
+                field_name: "n".to_string(),
+                item_type: ReturnItemType::Node {
+                    labels: vec!["Person".to_string()],
+                },
+                columns: pairs(&[("id", "n.id"), ("name", "n.name_2")]),
+            },
+            ReturnItemMetadata {
+                field_name: "n.age + 1".to_string(),
+                item_type: ReturnItemType::Scalar,
+                columns: pairs(&[("n.age + 1", "n.age + 1")]),
+            },
+        ];
+        let node_row = metadata[1].entity_row(&row);
+        let node = transform_to_node(&node_row, "n", &["Person".to_string()], &schema).unwrap();
+        let mut props: Vec<_> = node.properties.into_iter().collect();
+        props.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            props,
+            [
+                ("id".to_string(), Value::from(7)),
+                ("name".to_string(), Value::from("Alice"))
+            ]
+        );
+        assert_eq!(metadata[0].value(&row), Some(&Value::from("Bob")));
+        assert_eq!(metadata[2].value(&row), Some(&Value::from(29)));
+        // A value whose column was renamed is read from that column.
+        let renamed = ReturnItemMetadata {
+            field_name: "x".to_string(),
+            item_type: ReturnItemType::Scalar,
+            columns: pairs(&[("x", "n.name_2")]),
+        };
+        assert_eq!(renamed.value(&row), Some(&Value::from("Alice")));
+        let mut ids = super::super::id_mapper::IdMapper::new();
+        let out = transform_row(row, &metadata, &schema, &mut ids).unwrap();
+        assert_eq!(out.len(), 3);
+
+        // An element an OPTIONAL MATCH did not match (every column NULL), and
+        // its `id()`, are NULL, not an error or a made-up id.
+        let unmatched: HashMap<String, Value> = [("n.id", Value::Null), ("n.name_2", Value::Null)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let id_item = ReturnItemMetadata {
+            field_name: "id(n)".to_string(),
+            item_type: ReturnItemType::IdFunction {
+                alias: "n".to_string(),
+                labels: vec!["Person".to_string()],
+            },
+            columns: pairs(&[("id(n)", "n.id")]),
+        };
+        assert!(metadata[1].is_null(&unmatched) && id_item.is_null(&unmatched));
+        assert!(!metadata[1].is_null(&[("n.id".to_string(), Value::from(7))].into()));
+        let out = transform_row(
+            unmatched,
+            &[metadata[1].clone(), id_item],
+            &schema,
+            &mut ids,
+        )
+        .unwrap();
+        assert!(
+            out.iter()
+                .all(|v| matches!(v, BoltValue::Json(Value::Null))),
+            "{out:?}"
+        );
+    }
+
+    /// ELEMENT_IDENTITY.md I5a: the number of an `id()` item whose key is
+    /// hashed (a composite or string key) is assigned in the session, so
+    /// `WHERE id(n) = N` reads it back; a key's bits (a small integer) need
+    /// not be.
+    #[test]
+    fn an_id_item_of_a_hashed_key_is_assigned_in_the_session() {
+        let schema = keyed_labels_schema();
+        let item_of = |label: &str| ReturnItemMetadata {
+            field_name: "i".to_string(),
+            item_type: ReturnItemType::IdFunction {
+                alias: "a".to_string(),
+                labels: vec![label.to_string()],
+            },
+            columns: Some(vec![("i".to_string(), "i".to_string())]),
+        };
+        let number =
+            |ids: &mut super::super::id_mapper::IdMapper, label: &str, key: Value| -> i64 {
+                let row: HashMap<String, Value> = [("i".to_string(), key)].into();
+                match transform_row(row, std::slice::from_ref(&item_of(label)), &schema, ids)
+                    .unwrap()
+                    .as_slice()
+                {
+                    [BoltValue::Json(Value::Number(n))] => n.as_i64().unwrap(),
+                    other => panic!("{other:?}"),
+                }
+            };
+        let mut ids = super::super::id_mapper::IdMapper::new();
+        // A composite key (its escaped text), and a string one.
+        let composite = number(&mut ids, "Account", Value::from("CHASE|CHK-001"));
+        assert_eq!(
+            ids.get_element_id(composite).as_deref(),
+            Some("Account:CHASE|CHK-001-")
+        );
+        let string = number(&mut ids, "Account", Value::from("LAX"));
+        assert_eq!(ids.get_element_id(string).as_deref(), Some("Account:LAX-"));
+        // A string key of digits is no integer's bits: its number is kept.
+        let digits = number(&mut ids, "Account", Value::from("12345678901"));
+        assert_eq!(
+            ids.get_element_id(digits).as_deref(),
+            Some("Account:12345678901-")
+        );
+        // An integer key is its number's bits: nothing to assign, whether it
+        // is small or 2^31 or more (most LDBC ids).
+        for key in [7_i64, 2_336_468_743_926] {
+            let n = number(&mut ids, "Num", Value::from(key));
+            assert_eq!(ids.get_element_id(n), None, "{key}");
+            // ... and the number reads back from its bits.
+            assert_eq!(
+                super::super::id_mapper::resolve_node_id(&ids, Some(&schema), n),
+                Some(("Num".to_string(), key.to_string())),
+                "{key}"
+            );
+        }
+        // A key too large for the bits is hashed, and kept.
+        let huge = number(&mut ids, "Num", Value::from(i64::MAX));
+        assert!(ids.get_element_id(huge).is_some());
+    }
+
+    /// A schema of an integer-keyed label (`Num`, and `User`) and a
+    /// string-keyed one (`Account`).
+    fn keyed_labels_schema() -> GraphSchema {
+        let mut schema = crate::graph_catalog::config::GraphSchemaConfig::from_yaml_str(
+            r#"
+graph_schema:
+  name: t
+  nodes:
+    - {label: Num, database: test, table: num, node_id: id, property_mappings: {id: id}}
+    - {label: User, database: test, table: users, node_id: id, property_mappings: {id: id}}
+    - {label: Account, database: test, table: acct, node_id: code, property_mappings: {code: code}}
+"#,
+        )
+        .expect("parse schema")
+        .to_graph_schema()
+        .expect("to graph schema");
+        // As the column's discovered type makes it.
+        let mut account = schema.node_schema("Account").expect("Account").clone();
+        account.node_id.dtype = crate::graph_catalog::schema_types::SchemaType::String;
+        schema.insert_node_schema("Account".to_string(), account);
+        schema
+    }
+
+    /// #1528: a node's element id spelled in SQL (`NODE_ELEMENT_ID_KEY`) is
+    /// taken as it is, and is no property; a relationship's ends are texts.
+    #[test]
+    fn a_node_takes_its_element_id_from_sql() {
+        let schema = keyed_labels_schema();
+        let key = crate::bound_plan::lower::NODE_ELEMENT_ID_KEY;
+        let row: HashMap<String, Value> = [
+            ("n.id".to_string(), Value::from(1.5e20)),
+            (
+                format!("n.{key}"),
+                Value::from("Num:150000000000000000000-"),
+            ),
+        ]
+        .into();
+        let node = transform_to_node(&row, "n", &["Num".to_string()], &schema).unwrap();
+        assert_eq!(node.element_id, "Num:150000000000000000000-");
+        assert!(!node.properties.contains_key(key), "{:?}", node.properties);
+        assert_eq!(
+            node.id,
+            super::super::id_mapper::IdMapper::compute_deterministic_id(&node.element_id)
+        );
+        // Without it, spelled from the value as before.
+        let row: HashMap<String, Value> = [("n.id".to_string(), Value::from(7))].into();
+        let node = transform_to_node(&row, "n", &["Num".to_string()], &schema).unwrap();
+        assert_eq!(node.element_id, "Num:7-");
+    }
+
+    /// ELEMENT_IDENTITY.md I5b: the number of an element id item (`id(r)`, or
+    /// `id(n)` of a node of several labels) is the number of the same element
+    /// id returned whole; a node's that holds its key's bits is not kept in
+    /// the session, a hash is (as a relationship's always is).
+    #[test]
+    fn an_element_id_item_is_numbered_like_the_element_returned_whole() {
+        let schema = keyed_labels_schema();
+        let item = ReturnItemMetadata {
+            field_name: "i".to_string(),
+            item_type: ReturnItemType::ElementIdNumber,
+            columns: Some(vec![("i".to_string(), "i".to_string())]),
+        };
+        let number = |ids: &mut super::super::id_mapper::IdMapper, text: Value| -> Value {
+            let row: HashMap<String, Value> = [("i".to_string(), text)].into();
+            match transform_row(row, std::slice::from_ref(&item), &schema, ids)
+                .unwrap()
+                .as_slice()
+            {
+                [BoltValue::Json(v)] => v.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let mut ids = super::super::id_mapper::IdMapper::new();
+        let small = number(&mut ids, Value::from("User:7-"));
+        assert_eq!(
+            small.as_i64(),
+            Some(super::super::id_mapper::IdMapper::compute_deterministic_id(
+                "User:7-"
+            ))
+        );
+        assert_eq!(ids.get_element_id(small.as_i64().unwrap()), None);
+        let hashed = number(&mut ids, Value::from("Account:CHASE|CHK-001-"));
+        assert_eq!(
+            ids.get_element_id(hashed.as_i64().unwrap()).as_deref(),
+            Some("Account:CHASE|CHK-001-")
+        );
+        let rel = number(&mut ids, Value::from("FOLLOWS:1->2-"));
+        assert_eq!(
+            ids.get_element_id(rel.as_i64().unwrap()).as_deref(),
+            Some("FOLLOWS:1->2-")
+        );
+        // An integer key's number holds its bits, up to 2^31 and beyond: not
+        // kept, and read back from the number. A string key of digits, and a
+        // key of a label not in the schema, are kept.
+        for (text, bits) in [
+            ("Num:7-", true),
+            ("Num:2336468743926-", true),
+            ("Account:12345678901-", false),
+            ("Nowhere:5-", false),
+        ] {
+            let n = number(&mut ids, Value::from(text)).as_i64().unwrap();
+            assert_eq!(ids.get_element_id(n).is_none(), bits, "{text}");
+        }
+        let n = number(&mut ids, Value::from("Num:2336468743926-"))
+            .as_i64()
+            .unwrap();
+        assert_eq!(
+            super::super::id_mapper::resolve_node_id(&ids, Some(&schema), n),
+            Some(("Num".to_string(), "2336468743926".to_string()))
+        );
+        // NULL stays NULL.
+        assert_eq!(number(&mut ids, Value::Null), Value::Null);
+    }
+
+    /// #486: `transform_vlp_path` must decode the standard (single-type) VLP
+    /// CTE's 3-field tuple (`path_nodes, path_relationships, hop_count`,
+    /// #469) rather than always assuming the 9-field multi-type shape. Before
+    /// the fix, `RETURN p` on a single-type VLP over Bolt failed with
+    /// "expected 9 tuple fields, got 3" for every row.
+    #[test]
+    fn test_transform_vlp_path_standard_three_field_tuple() {
+        let schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("p".to_string(), serde_json::json!([[1, 2], ["FLIGHT"], 1]));
+
+        let path = transform_vlp_path(
+            &row,
+            "p",
+            &schema,
+            &["Airport".to_string()],
+            &["Airport".to_string()],
+            &["FLIGHT".to_string()],
+        )
+        .expect("3-field standard VLP tuple should decode to a Path");
+
+        assert_eq!(path.nodes.len(), 2);
+        assert_eq!(path.relationships.len(), 1);
+        assert_eq!(path.nodes[0].labels, vec!["Airport".to_string()]);
+        assert_eq!(path.nodes[1].labels, vec!["Airport".to_string()]);
+        assert_eq!(path.relationships[0].rel_type, "FLIGHT");
+    }
+
+    /// #486: multi-hop standard VLP (`hop_count > 1`) is truncated to a
+    /// single start->end hop for Bolt serialization (mirrors the pre-existing
+    /// multi-type VLP behavior) rather than erroring.
+    #[test]
+    fn test_transform_vlp_path_standard_multi_hop_truncates_to_start_end() {
+        let schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert(
+            "p".to_string(),
+            serde_json::json!([[10, 20, 30], ["FLIGHT", "FLIGHT"], 2]),
+        );
+
+        let path = transform_vlp_path(
+            &row,
+            "p",
+            &schema,
+            &["Airport".to_string()],
+            &["Airport".to_string()],
+            &["FLIGHT".to_string()],
+        )
+        .expect("multi-hop 3-field standard VLP tuple should decode to a truncated Path");
+
+        assert_eq!(path.nodes.len(), 2);
+        assert_eq!(path.relationships.len(), 1);
+    }
+
+    /// #486: the 9-field multi-type VLP tuple shape must still decode
+    /// correctly through the same entry point (regression guard for the
+    /// dispatcher added to fix the 3-field case).
+    #[test]
+    fn test_transform_vlp_path_multi_type_nine_field_tuple() {
+        let schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert(
+            "p".to_string(),
+            serde_json::json!([
+                "{\"name\":\"Alice\"}",
+                "{\"title\":\"Post 1\"}",
+                ["{}"],
+                ["AUTHORED"],
+                "1",
+                "2",
+                1,
+                "User",
+                "Post"
+            ]),
+        );
+
+        let path = transform_vlp_path(&row, "p", &schema, &[], &[], &[])
+            .expect("9-field multi-type VLP tuple should decode to a Path");
+
+        assert_eq!(path.nodes.len(), 2);
+        assert_eq!(path.relationships.len(), 1);
+        assert_eq!(path.relationships[0].rel_type, "AUTHORED");
+    }
+
+    /// #486: an unrecognized tuple shape (neither 3 nor >=9 fields) must fail
+    /// loudly with a clear message rather than silently misinterpreting
+    /// fields.
+    #[test]
+    fn test_transform_vlp_path_unrecognized_tuple_shape_errors() {
+        let schema = GraphSchema::build(1, "test".to_string(), HashMap::new(), HashMap::new());
+
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("p".to_string(), serde_json::json!([1, 2, 3, 4, 5]));
+
+        let err = transform_vlp_path(&row, "p", &schema, &[], &[], &[])
+            .expect_err("5-field tuple is neither standard (3) nor multi-type (9+) shape");
+        assert!(err.contains("expected 3"), "unexpected error text: {err}");
+    }
+
+    /// #1334: parallel relationships (one type, one pair of nodes) are told
+    /// apart by their `edge_id`, which their element ids (and so their Bolt
+    /// numbers) carry: the bound plan returns the element id the SQL spells
+    /// (`REL_ELEMENT_ID_KEY`), taken as is, whatever the properties are
+    /// named; a relationship without one is spelled from its ends.
+    #[test]
+    fn parallel_relationships_have_their_own_element_ids() {
+        const YAML: &str = r#"
+name: parallel
+graph_schema:
+  nodes:
+    - {label: U, database: db, table: u, node_id: id, property_mappings: {name: name}}
+  edges:
+    - {type: F, database: db, table: f, from_node: U, to_node: U, from_id: a, to_id: b,
+       edge_id: fid, property_mappings: {w: w, edge_id: fid, elementId: x}}
+    - {type: N, database: db, table: n, from_node: U, to_node: U, from_id: a, to_id: b,
+       property_mappings: {}}
+"#;
+        let schema = crate::graph_catalog::config::GraphSchemaConfig::from_yaml_str(YAML)
+            .unwrap()
+            .to_graph_schema()
+            .unwrap();
+        let key = crate::bound_plan::lower::REL_ELEMENT_ID_KEY;
+        let rel = |rel_type: &str, cols: &[(&str, Value)]| {
+            let row: HashMap<String, Value> = cols
+                .iter()
+                .map(|(k, v)| (format!("r.{k}"), v.clone()))
+                .collect();
+            transform_to_relationship(
+                &row,
+                "r",
+                &[rel_type.to_string()],
+                Some("U"),
+                Some("U"),
+                &schema,
+            )
+            .unwrap()
+        };
+        let parallel = |fid: &str, element_id: &str| {
+            rel(
+                "F",
+                &[
+                    ("#fromId", Value::from(6)),
+                    ("#toId", Value::from(7)),
+                    ("w", Value::from(1)),
+                    ("edge_id", Value::from(fid)),
+                    ("elementId", Value::from("p")),
+                    (key, Value::from(element_id)),
+                ],
+            )
+        };
+        let (a, b) = (parallel("10", "F:10:6->7-"), parallel("11", "F:11:6->7-"));
+        assert_eq!(a.element_id, "F:10:6->7-");
+        assert_eq!(b.element_id, "F:11:6->7-");
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.start_node_element_id, "U:6-");
+        // Properties named `edge_id` and `elementId` stay properties.
+        assert_eq!(a.properties.get("edge_id"), Some(&Value::from("10")));
+        assert_eq!(a.properties.get("elementId"), Some(&Value::from("p")));
+        assert_eq!(a.properties.len(), 3);
+        // Without the SQL's: from its type and ends.
+        let n = rel(
+            "N",
+            &[("#fromId", Value::from(6)), ("#toId", Value::from(7))],
+        );
+        assert_eq!(n.element_id, "N:6->7-");
+        // #1521: properties named like the end columns (`from_id`, `to_id`,
+        // and a numbered `from_id_1`) stay properties: they neither spell
+        // the ends nor are dropped as end columns.
+        let c = rel(
+            "N",
+            &[
+                ("#fromId", Value::from(6)),
+                ("#toId", Value::from(7)),
+                ("from_id", Value::from("pf")),
+                ("to_id", Value::from("pt")),
+                ("from_id_1", Value::from("p1")),
+            ],
+        );
+        assert_eq!(c.element_id, "N:6->7-");
+        assert_eq!(c.start_node_element_id, "U:6-");
+        assert_eq!(c.end_node_element_id, "U:7-");
+        assert_eq!(c.properties.len(), 3);
+        assert_eq!(c.properties.get("from_id"), Some(&Value::from("pf")));
+        assert_eq!(c.properties.get("to_id"), Some(&Value::from("pt")));
+        assert_eq!(c.properties.get("from_id_1"), Some(&Value::from("p1")));
+    }
+}

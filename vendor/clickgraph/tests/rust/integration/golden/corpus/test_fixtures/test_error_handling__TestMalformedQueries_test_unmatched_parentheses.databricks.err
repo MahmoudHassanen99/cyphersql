@@ -1,0 +1,1 @@
+parse error: Parsing Failure: OpenCypherParsingError { errors: [("MATCH (a:TestUser\n            RETURN a.name", "Unexpected tokens after query"), ("MATCH (a:TestUser\n            RETURN a.name", "Unparsed input")] }

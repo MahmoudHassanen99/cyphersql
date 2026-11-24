@@ -1,0 +1,2942 @@
+use std::{collections::HashMap, sync::Arc, time::Instant};
+
+use axum::{
+    extract::State,
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use clickhouse::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{
+    config::SchemaPersistenceMode,
+    graph_catalog::graph_schema::{GraphSchema, GraphSchemaElement},
+    graph_catalog::{DraftOptions, DraftRequest, EdgeHint, FkEdgeHint, NodeHint, SchemaDiscovery},
+    open_cypher_parser::{self, ast::CypherStatement},
+    query_planner::{self, types::QueryType},
+};
+
+use super::{
+    graph_catalog,
+    metrics::{self, ErrorClass, Outcome, QuerySample},
+    models::{GraphQueryResponse, OutputFormat, QueryRequest, QueryStats, SqlOnlyResponse},
+    parameter_substitution, query_cache,
+    query_context::{with_query_context, QueryContext},
+    schema_registry, AppState, GLOBAL_QUERY_CACHE, GLOBAL_SERVER_METRICS,
+};
+
+/// Record a completed query into the global registry (no-op if metrics are off
+/// or uninitialized). Pulls any ClickHouse-side stats captured for this query.
+/// `has_phase_breakdown` says whether the sample's parse/plan/render/sqlgen
+/// times are real measurements (the full pipeline ran) — true records the
+/// phase histograms, false (a cache hit, or a sample whose phases were not
+/// all measured) reads only total and execution — and the OTLP span takes
+/// its breakdown gate from the same field.
+fn record_query_with(
+    metrics: &QueryPerformanceMetrics,
+    query_text: &str,
+    outcome: Outcome,
+    schema: Option<&str>,
+    has_phase_breakdown: bool,
+) {
+    // `query_handler` records the requests no site recorded (#1500).
+    let _ = REQUEST_RECORD.try_with(|r| r.borrow_mut().recorded = true);
+    if let Some(reg) = GLOBAL_SERVER_METRICS.get() {
+        reg.record_query(&QuerySample {
+            metrics,
+            outcome,
+            has_phase_breakdown,
+            query_text: Some(query_text),
+            schema,
+            ch: metrics::current_ch_stats(),
+        });
+    }
+}
+
+fn record_query(
+    metrics: &QueryPerformanceMetrics,
+    query_text: &str,
+    outcome: Outcome,
+    schema: Option<&str>,
+) {
+    record_query_with(metrics, query_text, outcome, schema, true);
+}
+
+/// A cache hit is still a query: record it, so tracing keeps one span per
+/// query instead of covering only the queries that missed the cache.
+///
+/// No phase ran again for the hit — parse/plan/render/sqlgen are zeros — so
+/// the record spells has-phase-breakdown false (metrics read only the total
+/// and execution histograms). The type is the classification stored with the
+/// template (`query_type`), so a cached read is still counted under `read`
+/// instead of flipping to `other`; a cache without one (older entries, the
+/// un-classified insert) falls back to `other`.
+///
+/// `execution_time` is the caller's metric: real on an executed hit, left at
+/// zero on a sql_only hit, where nothing was executed.
+fn record_cache_hit(
+    metrics: &mut QueryPerformanceMetrics,
+    query_text: &str,
+    schema: Option<&str>,
+    query_type: Option<&str>,
+) {
+    metrics.query_type = query_type.unwrap_or("other").to_string();
+    record_query_with(metrics, query_text, Outcome::Ok, schema, false);
+}
+
+/// Merge view_parameters and query parameters into a single HashMap
+///
+/// Both view_parameters and parameters can contain values that need to be substituted
+/// in the SQL template. View parameters (like tenant_id) and query parameters (like $userId)
+/// are merged, with query parameters taking precedence in case of conflicts.
+fn merge_parameters(
+    query_params: &Option<std::collections::HashMap<String, Value>>,
+    view_params: &Option<std::collections::HashMap<String, Value>>,
+) -> Option<std::collections::HashMap<String, Value>> {
+    match (query_params, view_params) {
+        (None, None) => None,
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(v)) => Some(v.clone()),
+        (Some(p), Some(v)) => {
+            let mut merged = v.clone();
+            merged.extend(p.clone()); // Query params override view params
+            Some(merged)
+        }
+    }
+}
+
+/// Performance metrics for query execution
+#[derive(Debug, Clone)]
+pub struct QueryPerformanceMetrics {
+    pub total_time: f64,
+    pub parse_time: f64,
+    pub planning_time: f64,
+    pub render_time: f64,
+    pub sql_generation_time: f64,
+    pub execution_time: f64,
+    pub query_type: String,
+    pub sql_queries_count: usize,
+    pub result_rows: Option<usize>,
+}
+
+impl Default for QueryPerformanceMetrics {
+    fn default() -> Self {
+        Self {
+            total_time: 0.0,
+            parse_time: 0.0,
+            planning_time: 0.0,
+            render_time: 0.0,
+            sql_generation_time: 0.0,
+            execution_time: 0.0,
+            query_type: "unknown".to_string(),
+            sql_queries_count: 0,
+            result_rows: None,
+        }
+    }
+}
+
+/// Response for SHOW DATABASES command (Neo4j browser compatibility)
+#[derive(Debug, Clone, Serialize)]
+pub struct DatabaseListResponse {
+    pub databases: Vec<serde_json::Value>,
+}
+
+impl QueryPerformanceMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn log_performance(&self, query: &str) {
+        log::info!(
+            "Query performance - Total: {:.3}ms, Parse: {:.3}ms, Planning: {:.3}ms, Render: {:.3}ms, SQL Gen: {:.3}ms, Exec: {:.3}ms, Type: {}, Queries: {}, Rows: {}",
+            self.total_time * 1000.0,
+            self.parse_time * 1000.0,
+            self.planning_time * 1000.0,
+            self.render_time * 1000.0,
+            self.sql_generation_time * 1000.0,
+            self.execution_time * 1000.0,
+            self.query_type,
+            self.sql_queries_count,
+            self.result_rows
+                .map_or("N/A".to_string(), |r| r.to_string())
+        );
+
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "Performance breakdown for query: {}",
+                query.chars().take(100).collect::<String>()
+            );
+        }
+    }
+
+    pub fn to_stats(&self) -> QueryStats {
+        QueryStats {
+            total_time_ms: self.total_time * 1000.0,
+            parse_time_ms: self.parse_time * 1000.0,
+            planning_time_ms: self.planning_time * 1000.0,
+            render_time_ms: self.render_time * 1000.0,
+            sql_generation_time_ms: self.sql_generation_time * 1000.0,
+            execution_time_ms: self.execution_time * 1000.0,
+            query_type: self.query_type.clone(),
+            result_rows: self.result_rows,
+        }
+    }
+
+    pub fn to_headers(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "X-Query-Total-Time".to_string(),
+                format!("{:.3}ms", self.total_time * 1000.0),
+            ),
+            (
+                "X-Query-Parse-Time".to_string(),
+                format!("{:.3}ms", self.parse_time * 1000.0),
+            ),
+            (
+                "X-Query-Planning-Time".to_string(),
+                format!("{:.3}ms", self.planning_time * 1000.0),
+            ),
+            (
+                "X-Query-Render-Time".to_string(),
+                format!("{:.3}ms", self.render_time * 1000.0),
+            ),
+            (
+                "X-Query-SQL-Gen-Time".to_string(),
+                format!("{:.3}ms", self.sql_generation_time * 1000.0),
+            ),
+            (
+                "X-Query-Execution-Time".to_string(),
+                format!("{:.3}ms", self.execution_time * 1000.0),
+            ),
+            ("X-Query-Type".to_string(), self.query_type.clone()),
+            (
+                "X-Query-SQL-Count".to_string(),
+                self.sql_queries_count.to_string(),
+            ),
+        ]
+    }
+}
+
+/// Simple health check endpoint
+pub async fn health_check() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "service": "clickgraph",
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+/// Simple test endpoint
+pub async fn simple_test_handler() -> impl IntoResponse {
+    "Hello from simple test"
+}
+
+/// JSON helper: current query-cache metrics, or `null` when the cache is absent.
+fn cache_metrics_json() -> serde_json::Value {
+    match GLOBAL_QUERY_CACHE.get() {
+        Some(cache) => {
+            let m = cache.metrics();
+            serde_json::json!({
+                "hits": m.hits,
+                "misses": m.misses,
+                "evictions": m.evictions,
+                "hit_rate": m.hit_rate(),
+                "size": m.size,
+                "size_bytes": m.size_bytes,
+                "max_entries": m.max_entries,
+                "max_size_bytes": m.max_size_bytes,
+            })
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
+/// JSON helper: connection-pool stats, or `null` in embedded/Databricks modes.
+async fn pool_stats_json(app_state: &AppState) -> serde_json::Value {
+    match &app_state.pool {
+        Some(pool) => {
+            let s = pool.stats().await;
+            serde_json::json!({
+                "total_role_pools": s.total_role_pools,
+                "roles": s.roles,
+                "node_count": s.node_count,
+                "cluster_name": s.cluster_name,
+            })
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
+/// `GET /metrics` — Prometheus exposition format. 404 when metrics are disabled.
+pub async fn metrics_handler(State(app_state): State<Arc<AppState>>) -> Response {
+    let Some(reg) = GLOBAL_SERVER_METRICS.get() else {
+        return (StatusCode::NOT_FOUND, "metrics not initialized").into_response();
+    };
+    if !reg.enabled() {
+        return (StatusCode::NOT_FOUND, "metrics disabled").into_response();
+    }
+
+    let mut out = String::with_capacity(2048);
+    reg.render_prometheus(&mut out);
+
+    // Append cache + pool gauges (sourced from their own registries).
+    use std::fmt::Write;
+    if let Some(cache) = GLOBAL_QUERY_CACHE.get() {
+        let m = cache.metrics();
+        let _ = writeln!(out, "# TYPE clickgraph_cache_hits_total counter");
+        let _ = writeln!(out, "clickgraph_cache_hits_total {}", m.hits);
+        let _ = writeln!(out, "# TYPE clickgraph_cache_misses_total counter");
+        let _ = writeln!(out, "clickgraph_cache_misses_total {}", m.misses);
+        let _ = writeln!(out, "# TYPE clickgraph_cache_evictions_total counter");
+        let _ = writeln!(out, "clickgraph_cache_evictions_total {}", m.evictions);
+        let _ = writeln!(out, "# TYPE clickgraph_cache_size gauge");
+        let _ = writeln!(out, "clickgraph_cache_size {}", m.size);
+        let _ = writeln!(out, "# TYPE clickgraph_cache_size_bytes gauge");
+        let _ = writeln!(out, "clickgraph_cache_size_bytes {}", m.size_bytes);
+    }
+    if let Some(pool) = &app_state.pool {
+        let s = pool.stats().await;
+        let _ = writeln!(out, "# TYPE clickgraph_pool_role_pools gauge");
+        let _ = writeln!(out, "clickgraph_pool_role_pools {}", s.total_role_pools);
+        let _ = writeln!(out, "# TYPE clickgraph_pool_node_count gauge");
+        let _ = writeln!(out, "clickgraph_pool_node_count {}", s.node_count);
+    }
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        out,
+    )
+        .into_response()
+}
+
+/// `GET /stats` — JSON snapshot of counters, latency percentiles, cache, pool.
+pub async fn stats_handler(State(app_state): State<Arc<AppState>>) -> Response {
+    let Some(reg) = GLOBAL_SERVER_METRICS.get() else {
+        return (StatusCode::NOT_FOUND, "metrics not initialized").into_response();
+    };
+    if !reg.enabled() {
+        return (StatusCode::NOT_FOUND, "metrics disabled").into_response();
+    }
+
+    let snapshot = reg.snapshot();
+    let body = serde_json::json!({
+        "service": "clickgraph",
+        "version": env!("CARGO_PKG_VERSION"),
+        "metrics": snapshot,
+        "cache": cache_metrics_json(),
+        "pool": pool_stats_json(&app_state).await,
+    });
+    Json(body).into_response()
+}
+
+/// `GET /stats/queries?recent=N&slowest=N` — slow-query ring buffer view.
+pub async fn stats_queries_handler(
+    State(_app_state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let Some(reg) = GLOBAL_SERVER_METRICS.get() else {
+        return (StatusCode::NOT_FOUND, "metrics not initialized").into_response();
+    };
+    if !reg.enabled() {
+        return (StatusCode::NOT_FOUND, "metrics disabled").into_response();
+    }
+
+    let parse_n = |key: &str, default: usize| {
+        params
+            .get(key)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+            .min(1000)
+    };
+    let recent = parse_n("recent", 20);
+    let slowest = parse_n("slowest", 20);
+
+    Json(serde_json::json!({
+        "recent": reg.recent_queries(recent),
+        "slowest": reg.slowest_queries(slowest),
+    }))
+    .into_response()
+}
+
+pub async fn query_handler(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<QueryRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    let start_time = Instant::now();
+    //Owned here: the body consumes the payload, and the record below wants the
+    // raw text the client sent even when the failure happens before it is
+    // parsed. Cloned only when the metrics registry is up — the only reader —
+    // so a server with metrics off does not copy every request body.
+    let raw_query = if GLOBAL_SERVER_METRICS.get().is_some() {
+        payload.query.clone()
+    } else {
+        String::new()
+    };
+    let Some(reg) = GLOBAL_SERVER_METRICS.get() else {
+        return query_handler_body(app_state, payload, start_time).await;
+    };
+    // The request's one record (#1500). Queries that run the pipeline are
+    // recorded at the inner finalization sites, with their phase breakdown;
+    // every other answer — a procedure, SHOW DATABASES, COPY TO, an export,
+    // a capacity rejection, any `Err` — is recorded here, from the status it
+    // returns. The flag in `REQUEST_RECORD` keeps it to one record. (Axum
+    // extractor rejections — malformed JSON, the body cap — fail before this
+    // handler runs, so they sit outside the one-record-per-request promise.)
+    let (result, record, ch) = REQUEST_RECORD
+        .scope(
+            std::cell::RefCell::new(RequestRecord::default()),
+            metrics::with_ch_stats_scope(async {
+                let result = query_handler_body(app_state, payload, start_time).await;
+                let record = REQUEST_RECORD.with(|r| std::mem::take(&mut *r.borrow_mut()));
+                (result, record, metrics::current_ch_stats())
+            }),
+        )
+        .await;
+    if !record.recorded {
+        let status = match &result {
+            Ok(response) => response.status(),
+            Err((status, _)) => *status,
+        };
+        let outcome = if status.is_success() {
+            Outcome::Ok
+        } else {
+            Outcome::Err(ErrorClass::from_status(status.as_u16()))
+        };
+        // A schema label (only spans read it) for a success, on a schema
+        // that is loaded: the request can name one that does not exist.
+        let schema = match (&record.schema, outcome) {
+            (Some(name), Outcome::Ok)
+                if reg.tracing_enabled() && graph_catalog::schema_exists(name).await =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
+        };
+        let m = QueryPerformanceMetrics {
+            total_time: start_time.elapsed().as_secs_f64(),
+            query_type: record.query_type.unwrap_or("other").to_string(),
+            ..QueryPerformanceMetrics::default()
+        };
+        reg.record_query(&QuerySample {
+            metrics: &m,
+            outcome,
+            has_phase_breakdown: false,
+            query_text: Some(&raw_query),
+            // A failure can come before or after the schema is resolved (and
+            // can name one that does not exist): no schema attribute for it
+            // (an omitted attribute, not an "unknown" value).
+            schema,
+            ch,
+        });
+    }
+    result
+}
+
+/// What [`query_handler`] knows of the request it records (#1500): whether
+/// an inner finalization site recorded it, and the type and schema of a
+/// request answered before those sites.
+#[derive(Default)]
+struct RequestRecord {
+    recorded: bool,
+    query_type: Option<&'static str>,
+    schema: Option<String>,
+}
+
+tokio::task_local! {
+    static REQUEST_RECORD: std::cell::RefCell<RequestRecord>;
+}
+
+/// Note the type of the request (for its record when no finalization site
+/// records it).
+fn note_request_type(query_type: &'static str) {
+    let _ = REQUEST_RECORD.try_with(|r| r.borrow_mut().query_type = Some(query_type));
+}
+
+/// Note the schema the request runs on.
+fn note_request_schema(schema: &str) {
+    let _ = REQUEST_RECORD.try_with(|r| r.borrow_mut().schema = Some(schema.to_string()));
+}
+
+async fn query_handler_body(
+    app_state: Arc<AppState>,
+    payload: QueryRequest,
+    start_time: Instant,
+) -> Result<Response, (StatusCode, String)> {
+    // Acquire concurrency permit if semaphore is configured
+    let _permit = if let Some(sem) = app_state.query_semaphore.clone() {
+        match sem.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                log::warn!(
+                    "Query rejected: max concurrent queries ({}) reached",
+                    app_state.config.max_concurrent_queries
+                );
+                // Recorded by `query_handler` (a 503: `capacity`).
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "Server is at maximum query capacity. Please retry later.",
+                        "max_concurrent_queries": app_state.config.max_concurrent_queries
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Increment the in-flight gauge for the lifetime of this request. The RAII
+    // guard decrements on every return path (incl. the many early returns and
+    // panics) in this handler.
+    let _inflight = GLOBAL_SERVER_METRICS.get().map(|reg| reg.in_flight_guard());
+
+    let metrics = QueryPerformanceMetrics::new();
+
+    log::debug!("Query handler called with query: {}", payload.query);
+
+    // Extract all needed fields from payload BEFORE any partial moves
+    // Use clone() or take() to avoid partial move issues
+    let output_format = payload.format.clone().unwrap_or(OutputFormat::JSONEachRow);
+    let sql_only = payload.sql_only.unwrap_or(false);
+    let query_string = payload.query.clone();
+    let schema_name_param = payload.schema_name.clone();
+
+    // The statement front end (`translate::prepared`, shared with Bolt and
+    // the embedded connection): the prelude (`CYPHER replan=..`, EXPLAIN /
+    // PROFILE) is read once, comments are stripped, and the statement's
+    // graph is chosen by the one rule: the first arm's USE, else
+    // `schema_name`, else the default schema (a later arm's USE naming
+    // another graph is refused, #1370).
+    let prepared = crate::translate::PreparedStatement::parse(&query_string)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let replan_option = prepared.prelude.replan;
+    if prepared.prelude.mode != crate::translate::prepared::ExecutionMode::Run {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Not supported: EXPLAIN / PROFILE over HTTP (`sql_only: true` returns the SQL a \
+             query runs)"
+                .to_string(),
+        ));
+    }
+    let graph_name = prepared
+        .targets
+        .graph(schema_name_param.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    note_request_schema(&graph_name);
+    let clean_query = prepared.prelude.text;
+
+    // Handle SHOW DATABASES early (special case for Neo4j browser compatibility)
+    let clean_upper = clean_query.trim().to_uppercase();
+    if clean_upper.starts_with("SHOW DATABASES") {
+        note_request_type("procedure");
+        log::info!("📊 SHOW DATABASES query detected - returning available schemas");
+
+        // Use shared SHOW DATABASES implementation
+        let databases_result = crate::procedures::show_databases::execute_show_databases();
+
+        let databases: Vec<serde_json::Value> = match databases_result {
+            Ok(db_list) => db_list
+                .into_iter()
+                .map(|db| {
+                    serde_json::to_value(db).expect("a database description serializes to JSON")
+                })
+                .collect(),
+            Err(e) => {
+                log::error!("Failed to execute SHOW DATABASES: {}", e);
+                vec![]
+            }
+        };
+
+        let response = DatabaseListResponse { databases };
+        return Ok(Json(response).into_response());
+    }
+
+    // Intercept apoc.meta.schema MCP queries that use UNWIND + map projection.
+    // The procedure executor can handle simple CALL, but the MCP query pattern
+    // (UNWIND keys(value) AS key WITH key, value[key] ...) cannot be parsed/executed.
+    // Simple CALL apoc.meta.schema() falls through to the normal procedure dispatch below.
+    if clean_upper.contains("APOC.META.SCHEMA") && clean_upper.contains("UNWIND") {
+        note_request_type("procedure");
+        log::info!("Detected apoc.meta.schema MCP query — short-circuiting with unwound results");
+
+        let schema_name = graph_name.clone();
+
+        let schema_guard = crate::server::GLOBAL_SCHEMAS.get().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Schema registry not initialized".to_string(),
+            )
+        })?;
+        let schemas = schema_guard.read().await;
+        let schema = schemas.get(&schema_name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Schema not found: {}", schema_name),
+            )
+        })?;
+
+        match crate::procedures::apoc_meta_schema::execute_unwound(schema) {
+            Ok(results) => {
+                let response_json = crate::procedures::executor::format_as_json(results);
+                return Ok(Json(response_json).into_response());
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("apoc.meta.schema execution failed: {}", e),
+                ));
+            }
+        }
+    }
+
+    // ── COPY TO export statements ──
+    // Intercept COPY (<cypher>) TO '<dest>' before procedure or query dispatch.
+    // Extract all owned data in a sync block so no borrows persist across .await.
+    let copy_to_params = if clean_upper.starts_with("COPY") {
+        if let Ok((_, CypherStatement::CopyTo(copy_stmt))) =
+            open_cypher_parser::parse_cypher_statement(&clean_query)
+        {
+            let inner_query = copy_stmt.query.to_string();
+            let destination = copy_stmt.destination.to_string();
+            let ch_format = if let Some(fmt) = copy_stmt.format {
+                crate::procedures::apoc_export::format_from_copy_format(fmt)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+            } else {
+                crate::procedures::apoc_export::format_from_extension(&destination)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "Cannot determine format from extension of '{}'. Use FORMAT clause.",
+                                destination
+                            ),
+                        )
+                    })?
+            };
+            let config =
+                crate::procedures::apoc_export::ExportConfig::from_copy_options(&copy_stmt.options);
+            Some((inner_query, destination, ch_format, config))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((inner_query, destination, ch_format, config)) = copy_to_params {
+        note_request_type("read");
+        log::info!("Detected COPY TO: destination={}", destination);
+        let export_start = Instant::now();
+
+        // The inner query's USE, else the request's schema.
+        let schema_name_for_export = graph_name.clone();
+        let graph_schema =
+            match graph_catalog::get_graph_schema_by_name(&schema_name_for_export).await {
+                Ok(s) => s,
+                Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+            };
+
+        // Translate inside a task-local QueryContext so set_current_schema() works
+        let context = QueryContext::new(Some(schema_name_for_export.clone()));
+        let export_sql = with_query_context(context, async {
+            crate::server::query_context::set_current_schema(Arc::new(graph_schema.clone()));
+
+            let inner_sql = translate_cypher_to_sql(
+                &inner_query,
+                &graph_schema,
+                &schema_name_for_export,
+                request_id_mapper(&schema_name_for_export, &payload),
+            )?;
+
+            crate::procedures::apoc_export::build_export_sql(
+                &inner_sql,
+                &destination,
+                ch_format,
+                &config,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+        })
+        .await?;
+
+        log::debug!("COPY TO SQL: {}", export_sql);
+
+        // If sql_only, return the SQL
+        if sql_only {
+            let response = SqlOnlyResponse {
+                cypher_query: payload.query.clone(),
+                // #1314: carry the semantic session settings.
+                generated_sql: crate::sql_generator::portable_sql(
+                    &export_sql,
+                    crate::server::query_context::get_current_dialect(),
+                ),
+                execution_mode: "sql_only".to_string(),
+            };
+            return Ok(Json(response).into_response());
+        }
+
+        // Execute
+        let role = payload.role.as_deref();
+        match app_state
+            .executor
+            .execute_text(&export_sql, "TabSeparated", role)
+            .await
+        {
+            Ok(_) => {
+                log::info!(
+                    "COPY TO completed in {:.3} seconds",
+                    export_start.elapsed().as_secs_f64()
+                );
+                let response = serde_json::json!({
+                    "file": destination,
+                    "format": ch_format,
+                    "source": inner_query,
+                });
+                return Ok(Json(response).into_response());
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("COPY TO execution failed: {}", e),
+                ));
+            }
+        }
+    }
+
+    // Handle procedure calls early (before query context)
+    // Parse to check if it's a procedure call or procedure-only query
+    let (_is_procedure, is_union, proc_name_opt) =
+        if let Ok((_, parsed_stmt)) = open_cypher_parser::parse_cypher_statement(&clean_query) {
+            log::debug!("Parse succeeded for query: {}", &clean_query);
+
+            // Check if it's a procedure-only statement
+            let proc_check = crate::procedures::is_procedure_only_statement(&parsed_stmt);
+
+            // Check if it's a procedure UNION
+            let union_check = crate::procedures::is_procedure_union_query(&parsed_stmt);
+            log::debug!(
+                "Procedure check: {}, Union check: {}",
+                proc_check,
+                union_check
+            );
+
+            // Extract procedure name for standalone procedures (non-UNION)
+            let proc_name = if proc_check && !union_check {
+                match &parsed_stmt {
+                    CypherStatement::ProcedureCall(proc_call) => {
+                        Some(proc_call.procedure_name.to_string())
+                    }
+                    CypherStatement::Query { query, .. } => query
+                        .call_clause
+                        .as_ref()
+                        .map(|cc| cc.procedure_name.to_string()),
+                    CypherStatement::CopyTo(_) => None,
+                }
+            } else {
+                None
+            };
+
+            (proc_check, union_check, proc_name)
+        } else {
+            log::debug!("Parse FAILED for query: {}", &clean_query);
+            (false, false, None)
+        };
+
+    if is_union || proc_name_opt.is_some() {
+        note_request_type("procedure");
+    }
+    if is_union {
+        log::info!("Executing UNION ALL of procedures");
+
+        // Extract procedure names BEFORE any async calls
+        let proc_names = match crate::procedures::extract_procedure_names_from_union(&clean_query) {
+            Ok(names) => names,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to parse UNION query: {}", e),
+                ));
+            }
+        };
+
+        let registry = crate::procedures::ProcedureRegistry::new();
+        let schema_name = graph_name.clone();
+
+        // Now execute (no lifetimes involved), each branch with its tail
+        let results = async {
+            let mut all = Vec::new();
+            for (branch, proc_name) in proc_names.iter().enumerate() {
+                let rows = crate::procedures::executor::execute_procedure_by_name(
+                    proc_name,
+                    &schema_name,
+                    &registry,
+                )
+                .await?;
+                all.extend(crate::procedures::executor::apply_statement_tail(
+                    rows,
+                    &clean_query,
+                    branch,
+                )?);
+            }
+            Ok::<_, String>(all)
+        }
+        .await;
+
+        match results {
+            Ok(r) => {
+                let response_json = crate::procedures::executor::format_as_json(r);
+                return Ok(Json(response_json).into_response());
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Procedure union execution failed: {}", e),
+                ));
+            }
+        }
+    }
+
+    if let Some(proc_name) = proc_name_opt {
+        log::info!("Executing procedure: {}", proc_name);
+
+        if crate::procedures::is_sql_procedure(&proc_name) {
+            if let Ok((_, stmt)) = open_cypher_parser::parse_cypher_statement(&clean_query) {
+                crate::procedures::executor::sql_procedure_tail_refused(&stmt)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            }
+        }
+
+        // ── Export procedures: apoc.export.{csv|json|parquet}.query() ──
+        // These need SQL execution (not just schema introspection), so they
+        // bypass ProcedureRegistry and run the inner Cypher → SQL pipeline.
+        if crate::procedures::apoc_export::is_export_procedure(&proc_name) {
+            // An export runs a read, as COPY TO does.
+            note_request_type("read");
+            log::info!("Detected export procedure: {}", proc_name);
+
+            let export_start = Instant::now();
+
+            // Determine the output format from the procedure name
+            let ch_format = crate::procedures::apoc_export::format_from_procedure_name(&proc_name)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            // Re-parse to extract arguments (parser is fast, export is rare)
+            let export_args = {
+                let (_, stmt) =
+                    open_cypher_parser::parse_cypher_statement(&clean_query).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to parse export call: {}", e),
+                        )
+                    })?;
+                // StandaloneProcedureCall has Vec<Expression> arguments;
+                // CallClause (in-query CALL) has Vec<CallArgument> with .value field.
+                let expressions: Vec<_> = match &stmt {
+                    CypherStatement::ProcedureCall(pc) => pc.arguments.iter().collect(),
+                    CypherStatement::Query { query, .. } => {
+                        let cc = query.call_clause.as_ref().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "No CALL clause found in export query".to_string(),
+                            )
+                        })?;
+                        cc.arguments.iter().map(|a| &a.value).collect()
+                    }
+                    CypherStatement::CopyTo(_) => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "COPY TO statements are handled separately".to_string(),
+                        ));
+                    }
+                };
+                crate::procedures::apoc_export::parse_export_call(&expressions)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+            };
+
+            let schema_name_for_export = graph_name.clone();
+            let graph_schema =
+                match graph_catalog::get_graph_schema_by_name(&schema_name_for_export).await {
+                    Ok(s) => s,
+                    Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+                };
+            // Translate inner Cypher → SQL and build INSERT INTO FUNCTION ...
+            // SELECT ... inside a task-local QueryContext (as COPY TO does):
+            // this runs before the /query context opens, and outside one
+            // set_current_schema() is a no-op and translation would read
+            // process-global state.
+            let context = QueryContext::new(Some(schema_name_for_export.clone()));
+            let export_sql = with_query_context(context, async {
+                crate::server::query_context::set_current_schema(Arc::new(graph_schema.clone()));
+                let inner_sql = translate_cypher_to_sql(
+                    &export_args.cypher_query,
+                    &graph_schema,
+                    &schema_name_for_export,
+                    request_id_mapper(&schema_name_for_export, &payload),
+                )?;
+                crate::procedures::apoc_export::build_export_sql(
+                    &inner_sql,
+                    &export_args.destination,
+                    ch_format,
+                    &export_args.config,
+                )
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))
+            })
+            .await?;
+
+            log::info!("Export SQL: {}", export_sql);
+
+            // If sql_only, return the SQL
+            if sql_only {
+                let response = SqlOnlyResponse {
+                    cypher_query: payload.query.clone(),
+                    // #1314: carry the semantic session settings.
+                    generated_sql: crate::sql_generator::portable_sql(
+                        &export_sql,
+                        crate::server::query_context::get_current_dialect(),
+                    ),
+                    execution_mode: "sql_only".to_string(),
+                };
+                return Ok(Json(response).into_response());
+            }
+
+            // Execute the export SQL (INSERT produces no result rows)
+            let role = payload.role.as_deref();
+            match app_state
+                .executor
+                .execute_text(&export_sql, "TabSeparated", role)
+                .await
+            {
+                Ok(_) => {
+                    log::info!(
+                        "Export completed in {:.3} seconds",
+                        export_start.elapsed().as_secs_f64()
+                    );
+                    let response = serde_json::json!({
+                        "file": export_args.destination,
+                        "format": ch_format,
+                        "source": export_args.cypher_query,
+                    });
+                    return Ok(Json(response).into_response());
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Export execution failed: {}", e),
+                    ));
+                }
+            }
+        }
+
+        // ── Vector search procedures: db.index.vector.queryNodes ──
+        // These bypass ProcedureRegistry because they need ClickHouse execution.
+        if crate::procedures::vector_search::is_vector_search_procedure(&proc_name) {
+            log::info!("Detected vector search procedure");
+
+            let search_start = Instant::now();
+
+            // Re-parse to extract the arguments
+            let search_args;
+            {
+                let (_, stmt) =
+                    open_cypher_parser::parse_cypher_statement(&clean_query).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to parse vector search call: {}", e),
+                        )
+                    })?;
+                let expressions: Vec<_> = match &stmt {
+                    CypherStatement::ProcedureCall(pc) => pc.arguments.iter().collect(),
+                    CypherStatement::Query { query, .. } => {
+                        let cc = query.call_clause.as_ref().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "No CALL clause found in vector search query".to_string(),
+                            )
+                        })?;
+                        cc.arguments.iter().map(|a| &a.value).collect()
+                    }
+                    CypherStatement::CopyTo(_) => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "Unexpected COPY TO in vector search context".to_string(),
+                        ));
+                    }
+                };
+                search_args =
+                    crate::procedures::vector_search::parse_vector_search_args(&expressions)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            }
+
+            let schema_name_for_search = graph_name.clone();
+            let graph_schema = graph_catalog::get_graph_schema_by_name(&schema_name_for_search)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            let index_config = crate::procedures::vector_search::resolve_vector_index(
+                &graph_schema,
+                &search_args.index_name,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            // Generate SQL
+            let search_sql = crate::procedures::vector_search::build_vector_search_sql(
+                &search_args,
+                index_config,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            log::debug!(
+                "Vector search: index='{}', top_k={}, sql_length={}",
+                search_args.index_name,
+                search_args.top_k,
+                search_sql.len()
+            );
+
+            // If sql_only, return the SQL
+            if sql_only {
+                let response = SqlOnlyResponse {
+                    cypher_query: payload.query.clone(),
+                    generated_sql: search_sql,
+                    execution_mode: "sql_only".to_string(),
+                };
+                return Ok(Json(response).into_response());
+            }
+
+            // Execute and return results as JSON
+            let role = payload.role.as_deref();
+            match app_state
+                .executor
+                .execute_text(&search_sql, "JSONEachRow", role)
+                .await
+            {
+                Ok(result_text) => {
+                    log::info!(
+                        "Vector search completed in {:.3} seconds",
+                        search_start.elapsed().as_secs_f64()
+                    );
+                    // Parse JSONEachRow response, failing if any row is malformed
+                    let rows: Vec<serde_json::Value> = result_text
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(serde_json::from_str::<serde_json::Value>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to parse ClickHouse JSONEachRow response: {}", e),
+                            )
+                        })?;
+                    return Ok(Json(serde_json::json!(rows)).into_response());
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Vector search execution failed: {}", e),
+                    ));
+                }
+            }
+        }
+
+        // ── Fulltext search procedures: db.index.fulltext.queryNodes ──
+        // Same intercept pattern as vector search.
+        if crate::procedures::fulltext_search::is_fulltext_search_procedure(&proc_name) {
+            log::info!("Detected fulltext search procedure");
+
+            let search_start = Instant::now();
+
+            let search_args;
+            {
+                let (_, stmt) =
+                    open_cypher_parser::parse_cypher_statement(&clean_query).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to parse fulltext search call: {}", e),
+                        )
+                    })?;
+                let expressions: Vec<_> = match &stmt {
+                    CypherStatement::ProcedureCall(pc) => pc.arguments.iter().collect(),
+                    CypherStatement::Query { query, .. } => {
+                        let cc = query.call_clause.as_ref().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "No CALL clause found in fulltext search query".to_string(),
+                            )
+                        })?;
+                        cc.arguments.iter().map(|a| &a.value).collect()
+                    }
+                    CypherStatement::CopyTo(_) => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "Unexpected COPY TO in fulltext search context".to_string(),
+                        ));
+                    }
+                };
+                search_args =
+                    crate::procedures::fulltext_search::parse_fulltext_search_args(&expressions)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            }
+
+            let schema_name_for_search = graph_name.clone();
+            let graph_schema = graph_catalog::get_graph_schema_by_name(&schema_name_for_search)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            let index_config = crate::procedures::fulltext_search::resolve_fulltext_index(
+                &graph_schema,
+                &search_args.index_name,
+            )
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            let search_sql = crate::procedures::fulltext_search::build_fulltext_search_sql(
+                &search_args,
+                index_config,
+            );
+
+            log::debug!(
+                "Fulltext search: index='{}', query='{}', sql_length={}",
+                search_args.index_name,
+                search_args.query_text.chars().take(50).collect::<String>(),
+                search_sql.len()
+            );
+
+            if sql_only {
+                let response = SqlOnlyResponse {
+                    cypher_query: payload.query.clone(),
+                    generated_sql: search_sql,
+                    execution_mode: "sql_only".to_string(),
+                };
+                return Ok(Json(response).into_response());
+            }
+
+            let role = payload.role.as_deref();
+            match app_state
+                .executor
+                .execute_text(&search_sql, "JSONEachRow", role)
+                .await
+            {
+                Ok(result_text) => {
+                    log::info!(
+                        "Fulltext search completed in {:.3} seconds",
+                        search_start.elapsed().as_secs_f64()
+                    );
+                    let rows: Vec<serde_json::Value> = result_text
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(serde_json::from_str::<serde_json::Value>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to parse ClickHouse JSONEachRow response: {}", e),
+                            )
+                        })?;
+                    return Ok(Json(serde_json::json!(rows)).into_response());
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Fulltext search execution failed: {}", e),
+                    ));
+                }
+            }
+        }
+
+        let registry = crate::procedures::ProcedureRegistry::new();
+        let schema_name = graph_name.clone();
+
+        // Check if procedure exists
+        if !registry.contains(&proc_name) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Unknown procedure: {}", proc_name),
+            ));
+        }
+
+        // Execute procedure
+        let results = crate::procedures::executor::execute_procedure_by_name(
+            &proc_name,
+            &schema_name,
+            &registry,
+        )
+        .await;
+
+        match results {
+            Ok(r) => {
+                // What follows the CALL (YIELD, WHERE, RETURN; #1411)
+                let r = crate::procedures::executor::apply_statement_tail(r, &clean_query, 0)
+                    .map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("Procedure query failed: {}", e),
+                        )
+                    })?;
+                let response_json = crate::procedures::executor::format_as_json(r);
+                return Ok(Json(response_json).into_response());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Map known client-side errors (e.g., unknown schema) to 4xx instead of 500.
+                // This keeps INTERNAL_SERVER_ERROR reserved for genuine server failures.
+                if msg.contains("Schema not found") {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        format!("Procedure execution failed: {}", msg),
+                    ));
+                }
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Procedure execution failed: {}", msg),
+                ));
+            }
+        }
+    }
+
+    // Validate the syntax before the schema lookup: a query with a syntax
+    // error gets the syntax error, not a misleading "Schema not found".
+    // `Some`: the syntax error (owned: the parse result must not live across
+    // the await below).
+    let syntax_error = open_cypher_parser::parse_cypher_statement(&clean_query)
+        .err()
+        .map(|e| {
+            log::error!("Query parse failed: {}", e);
+            format!(
+                "Query syntax error: {}. Check Cypher syntax before proceeding.",
+                e
+            )
+        });
+    if let Some(syntax_error) = syntax_error {
+        // Text only the clause-list parser reads (P-4c S10b) is a read query
+        // for the bound plan, which reports whether it translates. Over a
+        // schema that does not exist, the syntax error is still the answer.
+        let text_only = crate::translate::clause_list_parses(&clean_query)
+            && graph_catalog::get_graph_schema_by_name(&graph_name)
+                .await
+                .is_ok();
+        if !text_only {
+            return Err((StatusCode::BAD_REQUEST, syntax_error));
+        }
+    }
+    let schema_name = graph_name;
+    log::debug!("Using schema: {}", schema_name);
+
+    // ✅ TASK-LOCAL CONTEXT: Wrap ALL query processing in with_query_context()
+    // This creates an isolated per-task context that is:
+    // - Automatically available to ALL phases (planning, rendering, SQL generation)
+    // - Isolated from concurrent queries on the same OS thread
+    // - Automatically cleaned up when the task completes
+    let context = QueryContext::new(Some(schema_name.clone()));
+
+    // The ClickHouse-stats slot the executor writes and the finalization
+    // sites read is `query_handler`'s, around the whole request.
+    let result = with_query_context(context, async move {
+        query_handler_inner(
+            app_state,
+            payload,
+            schema_name,
+            clean_query,
+            output_format,
+            sql_only,
+            replan_option,
+            start_time,
+            metrics,
+        )
+        .await
+    })
+    .await;
+
+    result
+}
+
+/// Inner query handler logic - runs within task-local context
+#[allow(clippy::too_many_arguments)] // HTTP query entrypoint: app state, request payload, schema/query/format inputs, sql_only flag, replan policy, plus timing/metrics handles
+async fn query_handler_inner(
+    app_state: Arc<AppState>,
+    payload: QueryRequest,
+    schema_name: String,
+    clean_query: String,
+    output_format: OutputFormat,
+    sql_only: bool,
+    replan_option: query_cache::ReplanOption,
+    start_time: Instant,
+    mut metrics: QueryPerformanceMetrics,
+) -> Result<Response, (StatusCode, String)> {
+    // Convert view_parameters to String values for cache key
+    let vp_strings: Option<HashMap<String, String>> =
+        payload.view_parameters.as_ref().map(|params| {
+            params
+                .iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), s)
+                })
+                .collect()
+        });
+    let cache_key = query_cache::QueryCacheKey::with_view_scope(
+        &clean_query,
+        &schema_name,
+        payload.tenant_id.as_deref(),
+        vp_strings.as_ref(),
+    );
+    let mut cache_status = "MISS";
+
+    // Try cache lookup (unless replan=force or Graph format, which needs the result shape)
+    let cached_sql = if output_format == OutputFormat::Graph {
+        log::debug!("Cache BYPASS for Graph format (needs the result shape)");
+        cache_status = "BYPASS";
+        None
+    } else if replan_option != query_cache::ReplanOption::Force {
+        if let Some(cache) = GLOBAL_QUERY_CACHE.get() {
+            if let Some((sql, query_type)) = cache.get_with_type(&cache_key) {
+                log::debug!("Cache HIT for query");
+                cache_status = "HIT";
+                Some((sql, query_type))
+            } else {
+                log::debug!("Cache MISS for query");
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        if replan_option == query_cache::ReplanOption::Force {
+            log::debug!("Cache BYPASS (replan=force)");
+            cache_status = "BYPASS";
+        }
+        None
+    };
+
+    // If cache hit, substitute parameters and return early
+    if let Some((sql_template, cached_query_type)) = cached_sql {
+        log::info!("Using cached SQL template");
+
+        // Merge view_parameters and query parameters for substitution
+        let all_params = merge_parameters(&payload.parameters, &payload.view_parameters);
+
+        // Substitute parameters if provided
+        let final_sql = if let Some(params) = &all_params {
+            match parameter_substitution::substitute_parameters(&sql_template, params) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Parameter substitution error: {}", e),
+                    ));
+                }
+            }
+        } else {
+            sql_template
+        };
+
+        // Check for unsubstituted $param placeholders before executing
+        if let Some(missing_param) =
+            parameter_substitution::find_unsubstituted_parameter(&final_sql)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Missing required parameter: '{}'. Parameterized views require view_parameters to be provided.", missing_param),
+            ));
+        }
+
+        // If SQL-only mode, return SQL without executing
+        if sql_only {
+            let sql_response = Json(SqlOnlyResponse {
+                cypher_query: payload.query.clone(),
+                // #1314: carry the semantic session settings in the SQL.
+                generated_sql: crate::sql_generator::portable_sql(
+                    &final_sql,
+                    crate::server::query_context::get_current_dialect(),
+                ),
+                execution_mode: "sql_only".to_string(),
+            });
+
+            let mut response = sql_response.into_response();
+            if let Ok(cache_header) = axum::http::HeaderValue::try_from(cache_status) {
+                response
+                    .headers_mut()
+                    .insert("X-Query-Cache-Status", cache_header);
+            }
+            // A cache hit is still a query: record it so tracing covers every
+            // query, not only the ones that happened to miss. Nothing ran for
+            // this response (no phases, no execution): the record spells
+            // has-phase-breakdown false, and execution_time stays 0 — the
+            // template reuse is the whole work of this call.
+            metrics.total_time = start_time.elapsed().as_secs_f64();
+            metrics.sql_queries_count = 1;
+            record_cache_hit(
+                &mut metrics,
+                &payload.query,
+                Some(&schema_name),
+                cached_query_type.as_deref(),
+            );
+            return Ok(response);
+        }
+
+        // Execute query and return
+        let ch_sql_queries = vec![final_sql];
+        let execution_start = Instant::now();
+        let response = execute_cte_queries(
+            app_state,
+            ch_sql_queries,
+            output_format,
+            all_params, // Use merged parameters
+            payload.role.clone(),
+            // A query with `id(r)` items is not cached.
+            &[],
+        )
+        .await;
+        metrics.execution_time = execution_start.elapsed().as_secs_f64();
+
+        let elapsed = start_time.elapsed();
+        metrics.total_time = elapsed.as_secs_f64();
+
+        match response {
+            Ok(mut resp) => {
+                log::info!("✓ Query succeeded (cached) in {:.2}ms", elapsed.as_millis());
+
+                // Add cache status header to response
+                let headers = resp.headers_mut();
+                headers.insert("X-Query-Cache-Status", HeaderValue::from_static("HIT"));
+
+                // Recorded like the sql-only hit above: no phase ran again
+                // for the reused template (has-phase-breakdown false — the
+                // plan/render/sqlgen times are zeros), the type comes from
+                // the cached template, and the total and execution times are
+                // this call's real ones.
+                metrics.sql_queries_count = 1;
+                record_cache_hit(
+                    &mut metrics,
+                    &payload.query,
+                    Some(&schema_name),
+                    cached_query_type.as_deref(),
+                );
+                return Ok(resp);
+            }
+            // Not recorded here: `query_handler` records every `Err` the inner
+            // handler returns, so recording it here as well counted a failing
+            // cache hit twice — once in `queries_failed` and once as a span.
+            Err(e) => return Err(e),
+        }
+    }
+
+    // graph_ctx holds (result shape, GraphSchema) when format=Graph
+    // Result columns holding an element id that JSON results return as
+    // Bolt's number for it (`id(r)`, P-4c S11l).
+    let mut id_number_columns: Vec<String> = Vec::new();
+    let (ch_sql_queries, maybe_schema_elem, is_read, query_type_str, graph_ctx) = {
+        // ✅ FAIL LOUDLY: If schema not found, return clear error (no silent fallback)
+        let graph_schema = match graph_catalog::get_graph_schema_by_name(&schema_name).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                let available = graph_catalog::list_available_schemas().await;
+                log::error!(
+                    "Schema '{}' not found. Available schemas: {:?}",
+                    schema_name,
+                    available
+                );
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{} Available schemas: {:?}", e, available),
+                ));
+            }
+        };
+
+        // Set the resolved schema in task-local context so all downstream
+        // code can access it via get_current_schema() without GLOBAL_SCHEMAS lookups
+        crate::server::query_context::set_current_schema(std::sync::Arc::new(graph_schema.clone()));
+
+        // S1 stats-informed planning: attach the current row-count snapshot
+        // (no-op unless CLICKGRAPH_STATS_ENABLED installed the cache at
+        // startup). Must happen before planning so select_anchor can see it.
+        crate::server::query_context::attach_current_table_stats(&graph_schema).await;
+
+        // Phase 1: Parse query with UNION support
+        // IMPORTANT: Parse the CLEAN query without CYPHER prefix
+        let parse_start = Instant::now();
+        // `None` with the legacy parse error: text only the clause-list
+        // parser reads (P-4c S10b), a read query the bound plan translates
+        // from the text or the error is reported.
+        let (parsed_stmt, legacy_parse_error) =
+            match open_cypher_parser::parse_cypher_statement(&clean_query) {
+                Ok((_remaining, stmt)) => (Some(stmt), None),
+                Err(e) if crate::translate::clause_list_parses(&clean_query) => (
+                    None,
+                    Some(format!(
+                        "Query syntax error: {}. Check Cypher syntax before proceeding.",
+                        e
+                    )),
+                ),
+                Err(e) => {
+                    metrics.parse_time = parse_start.elapsed().as_secs_f64();
+                    log::error!("Query parse failed: {:?}", e);
+                    // Return 400 for parse errors (both sql_only and normal mode)
+                    return Err((StatusCode::BAD_REQUEST, format!("Parse error: {}", e)));
+                }
+            };
+
+        // The bound plan reads `id()` values through this mapper. HTTP is
+        // stateless: a temporary IdMapper per request, of its scope.
+        let id_mapper = request_id_mapper(&schema_name, &payload);
+        let cypher_statement = parsed_stmt;
+
+        metrics.parse_time = parse_start.elapsed().as_secs_f64();
+
+        let query_type = cypher_statement
+            .as_ref()
+            .map_or(QueryType::Read, query_planner::get_statement_query_type);
+        let query_type_str = match query_type {
+            QueryType::Read => "read",
+            QueryType::Ddl => "ddl",
+            QueryType::Update => "update",
+            QueryType::Delete => "delete",
+            QueryType::Call => "call",
+            QueryType::Procedure => "procedure",
+        }
+        .to_string();
+
+        let is_read = query_type == QueryType::Read;
+        let is_call = query_type == QueryType::Call;
+
+        if is_call {
+            // Handle CALL queries (like PageRank) - use first query's AST
+            let query_ast = match &cypher_statement {
+                Some(CypherStatement::Query { query, .. }) => query,
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "CALL queries need the legacy parser".to_string(),
+                    ));
+                }
+                Some(CypherStatement::ProcedureCall(_)) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "Standalone procedure calls should not reach this path".to_string(),
+                    ));
+                }
+                Some(CypherStatement::CopyTo(_)) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "COPY TO statements are handled separately".to_string(),
+                    ));
+                }
+            };
+            let pagerank =
+                match query_planner::evaluate_call_query((**query_ast).clone(), &graph_schema) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        // Return 400 for call planning errors (both sql_only and normal mode)
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!("CALL planning error: {}", e),
+                        ));
+                    }
+                };
+
+            // PageRank generates complete SQL.
+            let ch_sql = {
+                use crate::clickhouse_query_generator::pagerank::PageRankConfig;
+                use crate::clickhouse_query_generator::pagerank::PageRankGenerator;
+
+                let config = PageRankConfig {
+                    iterations: pagerank.iterations,
+                    damping_factor: pagerank.damping_factor,
+                    convergence_threshold: None,
+                };
+
+                let generator = PageRankGenerator::new(
+                    &graph_schema,
+                    config,
+                    pagerank.graph_name.clone(),
+                    pagerank.node_labels.clone(),
+                    pagerank.relationship_types.clone(),
+                );
+                match generator.generate_pagerank_sql() {
+                    Ok(sql) => sql,
+                    Err(e) => {
+                        // Return 500 for PageRank SQL generation errors
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("PageRank SQL generation error: {}", e),
+                        ));
+                    }
+                }
+            };
+
+            // If SQL-only mode, return the SQL without executing
+            if sql_only {
+                let sql_response = SqlOnlyResponse {
+                    cypher_query: payload.query.clone(),
+                    generated_sql: crate::sql_generator::portable_sql(
+                        &ch_sql,
+                        crate::server::query_context::get_current_dialect(),
+                    ),
+                    execution_mode: "sql_only".to_string(),
+                };
+                // Recorded: one record per sql_only query, same as the read
+                // path. The CALL path does not measure the plan/render/sql-gen
+                // phases, so this record spells has-phase-breakdown false —
+                // its parse time and total stand in the span, execution is 0.
+                metrics.total_time = start_time.elapsed().as_secs_f64();
+                metrics.query_type = query_type_str.clone();
+                metrics.sql_queries_count = 1;
+                record_query_with(
+                    &metrics,
+                    &payload.query,
+                    Outcome::Ok,
+                    Some(&schema_name),
+                    false,
+                );
+                return Ok(Json(sql_response).into_response());
+            }
+
+            if output_format == OutputFormat::Graph {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Graph format is not supported for CALL queries".to_string(),
+                ));
+            }
+
+            (vec![ch_sql], None, true, query_type_str, None)
+        } else if is_read {
+            // Phase 2: Plan query
+            let planning_start = Instant::now();
+
+            // Convert view_parameters from Option<HashMap<String, Value>> to Option<HashMap<String, String>>
+            let view_parameter_values: Option<HashMap<String, String>> = payload
+                .view_parameters
+                .as_ref()
+                .map(|params: &HashMap<String, serde_json::Value>| {
+                    params
+                        .iter()
+                        .map(|(k, v): (&String, &serde_json::Value)| {
+                            let string_value = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                _ => v.to_string(),
+                            };
+                            (k.clone(), string_value)
+                        })
+                        .collect()
+                });
+
+            log::debug!(
+                "Handler: view_parameters from request: {:?}",
+                payload.view_parameters
+            );
+            log::debug!(
+                "Handler: converted view_parameter_values: {:?}",
+                view_parameter_values
+            );
+
+            // Phases 2-4 (plan, render, SQL) through the single translate seam.
+            // Schema context is already set via with_query_context() at handler entry.
+            let read_options = crate::translate::ReadOptions {
+                tenant_id: payload.tenant_id.clone(),
+                view_parameter_values,
+                cypher: clean_query.clone(),
+                id_mapper: Some(id_mapper.clone()),
+                neo4j_compat: None,
+                check_node_properties: None,
+            };
+            let translated = match cypher_statement {
+                Some(statement) => {
+                    crate::translate::translate_read(statement, &graph_schema, read_options)
+                }
+                None => match crate::translate::translate_text_read(
+                    &clean_query,
+                    &graph_schema,
+                    read_options,
+                ) {
+                    Ok(Some(t)) => Ok(t),
+                    Ok(None) => {
+                        metrics.planning_time = planning_start.elapsed().as_secs_f64();
+                        let e = legacy_parse_error.unwrap_or_default();
+                        return Err((StatusCode::BAD_REQUEST, e));
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            let translation = match translated {
+                Ok(t) => t,
+                Err(crate::translate::TranslateError::Invalid(e)) => {
+                    metrics.planning_time = planning_start.elapsed().as_secs_f64();
+                    // Invalid Cypher, as Neo4j rejects it: the client's.
+                    return Err((StatusCode::BAD_REQUEST, format!("Query error: {}", e)));
+                }
+                Err(crate::translate::TranslateError::Unsupported(e)) => {
+                    metrics.planning_time = planning_start.elapsed().as_secs_f64();
+                    // A form the engine does not translate: the client's.
+                    return Err((StatusCode::BAD_REQUEST, format!("Not supported: {}", e)));
+                }
+                Err(crate::translate::TranslateError::Internal(e)) => {
+                    metrics.planning_time = planning_start.elapsed().as_secs_f64();
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Internal error: {}", e),
+                    ));
+                }
+            };
+            metrics.planning_time = translation.timings.planning.as_secs_f64();
+            metrics.render_time = translation.timings.render.as_secs_f64();
+            metrics.sql_generation_time = translation.timings.sql_generation.as_secs_f64();
+            let ch_query = translation.sql.clone();
+            crate::debug_println!("\n ch_query \n {} \n", ch_query);
+            id_number_columns = translation
+                .shape
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.kind,
+                        crate::bound_plan::lower::ResultKind::ElementIdNumber
+                    )
+                })
+                .map(|c| c.name.clone())
+                .collect();
+
+            // Store in cache (even in sql_only mode for future use). Not a
+            // query whose results need the result shape (a cached query is
+            // not translated again), nor one whose SQL holds the server's
+            // reading of `id()` numbers, which holds only now. The
+            // statement's classification rides with the template so a later
+            // hit is recorded under this type (see `record_cache_hit`).
+            let cacheable = id_number_columns.is_empty() && !translation.session_ids;
+            if let (Some(cache), true) = (GLOBAL_QUERY_CACHE.get(), cacheable) {
+                cache.insert_typed(cache_key.clone(), ch_query.clone(), query_type_str.clone());
+                log::debug!("Stored SQL template in cache");
+            }
+
+            // If SQL-only mode, return the SQL without executing
+            if sql_only {
+                let sql_response = Json(SqlOnlyResponse {
+                    cypher_query: payload.query.clone(),
+                    generated_sql: crate::sql_generator::portable_sql(
+                        &ch_query,
+                        crate::server::query_context::get_current_dialect(),
+                    ),
+                    execution_mode: "sql_only".to_string(),
+                });
+
+                // Recorded like the executed path: the pipeline actually ran
+                // (parse through sql-gen are this request's real times), so
+                // the record carries a full breakdown; only execution is 0
+                // and there are no result rows — there is no execution. One
+                // record per query: without this the first sql_only request
+                // would get no span or count while its cached repeat gets
+                // both.
+                metrics.total_time = start_time.elapsed().as_secs_f64();
+                metrics.query_type = query_type_str.clone();
+                metrics.sql_queries_count = 1;
+                record_query(&metrics, &payload.query, Outcome::Ok, Some(&schema_name));
+
+                // Add cache status header
+                let mut response = sql_response.into_response();
+                if let Ok(cache_header) = axum::http::HeaderValue::try_from(cache_status) {
+                    response
+                        .headers_mut()
+                        .insert("X-Query-Cache-Status", cache_header);
+                }
+                return Ok(response);
+            }
+
+            // Graph format builds nodes and edges from the result shape.
+            let graph_ctx = if output_format == OutputFormat::Graph {
+                Some((translation.return_metadata(), graph_schema))
+            } else {
+                None
+            };
+
+            (vec![ch_query], None, true, query_type_str, graph_ctx)
+        } else {
+            // DDL operations not supported - ClickGraph is read-only
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "DDL operations (CREATE/SET/DELETE) not supported. ClickGraph is a read-only query engine. Use YAML schemas to define graph views.".to_string(),
+            ));
+        }
+    };
+
+    // Phase 5: Execute query
+    let execution_start = Instant::now();
+    let sql_queries_count = ch_sql_queries.len();
+
+    // Merge view_parameters and query parameters for substitution
+    let all_params = merge_parameters(&payload.parameters, &payload.view_parameters);
+
+    // Graph format: execute SQL, get rows, transform to nodes/edges
+    if let Some((return_metadata, graph_schema)) = graph_ctx {
+        let rows = execute_json_rows(
+            &app_state,
+            &ch_sql_queries,
+            all_params,
+            payload.role.clone(),
+        )
+        .await?;
+
+        metrics.execution_time = execution_start.elapsed().as_secs_f64();
+        metrics.total_time = start_time.elapsed().as_secs_f64();
+        metrics.query_type = query_type_str;
+        metrics.sql_queries_count = sql_queries_count;
+        metrics.result_rows = Some(rows.len());
+        metrics.log_performance(&payload.query);
+
+        let (nodes, edges) =
+            super::graph_output::transform_to_graph(&rows, &return_metadata, &graph_schema);
+
+        let response = GraphQueryResponse {
+            nodes,
+            edges,
+            stats: metrics.to_stats(),
+        };
+
+        record_query(&metrics, &payload.query, Outcome::Ok, Some(&schema_name));
+
+        let mut resp = Json(response).into_response();
+        if let Ok(cache_header) = axum::http::HeaderValue::try_from(cache_status) {
+            resp.headers_mut()
+                .insert("X-Query-Cache-Status", cache_header);
+        }
+        return Ok(resp);
+    }
+
+    let response = if is_read {
+        execute_cte_queries(
+            app_state,
+            ch_sql_queries,
+            output_format,
+            all_params,
+            payload.role.clone(),
+            &id_number_columns,
+        )
+        .await
+    } else {
+        let ch_client = app_state.clickhouse_client.clone().ok_or_else(|| {
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "DDL operations are not available in embedded mode (no ClickHouse connection)"
+                    .to_string(),
+            )
+        })?;
+        ddl_handler(ch_client, ch_sql_queries, maybe_schema_elem).await
+    };
+    metrics.execution_time = execution_start.elapsed().as_secs_f64();
+
+    // Complete metrics collection
+    metrics.total_time = start_time.elapsed().as_secs_f64();
+    metrics.query_type = query_type_str;
+    metrics.sql_queries_count = sql_queries_count;
+
+    // Extract result count if available (for read queries)
+    if let Ok(ref resp) = response {
+        if let Some(result_count) = extract_result_count(resp) {
+            metrics.result_rows = Some(result_count);
+        }
+    }
+
+    // Log performance metrics
+    metrics.log_performance(&payload.query);
+
+    // Add performance headers and stats to response
+    match response {
+        Ok(mut resp) => {
+            let headers = metrics.to_headers();
+            for (key, value) in headers {
+                if let (Ok(header_name), Ok(header_value)) = (
+                    axum::http::HeaderName::try_from(key),
+                    axum::http::HeaderValue::try_from(value),
+                ) {
+                    resp.headers_mut().insert(header_name, header_value);
+                }
+            }
+
+            // Add cache status header
+            if let Ok(cache_header) = axum::http::HeaderValue::try_from(cache_status) {
+                resp.headers_mut()
+                    .insert("X-Query-Cache-Status", cache_header);
+            }
+
+            record_query(&metrics, &payload.query, Outcome::Ok, Some(&schema_name));
+            Ok(resp)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// pub async fn query_handler_old(
+//     State(app_state): State<Arc<AppState>>,
+//     Json(payload): Json<QueryRequest>,
+// ) -> Result<Response, (StatusCode, String)> {
+//     let instant = Instant::now();
+
+//     let graph_schema = graph_meta::get_graph_schema().await;
+
+//     let output_format = payload.format.unwrap_or(OutputFormat::JSONEachRow);
+
+//     // parse cypher query
+//     let cypher_ast = open_cypher_parser::parse_query(&payload.query).map_err(|e| {
+//         (
+//             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+//             format!("Brahmand Error: {}", e),
+//         )
+//     })?;
+
+//     let mut traversal_mode = TraversalMode::Cte;
+
+//     if let Some(mode) = payload.mode {
+//         traversal_mode = mode
+//     }
+
+//     // TODO convert this error to axum error with proper message. Expose the module name in traces but not to users
+//     let (query_type, ch_sql_queries, graph_schema_element_opt) =
+//         query_planner::evaluate_query(cypher_ast, &traversal_mode, &graph_schema).map_err(|e| {
+//             (
+//                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+//                 format!("Brahmand Error: {}", e),
+//             )
+//         })?;
+//         // query_engine::evaluate_query(cypher_ast, &traversal_mode, &graph_schema).map_err(|e| {
+//         //     (
+//         //         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+//         //         format!("Brahmand Error: {}", e),
+//         //     )
+//         // })?;
+//     if query_type == QueryType::Ddl {
+//         return ddl_handler(
+//             app_state.clickhouse_client.clone(),
+//             ch_sql_queries,
+//             graph_schema_element_opt,
+//         )
+//         .await;
+//     }
+
+//     if traversal_mode == TraversalMode::Cte {
+//         execute_cte_queries(app_state, ch_sql_queries, output_format, instant).await
+//     } else {
+//         execute_temp_table_queries(app_state, ch_sql_queries, output_format, instant).await
+//     }
+// }
+
+/// Substitute parameters and validate that no unsubstituted placeholders remain.
+/// Shared by `execute_json_rows` and `execute_cte_queries`.
+fn prepare_final_sql(
+    ch_sql_queries: &[String],
+    parameters: Option<&std::collections::HashMap<String, Value>>,
+) -> Result<String, (StatusCode, String)> {
+    let ch_query_string = ch_sql_queries.join(" ");
+
+    let final_sql = if let Some(params) = parameters {
+        parameter_substitution::substitute_parameters(&ch_query_string, params).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Parameter substitution error: {}", e),
+            )
+        })?
+    } else {
+        ch_query_string
+    };
+
+    if let Some(missing_param) = parameter_substitution::find_unsubstituted_parameter(&final_sql) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Missing required parameter: '{}'. Parameterized views require view_parameters to be provided.",
+                missing_param
+            ),
+        ));
+    }
+
+    Ok(final_sql)
+}
+
+/// Execute SQL and return parsed JSON rows (used by Graph format).
+async fn execute_json_rows(
+    app_state: &Arc<AppState>,
+    ch_sql_queries: &[String],
+    parameters: Option<std::collections::HashMap<String, Value>>,
+    role: Option<String>,
+) -> Result<Vec<Value>, (StatusCode, String)> {
+    let final_sql = prepare_final_sql(ch_sql_queries, parameters.as_ref())?;
+
+    log::debug!("Executing SQL (graph format):\n{}", final_sql);
+
+    app_state
+        .executor
+        .execute_json(&final_sql, role.as_deref())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Executor error: {}", e),
+            )
+        })
+}
+
+async fn execute_cte_queries(
+    app_state: Arc<AppState>,
+    ch_sql_queries: Vec<String>,
+    output_format: OutputFormat,
+    parameters: Option<std::collections::HashMap<String, Value>>,
+    role: Option<String>,
+    id_number_columns: &[String],
+) -> Result<Response, (StatusCode, String)> {
+    let final_sql = prepare_final_sql(&ch_sql_queries, parameters.as_ref())?;
+
+    // Log full SQL for debugging (especially helpful when ClickHouse truncates errors)
+    log::debug!("Executing SQL:\n{}", final_sql);
+
+    if output_format == OutputFormat::Pretty
+        || output_format == OutputFormat::PrettyCompact
+        || output_format == OutputFormat::Csv
+        || output_format == OutputFormat::CSVWithNames
+    {
+        let format_str: String = output_format.into();
+        let text = app_state
+            .executor
+            .execute_text(&final_sql, &format_str, role.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Executor error: {}", e),
+                )
+            })?;
+
+        let mut response = (StatusCode::OK, text).into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        Ok(response)
+    } else {
+        let rows = app_state
+            .executor
+            .execute_json(&final_sql, role.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Executor error: {}", e),
+                )
+            })?;
+
+        // An element id returned as Bolt's number for it (`id(r)`, S11l).
+        let mut rows = rows;
+        if !id_number_columns.is_empty() {
+            for row in rows.iter_mut() {
+                if let Value::Object(map) = row {
+                    for c in id_number_columns {
+                        if let Some(v) = map.get_mut(c) {
+                            *v =
+                                crate::server::bolt_protocol::result_transformer::element_id_number(
+                                    v.take(),
+                                );
+                        }
+                    }
+                }
+            }
+        }
+        // Wrap results in an object with "results" key for consistency with Neo4j format
+        let response_obj = serde_json::json!({
+            "results": rows
+        });
+
+        Ok(Json(response_obj).into_response())
+    }
+}
+
+// async fn execute_temp_table_queries(
+//     app_state: Arc<AppState>,
+//     mut ch_sql_queries: Vec<String>,
+//     output_format: OutputFormat,
+//     instant: Instant,
+// ) -> Result<Response, (StatusCode, String)> {
+//     let session_id = Uuid::new_v4();
+//     let ch_client = app_state
+//         .clickhouse_client
+//         .clone()
+//         .with_option("session_id", session_id);
+//     let last_query = ch_sql_queries.pop().unwrap();
+
+//     for ch_query in ch_sql_queries {
+//         println!("\n ch_query -> {:?}", ch_query);
+//         let ch_client = app_state
+//             .clickhouse_client
+//             .clone()
+//             .with_option("session_id", session_id);
+//         ch_client
+//             .query(&ch_query)
+//             .execute()
+//             .await
+//             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+//     }
+
+//     if output_format == OutputFormat::Pretty
+//         || output_format == OutputFormat::PrettyCompact
+//         || output_format == OutputFormat::Csv
+//         || output_format == OutputFormat::CSVWithNames
+//     {
+//         let mut lines = ch_client
+//             .query(&last_query)
+//             .fetch_bytes(output_format)
+//             .map_err(|e| {
+//                 (
+//                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+//                     format!("Clickhouse Error: {}", e),
+//                 )
+//             })?
+//             .lines();
+
+//         let mut rows: Vec<String> = vec![];
+//         while let Some(line) = lines.next_line().await.map_err(|e| {
+//             (
+//                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+//                 format!("Clickhouse Error: {}", e),
+//             )
+//         })? {
+//             // let value: serde_json::Value = serde_json::de::from_str(&line).unwrap();
+//             rows.push(line);
+//         }
+
+//         let now = Instant::now();
+//         let elapsed = now.duration_since(instant).as_secs_f64();
+//         let elapsed_rounded = (elapsed * 1000.0).round() / 1000.0;
+//         rows.push(format!("\nElapsed: {} sec", elapsed_rounded));
+
+//         let text = rows.join("\n");
+
+//         let mut response = (StatusCode::OK, text).into_response();
+//         response
+//             .headers_mut()
+//             .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+//         Ok(response)
+//     } else {
+//         // Execute the arbitrary ClickHouse query.
+//         let mut lines = ch_client
+//             .query(&last_query)
+//             .fetch_bytes("JSONEachRow")
+//             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+//             .lines();
+
+//         let mut rows: Vec<Value> = vec![];
+//         while let Some(line) = lines
+//             .next_line()
+//             .await
+//             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+//         {
+//             let value: serde_json::Value = serde_json::de::from_str(&line).unwrap();
+//             rows.push(value);
+//         }
+
+//         Ok(Json(rows).into_response())
+//     }
+// }
+
+pub async fn ddl_handler(
+    clickhouse_client: Client,
+    ch_sql_queries: Vec<String>,
+    graph_schema_element_opt: Option<Vec<GraphSchemaElement>>,
+) -> Result<Response, (StatusCode, String)> {
+    // // parse cypher query
+    // let cypher_ast = open_cypher_parser::parse_query(&payload.query).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // let (query_type,ch_sql_queries) = query_engine::evaluate_ddl_query(cypher_ast).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let graph_schema_element: Vec<GraphSchemaElement> =
+        graph_schema_element_opt.ok_or_else(|| {
+            log::error!("Missing graph schema element in DDL query execution");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error: Missing schema element for DDL query".to_string(),
+            )
+        })?;
+
+    graph_catalog::validate_schema(&graph_schema_element)
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ClickGraph Error: {}", e),
+            )
+        })?;
+
+    for ch_query in ch_sql_queries {
+        crate::debug_println!("\n ch_query -> {:?}", ch_query);
+        let ch_client = clickhouse_client
+            .clone()
+            .with_option("wait_end_of_query", "1");
+
+        ch_client.query(&ch_query).execute().await.map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Clickhouse Error: {}", e),
+            )
+        })?;
+    }
+
+    // Now that DDL is applied successfully, add graph schema element into the schema and update the graph meta table here
+
+    graph_catalog::add_to_schema(clickhouse_client.clone(), graph_schema_element)
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Clickhouse Error: {}", e),
+            )
+        })?;
+
+    graph_catalog::refresh_global_schema(clickhouse_client.clone())
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Clickhouse Error: {}", e),
+            )
+        })?;
+
+    // DDL durability stays with the legacy `graph_catalog` table fallback
+    // (pre-existing on `main`): nothing here writes a persisted-schema row.
+    // The structural migration to the registry (`schema_registry`) is future
+    // work recorded in `docs/design/SCHEMA_PERSISTENCE.md` — `ddl_handler` is
+    // currently unreachable from query dispatch (every non-read statement is
+    // refused), so there is no live behavior to persist.
+
+    let mut response = (StatusCode::OK, "DDL applied successfully".to_string()).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+    Ok(response)
+}
+
+/// Extract result count from a response for performance metrics
+/// Note: This is a simplified implementation. In a production system,
+/// you might want to track result counts during query execution.
+
+// Multi-schema management endpoints - NEW
+
+#[derive(Deserialize)]
+pub struct LoadSchemaRequest {
+    pub schema_name: String,
+    pub config_content: String, // YAML content as string
+    pub validate_schema: Option<bool>,
+    /// Optional ClickHouse RBAC role for the durability write — the same
+    /// resolution `/query`'s `role` uses, pointed at the registry's
+    /// CREATE/INSERT/ALTER-DELETE work. Omitted (or empty) keeps the
+    /// default client, which a read-only user boots and replays with; a
+    /// hardened deploy passes `schema_writer` (see
+    /// `docs/design/SCHEMA_PERSISTENCE.md` §Privileges).
+    pub role: Option<String>,
+}
+
+/// Query parameter of `DELETE /schemas/{name}`: the same optional RBAC role
+/// the body-based POST accepts (a DELETE has no body to carry it).
+#[derive(Deserialize)]
+pub struct DeleteSchemaParams {
+    /// Omitted (or empty) keeps the default client, exactly like the POST.
+    pub role: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SchemaInfo {
+    pub name: String,
+    pub node_count: usize,
+    pub relationship_count: usize,
+}
+
+pub async fn list_schemas_handler(
+    State(_app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let schema_names = graph_catalog::list_available_schemas().await;
+    log::debug!("Found {} schemas: {:?}", schema_names.len(), schema_names);
+    let mut schemas_info = Vec::new();
+
+    for name in schema_names {
+        if let Ok(schema) = graph_catalog::get_graph_schema_by_name(&name).await {
+            let node_count = schema.all_node_schemas().len();
+            let relationship_count = schema.get_relationships_schemas().len();
+            schemas_info.push(SchemaInfo {
+                name,
+                node_count,
+                relationship_count,
+            });
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "schemas": schemas_info
+    })))
+}
+
+/// The admin-write gate's guard, owned so the store half of a call can carry
+/// it into its own task (see [`run_store_half`]).
+type RegistryGate = Option<tokio::sync::OwnedMutexGuard<()>>;
+
+/// Takes the admin-write gate when this server has a store to keep in step
+/// with memory. With persistence off (the default) there is no second half,
+/// so no gate: loads and deletes behave exactly as they did before the
+/// feature, and a slow load blocks only itself.
+async fn registry_gate_if_persisting(app_state: &AppState) -> RegistryGate {
+    if matches!(*app_state.schema_store, schema_registry::SchemaStore::Off) {
+        return None;
+    }
+    Some(app_state.schema_registry_gate.clone().lock_owned().await)
+}
+
+/// Runs the store half of an admin call as its own task, holding `gate`
+/// until the store answers. A request dropped by the client (disconnect) or
+/// by the server's request timeout drops its handler future; without a task
+/// of its own the store write would be abandoned at that point while the
+/// in-memory change it belongs to stays. The task is bounded by the store's
+/// own call bounds, so it cannot hold the gate for long. `None` = the task
+/// died (a panic), which the caller reports honestly.
+async fn run_store_half<T, F>(gate: RegistryGate, what: &str, store_half: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    match tokio::spawn(async move {
+        let _gate = gate;
+        store_half.await
+    })
+    .await
+    {
+        Ok(value) => Some(value),
+        Err(join_error) => {
+            log::error!("registry {what}: the store task failed ({join_error})");
+            None
+        }
+    }
+}
+
+pub async fn load_schema_handler(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<LoadSchemaRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let validate_schema = payload.validate_schema.unwrap_or(false);
+    // An empty role string is no role at all (ClickHouse would reject it at
+    // write time; normalizing here keeps a bad input a plain default-client
+    // write instead of a mystery `persisted: false`).
+    let role = payload.role.as_deref().filter(|r| !r.is_empty());
+
+    // Any schema-name or role the registry cannot record safely is a 400
+    // before any gate, registry or store work (both endpoints; the same
+    // checks run on DELETE). An empty name would register and 404 forever
+    // after; a control character in either identifier forges log lines
+    // (the pool logs a first-seen role verbatim).
+    if let Some(problem) = schema_registry::schema_name_error_if_any(&payload.schema_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": problem })),
+        ));
+    }
+    if let Some(role) = role {
+        if let Some(problem) = schema_registry::role_error_if_any(role) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": problem })),
+            ));
+        }
+    }
+
+    // Reserved names never touch the registries: the routes and the CLI's
+    // introspection workflow own these spellings.
+    if schema_registry::is_reserved_schema_name(&payload.schema_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Schema name '{}' is reserved ({}); pick another name",
+                    schema_registry::log_safe(&payload.schema_name),
+                    schema_registry::RESERVED_SCHEMA_NAMES.join(", ")
+                )
+            })),
+        ));
+    }
+
+    // One gate across the memory change AND the store change: two racing
+    // POSTs (or a POST and a DELETE of the same name) cannot interleave
+    // their halves into `memory = A, store = B` — the divergence a restart
+    // then surfaced as whichever boot-reload made it. Admin-endpoint rates
+    // make one global gate cost-free; boot replay needs no turn (it runs
+    // before the listener binds). Only a server that has a store takes it:
+    // with persistence off there is no second half to keep in step, and a
+    // slow load must not queue every other load behind it (the pre-feature
+    // behavior).
+    let registry_gate = registry_gate_if_persisting(&app_state).await;
+
+    match graph_catalog::load_schema_from_content(
+        &payload.schema_name,
+        &payload.config_content,
+        app_state.clickhouse_client.clone(),
+        validate_schema,
+    )
+    .await
+    {
+        Ok(_) => {
+            // Invalidate cache entries for this schema
+            if let Some(cache) = GLOBAL_QUERY_CACHE.get() {
+                cache.invalidate_schema(&payload.schema_name);
+                log::info!(
+                    "Cache invalidated for schema: {}",
+                    schema_registry::log_safe(&payload.schema_name)
+                );
+            }
+
+            // Durability is opt-in: with persistence off the response stays
+            // byte-identical to a server without this feature (no `persisted`
+            // key at all). With it on, a failed store never fails the
+            // registration — the field reports what actually happened.
+            // The store is the app state's one shared instance, not a
+            // per-request build: its one-time table preparation serializes
+            // concurrent first registrations across the server.
+            //
+            // The store half runs as its own task and owns the gate: a
+            // client that disconnects (or a request that times out) after
+            // the schema went live in memory must not abandon the write
+            // mid-flight, leaving memory at NEW and the store at OLD until
+            // someone retries. The task is bounded by the store's own call
+            // bounds, so it cannot hold the gate for long.
+            let store_half = {
+                let app_state = app_state.clone();
+                let schema_name = payload.schema_name.clone();
+                let config_content = payload.config_content.clone();
+                let role = role.map(str::to_owned);
+                run_store_half(registry_gate, "persist schema", async move {
+                    schema_registry::persist_yaml_after_load(
+                        &app_state.config,
+                        &app_state.schema_store,
+                        &schema_name,
+                        &config_content,
+                        role.as_deref(),
+                    )
+                    .await
+                })
+                .await
+            };
+            let outcome = match store_half {
+                Some(outcome) => outcome,
+                // The task died (a panic in the store code): the schema is
+                // live, the row is unknown — the honest answer is "not
+                // persisted", never a lie in either direction.
+                None => (app_state.config.schema_persistence == SchemaPersistenceMode::Clickhouse)
+                    .then_some(schema_registry::PersistOutcome {
+                        persisted: false,
+                        unrestorable_reason: None,
+                    }),
+            };
+
+            let mut body = serde_json::json!({
+                "message": format!("Schema '{}' loaded successfully", payload.schema_name),
+                "schema_name": payload.schema_name
+            });
+            if let Some(outcome) = outcome {
+                body["persisted"] = serde_json::json!(outcome.persisted);
+                if let Some(reason) = outcome.unrestorable_reason {
+                    // Additive, and only on the never-restorable row (over
+                    // the replay byte budget): a normal registration's body
+                    // carries `persisted` alone, byte-identical to round-1.
+                    body["restorable"] = serde_json::json!(false);
+                    body["restorable_reason"] = serde_json::json!(reason);
+                }
+            }
+            Ok(Json(body))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to load schema: {}", e)
+            })),
+        )),
+    }
+}
+
+pub async fn get_schema_handler(
+    axum::extract::Path(schema_name): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match graph_catalog::get_graph_schema_by_name(&schema_name).await {
+        Ok(schema) => {
+            let node_count = schema.all_node_schemas().len();
+            let relationship_count = schema.get_relationships_schemas().len();
+
+            Ok(Json(serde_json::json!({
+                "schema_name": schema_name,
+                "node_types": node_count,
+                "relationship_types": relationship_count,
+                "nodes": schema.all_node_schemas().keys().collect::<Vec<_>>(),
+                "relationships": schema.get_relationships_schemas().keys().collect::<Vec<_>>()
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": e
+            })),
+        )),
+    }
+}
+
+/// The id mapper of a request on graph `schema_name`: scoped as a Bolt
+/// session of its graph, tenant and view parameter values, so an id
+/// another scope's session gave is not read here (#1388).
+fn request_id_mapper(
+    schema_name: &str,
+    payload: &QueryRequest,
+) -> crate::server::bolt_protocol::id_mapper::IdMapper {
+    let views: Option<HashMap<String, String>> = payload.view_parameters.as_ref().map(|params| {
+        params
+            .iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (k.clone(), s)
+            })
+            .collect()
+    });
+    let mut id_mapper = crate::server::bolt_protocol::id_mapper::IdMapper::new();
+    id_mapper.set_scope_with_views(
+        Some(schema_name.to_string()),
+        payload.tenant_id.as_deref(),
+        views.as_ref(),
+    );
+    id_mapper
+}
+
+/// `DELETE /schemas/{name}` — complete the runtime-registration lifecycle:
+/// a schema you can register at runtime is a schema you can retire at
+/// runtime (`spec: docs/design/SCHEMA_PERSISTENCE.md`).
+///
+/// Removes the in-memory registration and — when persistence is configured —
+/// the stored row, so the next boot does not resurrect it. With persistence
+/// off the in-memory removal is the whole operation, and the response stays
+/// byte-identical to a server without the feature except for the new
+/// endpoint itself.
+///
+/// Name classes, stated explicitly:
+/// - runtime-persisted only: fully retired (memory + store row);
+/// - config-defined: may still carry a store row (the same POST that loads a
+///   config-defined name persists it, and a name can move into the config
+///   file after it was registered) — DELETE clears memory and that row, and
+///   the config file re-registers the schema on the next boot regardless, so
+///   the in-memory deletion of a config-defined name is transient by design
+///   (`default` included);
+/// - store-only: a row that failed boot replay lives in the store but was
+///   never loaded into memory, so `remove_schema` reports not-found while
+///   the row is still real — and boot replay's WARN advertises this exact
+///   endpoint as its remedy, which the handler must honor. When the name
+///   owns a stored row but no memory entry, the row is deleted and the
+///   response carries the additive `store_only: true` field (no in-memory
+///   entry ever existed for the name this boot, so nothing else changes).
+///   A name with neither a memory entry nor a stored row keeps the
+///   pre-feature 404, with the same body shape as GET's.
+///
+/// Ordering vs a concurrent re-register (`POST /schemas/load` of the same
+/// name) is serialized, not just last-writer-wins: both admin handlers hold
+/// `AppState.schema_registry_gate` across the in-memory change AND the store
+/// change, so the two halves can no longer interleave into `memory = A,
+/// store = B` — one call completes its whole lifecycle before the other
+/// starts, at the cost of queuing behind it (admin-endpoint rates, so the
+/// queue is empty in practice). Boot replay needs no turn: it runs before
+/// the listener binds. Within the store-only path the `exists` probe still
+/// answers before the delete: a probe that says "no row" ends the request
+/// (the pre-feature 404) without a DELETE statement.
+pub async fn delete_schema_handler(
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Path(schema_name): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<DeleteSchemaParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Same normalization the POST does: an empty role string is no role.
+    let role = params.role.as_deref().filter(|r| !r.is_empty());
+    // The POST's at-the-door checks, mirrored: a control character or a
+    // pathological length in either identifier is a 400 before any lock,
+    // memory work or store contact.
+    if let Some(problem) = schema_registry::schema_name_error_if_any(&schema_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": problem })),
+        ));
+    }
+    if let Some(role) = role {
+        if let Some(problem) = schema_registry::role_error_if_any(role) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": problem })),
+            ));
+        }
+    }
+    let registry_gate = registry_gate_if_persisting(&app_state).await;
+
+    let memory_removal = graph_catalog::remove_schema(&schema_name).await;
+
+    if let Err(e) = memory_removal {
+        // Store-only retirement. The probe is gated on persistence being
+        // configured (the honest 404 contract is the pre-feature one when
+        // the feature is off) and treats an unreachable store as "no" —
+        // never lie that something was deleted, and never let a failed
+        // probe become a 500.
+        let has_stored_row =
+            if app_state.config.schema_persistence == SchemaPersistenceMode::Clickhouse {
+                app_state
+                    .schema_store
+                    .exists(&schema_name)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+        if has_stored_row {
+            // Binding named `always_true`: the probe above short-circuits
+            // every path where the store cannot delete (the `Off` store
+            // answers probe `false`; a real store's delete is an idempotent
+            // success that reports `true`) — the old `!deleted → 404`
+            // branch here was unreachable dead code. The bool return stays
+            // because the memory-backed path below does read it.
+            let deleted = {
+                let app_state = app_state.clone();
+                let schema_name = schema_name.clone();
+                let role = role.map(str::to_owned);
+                run_store_half(registry_gate, "store-only delete", async move {
+                    app_state
+                        .schema_store
+                        .delete(&schema_name, role.as_deref())
+                        .await
+                })
+                .await
+            }
+            .unwrap_or_else(|| Err("the store task did not complete".to_string()));
+            return match deleted {
+                Ok(_always_true) => {
+                    log::info!(
+                        "store-only delete: stored row for schema '{}' \
+                         deleted (the schema was not booted into this \
+                         process)",
+                        schema_registry::log_safe(&schema_name)
+                    );
+                    Ok(Json(serde_json::json!({
+                        "message": format!(
+                            "Stored row for schema '{}' deleted",
+                            schema_name
+                        ),
+                        "schema_name": schema_name,
+                        "persisted": true,
+                        "store_only": true
+                    })))
+                }
+                Err(store_err) => {
+                    // Nothing was deleted (no memory entry ever existed,
+                    // the row survived): refusal to lie beats a fake 200.
+                    // The response is a FIXED message: a ClickHouse error
+                    // carries the server's user, database, grant names and
+                    // version, and none of it belongs in an API body. The
+                    // detail is logged (this WARN, with the name already
+                    // log-safe), the operators read it there.
+                    log::warn!(
+                        "store-only delete of schema '{}' failed ({store_err})",
+                        schema_registry::log_safe(&schema_name)
+                    );
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "stored row for schema '{}' could not be \
+                                 deleted (the registry store answered with \
+                                 a failure; the server log names the cause)",
+                                schema_registry::log_safe(&schema_name)
+                            )
+                        })),
+                    ))
+                }
+            };
+        }
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e })),
+        ));
+    }
+
+    // Same invalidation the load path performs — stale SQL for a deleted
+    // schema must never answer a query. (The store-only path skips this:
+    // with no memory entry there is nothing cached under the name.)
+    if let Some(cache) = GLOBAL_QUERY_CACHE.get() {
+        cache.invalidate_schema(&schema_name);
+        log::info!(
+            "Cache invalidated for schema: {}",
+            schema_registry::log_safe(&schema_name)
+        );
+    }
+
+    let store_deleted = if app_state.config.schema_persistence == SchemaPersistenceMode::Clickhouse
+    {
+        // The process's one shared store (hoisted into AppState): the same
+        // instance the load path persists through, so its one-time table
+        // preparation serializes first registrations across the whole
+        // server instead of within one request's throwaway store.
+        // Detached like the POST's store half: the memory entry is already
+        // gone, and a client that hangs up now must not leave the stored row
+        // behind to resurrect the schema at the next boot.
+        let deleted = {
+            let app_state = app_state.clone();
+            let schema_name = schema_name.clone();
+            let role = role.map(str::to_owned);
+            run_store_half(registry_gate, "delete stored row", async move {
+                app_state
+                    .schema_store
+                    .delete(&schema_name, role.as_deref())
+                    .await
+            })
+            .await
+        }
+        .unwrap_or_else(|| Err("the store task did not complete".to_string()));
+        match deleted {
+            Ok(deleted) => Some(deleted),
+            Err(e) => {
+                // The schema is gone from memory; a failing store must not
+                // turn a retirement into an error, but it must not lie
+                // either — the next boot will resurrect the row.
+                log::warn!(
+                    "stored row for schema '{}' could not be deleted ({e}); \
+                     it will re-register on the next boot until the store is \
+                     fixed",
+                    schema_registry::log_safe(&schema_name)
+                );
+                Some(false)
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut body = serde_json::json!({
+        "message": format!("Schema '{}' deleted", schema_name),
+        "schema_name": schema_name
+    });
+    if let Some(deleted) = store_deleted {
+        body["persisted"] = serde_json::json!(deleted);
+    }
+    Ok(Json(body))
+}
+
+/// Translate a Cypher query string into ClickHouse SQL.
+///
+/// Used by export procedures to compile the inner Cypher query.
+/// Runs the read seam (`translate::translate_inner_read`), reading `id()`
+/// numbers through `id_mapper` (the request's).
+fn translate_cypher_to_sql(
+    cypher: &str,
+    graph_schema: &GraphSchema,
+    schema_name: &str,
+    id_mapper: crate::server::bolt_protocol::id_mapper::IdMapper,
+) -> Result<String, (StatusCode, String)> {
+    log::debug!(
+        "Translating inner Cypher query for schema '{}'",
+        schema_name
+    );
+    // A broken invariant is the server's (500), anything else the query's.
+    crate::translate::translate_inner_read(cypher, graph_schema, schema_name, id_mapper).map_err(
+        |e| {
+            let status = match e {
+                crate::translate::TranslateError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, e.to_string())
+        },
+    )
+}
+
+fn extract_result_count(_response: &axum::response::Response) -> Option<usize> {
+    // TODO: Implement proper result count extraction
+    // This would require either:
+    // 1. Modifying the query execution to track row counts
+    // 2. Parsing the response body (complex with streaming)
+    // For now, we return None
+    None
+}
+
+// Schema discovery endpoints
+
+#[derive(Deserialize)]
+pub struct IntrospectRequest {
+    pub database: String,
+}
+
+/// Run schema introspection against whichever backend the server uses: the
+/// Databricks probe (`SHOW TABLES` / `DESCRIBE TABLE EXTENDED`) when running in
+/// DeltaGraph mode, or the ClickHouse `system.*` path otherwise. Both return the
+/// same `IntrospectResponse`, so the introspect / discover-prompt handlers share
+/// this entry point. `database` is the namespace to introspect — a ClickHouse
+/// database, or (under Databricks) the Spark schema within `DATABRICKS_CATALOG`.
+async fn introspect_for_backend(
+    app_state: &AppState,
+    database: &str,
+) -> Result<
+    crate::graph_catalog::schema_discovery::IntrospectResponse,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    #[cfg(feature = "databricks")]
+    if app_state.config.databricks {
+        return databricks_introspect(app_state, database).await;
+    }
+
+    let ch_client = match &app_state.clickhouse_client {
+        Some(c) => c,
+        None => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(
+                    serde_json::json!({ "error": "Schema introspection is not available in this mode (no ClickHouse connection)" }),
+                ),
+            ));
+        }
+    };
+
+    SchemaDiscovery::introspect(ch_client, database)
+        .await
+        .map_err(|e| {
+            log::error!("Introspect failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })
+}
+
+/// DeltaGraph introspection: resolve the concrete `DatabricksSqlExecutor` from
+/// the trait object, use its configured catalog plus the request's `database`
+/// (treated as the Spark schema) and drive `DatabricksProbe`.
+#[cfg(feature = "databricks")]
+async fn databricks_introspect(
+    app_state: &AppState,
+    schema: &str,
+) -> Result<
+    crate::graph_catalog::schema_discovery::IntrospectResponse,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    use crate::executor::databricks_sql::DatabricksSqlExecutor;
+    use crate::graph_catalog::databricks_probe::DatabricksProbe;
+
+    let executor = app_state
+        .executor
+        .as_any()
+        .and_then(|a| a.downcast_ref::<DatabricksSqlExecutor>())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Databricks mode is active but the executor is not a DatabricksSqlExecutor" })),
+            )
+        })?;
+
+    let catalog = executor.catalog().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Databricks introspection requires a catalog. Set DATABRICKS_CATALOG (or the schema YAML `catalog:` field) and restart the server; the request's `database` is used as the Spark schema within that catalog." })),
+        )
+    })?;
+
+    DatabricksProbe::introspect(executor, catalog, schema)
+        .await
+        .map_err(|e| {
+            log::error!("Databricks introspect failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })
+}
+
+pub async fn introspect_handler(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<IntrospectRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    log::info!("Introspecting database: {}", payload.database);
+
+    // Validate database name to prevent SQL injection
+    if !payload
+        .database
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_')
+    {
+        log::error!("Invalid database name: {}", payload.database);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid database name" })),
+        ));
+    }
+
+    let resp = introspect_for_backend(&app_state, &payload.database).await?;
+    Ok(Json(
+        serde_json::to_value(resp).expect("an introspection response serializes to JSON"),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct DiscoverPromptRequest {
+    pub database: String,
+}
+
+pub async fn discover_prompt_handler(
+    State(app_state): State<Arc<AppState>>,
+    Json(payload): Json<DiscoverPromptRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    log::info!("Generating discovery prompt for: {}", payload.database);
+
+    // Validate database name to prevent SQL injection
+    if !payload
+        .database
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid database name" })),
+        ));
+    }
+
+    // Introspect via whichever backend is active (ClickHouse or Databricks).
+    let resp = introspect_for_backend(&app_state, &payload.database).await?;
+    let prompt_response =
+        crate::graph_catalog::llm_prompt::format_discovery_prompt(&resp.database, &resp.tables);
+    Ok(Json(
+        serde_json::to_value(prompt_response)
+            .expect("a discovery prompt response serializes to JSON"),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct DraftRequestPayload {
+    pub database: String,
+    pub schema_name: String,
+    pub nodes: Vec<NodeHint>,
+    pub edges: Option<Vec<EdgeHint>>,
+    pub fk_edges: Option<Vec<FkEdgeHint>>,
+    pub options: Option<DraftOptions>,
+}
+
+pub async fn draft_handler(
+    State(_app_state): State<Arc<AppState>>,
+    Json(payload): Json<DraftRequestPayload>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    log::info!("Generating draft for schema: {}", payload.schema_name);
+
+    let request = DraftRequest {
+        database: payload.database,
+        schema_name: payload.schema_name,
+        nodes: payload.nodes,
+        edges: payload.edges.unwrap_or_default(),
+        fk_edges: payload.fk_edges.unwrap_or_default(),
+        options: payload.options,
+    };
+
+    let yaml = SchemaDiscovery::generate_draft(&request);
+
+    Ok(Json(serde_json::json!({
+        "yaml": yaml,
+        "message": "Review and edit the YAML before loading with /schemas/load"
+    })))
+}

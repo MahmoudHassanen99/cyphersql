@@ -1,0 +1,1 @@
+not supported: type IN_FORUM pairs ["forum_id", "region"] with Forum's id ["region", "forum_id"]: the same columns in another order

@@ -1,0 +1,951 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use clickhouse::Client;
+use tokio::{sync::RwLock, time::interval};
+
+use crate::graph_catalog::{
+    config::{GraphSchemaConfig, GraphSchemaDefinition},
+    graph_schema::{GraphSchema, GraphSchemaElement},
+};
+use crate::utils::id_encoding::IdEncoding;
+
+/// Indicates the source from which the schema was loaded
+#[derive(Debug, Clone)]
+pub enum SchemaSource {
+    Yaml,
+    Database,
+}
+
+use super::{
+    models::GraphCatalog, GLOBAL_SCHEMAS, GLOBAL_SCHEMA_CONFIG, GLOBAL_SCHEMA_CONFIGS,
+    GLOBAL_SCHEMA_CONTENT_HASHES,
+};
+
+/// The schema the name `default` aliases: the configured `default_schema`,
+/// else the first schema of the startup config. `None`: `default` names a
+/// schema of its own (a single unnamed schema, the database catalog), or
+/// nothing was loaded.
+static DEFAULT_SCHEMA_TARGET: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The schema the name `default` aliases ([`DEFAULT_SCHEMA_TARGET`]).
+pub fn default_schema_target() -> Option<String> {
+    DEFAULT_SCHEMA_TARGET.read().ok().and_then(|t| t.clone())
+}
+
+pub(crate) fn set_default_schema_target(target: Option<String>) {
+    if let Ok(mut t) = DEFAULT_SCHEMA_TARGET.write() {
+        *t = target;
+    }
+}
+
+/// After `name` is (re)loaded: when it is `default` or the schema `default`
+/// aliases, the two names no longer hold the same schema, so they are two
+/// graphs from now on (review of #1504: a UNION naming both read one copy).
+pub(crate) fn forget_default_alias_of(name: &str) {
+    let target = default_schema_target();
+    if name == crate::translate::DEFAULT_GRAPH || target.as_deref() == Some(name) {
+        set_default_schema_target(None);
+    }
+}
+
+/// Whether two schema names name the same graph: the same name, or
+/// `default` and the schema it aliases (a statement may name the default
+/// graph either way: `translate::StatementTargets::graph`).
+pub fn same_schema(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let default = crate::translate::DEFAULT_GRAPH;
+    default_schema_target().is_some_and(|t| (a == default && b == t) || (b == default && a == t))
+}
+
+/// Deterministic (within-process) hash of schema YAML content, used only to
+/// detect re-registration of an existing schema name with different content.
+/// Not a security primitive — `DefaultHasher` is fine here.
+fn hash_schema_content(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Warn (but don't block) when `schema_name` is being (re-)registered with
+/// content that differs from what's currently registered under that name.
+/// Last-writer-wins is intentional — `/schemas/load` is used for legitimate
+/// hot-reload of a schema's definition — but a collision with genuinely
+/// different content usually means two unrelated callers/tests picked the
+/// same schema name by accident, which is worth surfacing (#463). Idempotent
+/// re-registration of the SAME content stays silent.
+async fn warn_on_schema_content_collision(schema_name: &str, yaml_content: &str) {
+    let new_hash = hash_schema_content(yaml_content);
+    let hashes_lock = GLOBAL_SCHEMA_CONTENT_HASHES
+        .get_or_init(|| async { RwLock::new(HashMap::new()) })
+        .await;
+    let mut hashes_guard = hashes_lock.write().await;
+    if let Some(&existing_hash) = hashes_guard.get(schema_name) {
+        if existing_hash != new_hash {
+            log::warn!(
+                "Schema '{}' is being re-registered with DIFFERENT content than the \
+                 currently-registered version. This will silently repoint every \
+                 subsequent query against '{}' to the new definition. If this is \
+                 intentional (hot-reload), ignore this warning; if two unrelated \
+                 callers picked the same schema name by accident, rename one of them.",
+                schema_name,
+                schema_name
+            );
+        }
+    }
+    hashes_guard.insert(schema_name.to_string(), new_hash);
+}
+
+/// Pre-register all labels from a schema with the ID encoding registry.
+/// This enables id() decoding to work on first query without requiring
+/// prior node returns to populate the registry.
+pub fn preregister_schema_labels(schema: &GraphSchema) {
+    // Sort labels alphabetically for deterministic code assignment across restarts
+    let mut node_labels: Vec<_> = schema.all_node_schemas().keys().cloned().collect();
+    node_labels.sort();
+    for label in &node_labels {
+        let code = IdEncoding::register_label(label);
+        log::debug!("Pre-registered node label '{}' with code {}", label, code);
+    }
+    let mut rel_types: Vec<_> = schema
+        .get_relationships_schemas()
+        .keys()
+        .map(|k| k.split("::").next().unwrap_or(k).to_string())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    rel_types.sort();
+    for type_name in &rel_types {
+        let code = IdEncoding::register_label(type_name);
+        log::debug!(
+            "Pre-registered relationship type '{}' with code {}",
+            type_name,
+            code
+        );
+    }
+}
+
+/// Test basic ClickHouse connectivity
+async fn test_clickhouse_connection(client: Client) -> Result<(), String> {
+    client
+        .query("SELECT 1")
+        .fetch_one::<u8>()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("ClickHouse connection test failed: {}", e))
+}
+
+/// Load schema and config from YAML content string
+async fn load_schema_and_config_from_yaml_content(
+    yaml_content: &str,
+    clickhouse_client: Option<&Client>,
+) -> Result<(GraphSchema, GraphSchemaConfig), String> {
+    let config: GraphSchemaConfig = serde_yaml::from_str(yaml_content)
+        .map_err(|e| format!("Failed to parse YAML config: {}", e))?;
+
+    let schema = if let Some(client) = clickhouse_client {
+        // Use auto-discovery and engine detection when client is available
+        config
+            .to_graph_schema_with_client(client)
+            .await
+            .map_err(|e| format!("Failed to create schema with auto-discovery: {}", e))?
+    } else {
+        // Fallback to manual mode without client
+        config
+            .to_graph_schema()
+            .map_err(|e| format!("Failed to create schema from config: {}", e))?
+    };
+
+    Ok((schema, config))
+}
+
+/// The schemas of a startup YAML config, and the name of the schema its
+/// `default_schema` names.
+type LoadedSchemas = (
+    Vec<(String, GraphSchema, GraphSchemaConfig)>,
+    Option<String>,
+);
+
+/// Load multiple schemas from YAML content (supports both single and multi-schema format)
+async fn load_schemas_from_yaml_content(
+    yaml_content: &str,
+    clickhouse_client: Option<&Client>,
+) -> Result<LoadedSchemas, String> {
+    use crate::graph_catalog::config::SchemaConfigFile;
+
+    let config_file: SchemaConfigFile = serde_yaml::from_str(yaml_content)
+        .map_err(|e| format!("Failed to parse YAML config: {}", e))?;
+
+    let mut results = Vec::new();
+    let mut explicit_default = None;
+
+    match config_file {
+        SchemaConfigFile::Single(config) => {
+            // Single schema - use name from config or "default"
+            let schema_name = config.name.clone().unwrap_or_else(|| "default".to_string());
+
+            let schema = if let Some(client) = clickhouse_client {
+                config
+                    .to_graph_schema_with_client(client)
+                    .await
+                    .map_err(|e| format!("Failed to create schema: {}", e))?
+            } else {
+                config
+                    .to_graph_schema()
+                    .map_err(|e| format!("Failed to create schema: {}", e))?
+            };
+
+            results.push((schema_name, schema, config));
+        }
+        SchemaConfigFile::Multi {
+            default_schema,
+            schemas,
+        } => {
+            // Multiple schemas
+            for config in schemas {
+                let schema_name = config.name.clone().ok_or_else(|| {
+                    "Each schema in multi-schema file must have a 'name' field".to_string()
+                })?;
+
+                let schema = if let Some(client) = clickhouse_client {
+                    config
+                        .to_graph_schema_with_client(client)
+                        .await
+                        .map_err(|e| format!("Failed to create schema '{}': {}", schema_name, e))?
+                } else {
+                    config
+                        .to_graph_schema()
+                        .map_err(|e| format!("Failed to create schema '{}': {}", schema_name, e))?
+                };
+
+                results.push((schema_name.clone(), schema, config));
+            }
+
+            // If default_schema specified, add "default" alias
+            if let Some(default_name) = default_schema {
+                if let Some(idx) = results
+                    .iter()
+                    .position(|(name, _, _)| name == &default_name)
+                {
+                    let (_, schema, config) = results[idx].clone();
+                    results.push(("default".to_string(), schema, config));
+                    explicit_default = Some(default_name);
+                } else {
+                    return Err(format!(
+                        "default_schema '{}' not found in schemas list",
+                        default_name
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((results, explicit_default))
+}
+
+pub async fn initialize_global_schema(
+    clickhouse_client: Option<Client>,
+    validate_schema: bool,
+) -> Result<SchemaSource, String> {
+    log::info!("Initializing ClickGraph schema...");
+
+    // Try to load from YAML configuration first (preferred approach)
+    if let Ok(yaml_config_path) = std::env::var("GRAPH_CONFIG_PATH") {
+        log::info!(
+            "Loading schema from GRAPH_CONFIG_PATH: {}",
+            yaml_config_path
+        );
+
+        // Read YAML content
+        let yaml_content = std::fs::read_to_string(&yaml_config_path)
+            .map_err(|e| format!("Failed to read YAML file: {}", e))?;
+
+        // Load schemas (supports both single and multi-schema formats)
+        match load_schemas_from_yaml_content(&yaml_content, clickhouse_client.as_ref()).await {
+            Ok((schemas_list, explicit_default)) => {
+                log::info!(
+                    "✓ Loaded {} schema(s) from YAML: {}",
+                    schemas_list.len(),
+                    yaml_config_path
+                );
+
+                // Validate schemas against ClickHouse if requested
+                if validate_schema {
+                    if let Some(client) = clickhouse_client.as_ref() {
+                        log::info!("  Validating schemas against ClickHouse...");
+                        for (schema_name, _, config) in &schemas_list {
+                            match config
+                                .validate_schema(&mut crate::graph_catalog::SchemaValidator::new(
+                                    client.clone(),
+                                ))
+                                .await
+                            {
+                                Ok(_) => {
+                                    log::info!("  ✓ Schema '{}' validation passed", schema_name)
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "  ✗ Schema '{}' validation failed: {}",
+                                        schema_name,
+                                        e
+                                    );
+                                    return Err(format!(
+                                        "Schema '{}' validation failed: {}",
+                                        schema_name, e
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "  ⚠ Schema validation requested but no ClickHouse client available"
+                        );
+                        log::warn!("    Skipping validation - some queries may fail at runtime");
+                    }
+                }
+
+                // Build schema maps
+                let mut schemas = HashMap::new();
+                let mut view_configs = HashMap::new();
+                let schema_count = schemas_list.len();
+
+                // Check if "default" was explicitly set in config (from default_schema field)
+                let has_explicit_default =
+                    schemas_list.iter().any(|(name, _, _)| name == "default");
+                // The schema "default" aliases: the configured default_schema,
+                // else the first schema (#1370: a statement may name it
+                // either way).
+                set_default_schema_target(match explicit_default {
+                    Some(name) => Some(name),
+                    None if has_explicit_default => None,
+                    None => schemas_list
+                        .iter()
+                        .map(|(name, _, _)| name)
+                        .find(|name| *name != "default")
+                        .cloned(),
+                });
+                let mut first_schema_info: Option<(GraphSchema, GraphSchemaConfig)> = None;
+
+                for (schema_name, schema, config) in schemas_list {
+                    // Skip "default" here if it was explicitly set - we'll add it after the loop
+                    if schema_name == "default" {
+                        // Store to add after processing all schemas
+                        schemas.insert("default".to_string(), schema.clone());
+                        view_configs.insert("default".to_string(), config.clone());
+                        // Pre-register labels for id() decoding
+                        preregister_schema_labels(&schema);
+                        log::info!("  ✓ Registered explicit default schema");
+                        continue;
+                    }
+
+                    schemas.insert(schema_name.clone(), schema.clone());
+                    view_configs.insert(schema_name.clone(), config.clone());
+                    // Pre-register labels for id() decoding
+                    preregister_schema_labels(&schema);
+                    log::info!("  ✓ Registered schema: {}", schema_name);
+
+                    // Legacy: Set first (non-default) schema as GLOBAL_SCHEMA_CONFIG
+                    if first_schema_info.is_none() {
+                        GLOBAL_SCHEMA_CONFIG
+                            .set(RwLock::new(config.clone()))
+                            .map_err(|_| "Failed to initialize global view config")?;
+                        first_schema_info = Some((schema, config));
+                    }
+                }
+
+                // If no explicit default was set, use the first schema as default
+                if !has_explicit_default {
+                    if let Some((schema, config)) = first_schema_info {
+                        schemas.insert("default".to_string(), schema);
+                        view_configs.insert("default".to_string(), config);
+                        log::info!("  ✓ First schema also registered as 'default'");
+                    }
+                }
+
+                GLOBAL_SCHEMAS
+                    .set(RwLock::new(schemas))
+                    .map_err(|_| "Failed to initialize global schemas")?;
+                GLOBAL_SCHEMA_CONFIGS
+                    .set(RwLock::new(view_configs))
+                    .map_err(|_| "Failed to initialize global view configs")?;
+
+                println!(
+                    "✓ Schema initialization complete (YAML mode, {} schema(s) registered)",
+                    schema_count
+                );
+                return Ok(SchemaSource::Yaml);
+            }
+            Err(e) => {
+                log::warn!("✗ Failed to load YAML config {}: {}", yaml_config_path, e);
+                log::warn!("  Falling back to database schema loading...");
+            }
+        }
+    } else {
+        println!("No GRAPH_CONFIG_PATH environment variable found, using database schema");
+    }
+
+    // Fallback to database approach (original Brahmand behavior)
+    if let Some(client) = clickhouse_client.as_ref() {
+        match get_graph_catalog(client.clone()).await {
+            Ok(schema) => {
+                println!("✓ Successfully loaded schema from database");
+
+                let nodes_map = schema.all_node_schemas();
+                let rels_map = schema.get_relationships_schemas();
+
+                if nodes_map.is_empty() && rels_map.is_empty() {
+                    println!(
+                        "  Warning: Database schema is empty - this is normal for new installations"
+                    );
+                    println!(
+                        "  You can add graph schema using CREATE NODE/RELATIONSHIP statements"
+                    );
+                } else {
+                    println!("  - Loaded {} node types from database", nodes_map.len());
+                    println!(
+                        "  - Loaded {} relationship types from database",
+                        rels_map.len()
+                    );
+                }
+
+                // Initialize multi-schema storage with default schema
+                let mut schemas = HashMap::new();
+                schemas.insert("default".to_string(), schema.clone());
+                GLOBAL_SCHEMAS
+                    .set(RwLock::new(schemas))
+                    .map_err(|_| "Failed to initialize global schemas")?;
+
+                let mut view_configs = HashMap::new();
+                // For database mode, we don't have a view config, so create an empty one
+                let empty_config = GraphSchemaConfig {
+                    name: None,
+                    catalog: None,
+                    graph_schema: crate::graph_catalog::config::GraphSchemaDefinition {
+                        nodes: Vec::new(),
+                        relationships: Vec::new(),
+                        edges: Vec::new(),
+                        vector_indexes: Vec::new(),
+                        fulltext_indexes: Vec::new(),
+                        union_labels: Vec::new(),
+                    },
+                };
+                view_configs.insert("default".to_string(), empty_config);
+                GLOBAL_SCHEMA_CONFIGS
+                    .set(RwLock::new(view_configs))
+                    .map_err(|_| "Failed to initialize global view configs")?;
+
+                println!("✓ Schema initialization complete (database mode)");
+                Ok(SchemaSource::Database)
+            }
+            Err(e) => {
+                log::warn!("✗ Failed to load schema from database: {}", e);
+
+                // Try to test ClickHouse connectivity
+                match test_clickhouse_connection(client.clone()).await {
+                    Ok(_) => {
+                        println!("✓ ClickHouse connection is working");
+                        println!("  Creating empty schema for new installation...");
+
+                        // Initialize with empty but valid schema
+                        let empty_schema = GraphSchema::build(
+                            1,
+                            "default".to_string(),
+                            std::collections::HashMap::new(),
+                            std::collections::HashMap::new(),
+                        );
+
+                        // Initialize multi-schema storage with empty default schema
+                        let mut schemas = HashMap::new();
+                        schemas.insert("default".to_string(), empty_schema.clone());
+                        GLOBAL_SCHEMAS
+                            .set(RwLock::new(schemas))
+                            .map_err(|_| "Failed to initialize global schemas")?;
+
+                        let mut view_configs = HashMap::new();
+                        let empty_config = GraphSchemaConfig {
+                            name: None,
+                            catalog: None,
+                            graph_schema: GraphSchemaDefinition {
+                                nodes: Vec::new(),
+                                relationships: Vec::new(),
+                                edges: Vec::new(),
+                                vector_indexes: Vec::new(),
+                                fulltext_indexes: Vec::new(),
+                                union_labels: Vec::new(),
+                            },
+                        };
+                        view_configs.insert("default".to_string(), empty_config);
+                        GLOBAL_SCHEMA_CONFIGS
+                            .set(RwLock::new(view_configs))
+                            .map_err(|_| "Failed to initialize global view configs")?;
+
+                        println!("✓ Empty schema initialized successfully");
+                        println!(
+                            "  ClickGraph is ready to use. Add schema via YAML config or CREATE statements."
+                        );
+                        Ok(SchemaSource::Database)
+                    }
+                    Err(conn_err) => Err(format!(
+                        "Cannot initialize ClickGraph: ClickHouse connection failed: {}. \
+                            Please check your CLICKHOUSE_URL, credentials, and ensure ClickHouse is running.",
+                        conn_err
+                    )),
+                }
+            }
+        }
+    } else {
+        // No ClickHouse client provided at all
+        println!("⚠ No ClickHouse client configuration available");
+        println!(
+            "  Please provide YAML config via GRAPH_CONFIG_PATH or ClickHouse environment variables"
+        );
+
+        let empty_schema = GraphSchema::build(
+            1,
+            "default".to_string(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+
+        // Initialize multi-schema storage with empty default schema
+        let mut schemas = HashMap::new();
+        schemas.insert("default".to_string(), empty_schema.clone());
+        GLOBAL_SCHEMAS
+            .set(RwLock::new(schemas))
+            .map_err(|_| "Failed to initialize global schemas")?;
+
+        let mut view_configs = HashMap::new();
+        let empty_config = GraphSchemaConfig {
+            name: None,
+            catalog: None,
+            graph_schema: GraphSchemaDefinition {
+                nodes: Vec::new(),
+                relationships: Vec::new(),
+                edges: Vec::new(),
+                vector_indexes: Vec::new(),
+                fulltext_indexes: Vec::new(),
+                union_labels: Vec::new(),
+            },
+        };
+        view_configs.insert("default".to_string(), empty_config);
+        GLOBAL_SCHEMA_CONFIGS
+            .set(RwLock::new(view_configs))
+            .map_err(|_| "Failed to initialize global view configs")?;
+
+        println!("✓ Minimal schema initialized - server ready for YAML configuration");
+        Ok(SchemaSource::Database)
+    }
+}
+
+pub async fn refresh_global_schema(clickhouse_client: Client) -> Result<(), String> {
+    let new_schema = get_graph_catalog(clickhouse_client).await?;
+    // Acquire a write lock asynchronously and update the default schema
+    let global_schemas_lock = GLOBAL_SCHEMAS
+        .get()
+        .ok_or("Global schemas not initialized")?;
+    let mut schemas_guard = global_schemas_lock.write().await;
+    schemas_guard.insert("default".to_string(), new_schema);
+    println!("Global schema refreshed");
+    Ok(())
+}
+
+pub async fn get_graph_schema() -> Result<GraphSchema, String> {
+    let schemas_guard = GLOBAL_SCHEMAS
+        .get()
+        .ok_or("Global schemas not initialized. Server may not have completed startup. Check server logs for initialization errors.".to_string())?
+        .read()
+        .await;
+    schemas_guard
+        .get("default")
+        .cloned()
+        .ok_or("Default schema not found. No schema was loaded during initialization. Please load a schema via /schemas/load endpoint.".to_string())
+}
+
+pub async fn get_view_config() -> Option<GraphSchemaConfig> {
+    if let Some(config_guard) = GLOBAL_SCHEMA_CONFIG.get() {
+        let config = config_guard.read().await;
+        Some((*config).clone())
+    } else {
+        None
+    }
+}
+
+// Multi-schema support functions - NEW
+pub async fn get_graph_schema_by_name(schema_name: &str) -> Result<GraphSchema, String> {
+    let schemas_guard = GLOBAL_SCHEMAS
+        .get()
+        .ok_or("Global schemas not initialized")?
+        .read()
+        .await;
+
+    schemas_guard
+        .get(schema_name)
+        .cloned()
+        .ok_or(format!("Schema '{}' not found", schema_name))
+}
+
+/// Whether a schema of that name is loaded (without copying it).
+pub async fn schema_exists(schema_name: &str) -> bool {
+    match GLOBAL_SCHEMAS.get() {
+        Some(schemas) => schemas.read().await.contains_key(schema_name),
+        None => false,
+    }
+}
+
+pub async fn get_view_config_by_name(schema_name: &str) -> Result<GraphSchemaConfig, String> {
+    let configs_guard = GLOBAL_SCHEMA_CONFIGS
+        .get()
+        .ok_or("Global view configs not initialized")?
+        .read()
+        .await;
+
+    configs_guard.get(schema_name).cloned().ok_or(format!(
+        "View config for schema '{}' not found",
+        schema_name
+    ))
+}
+
+pub async fn list_available_schemas() -> Vec<String> {
+    if let Some(schemas_guard) = GLOBAL_SCHEMAS.get() {
+        let schemas = schemas_guard.read().await;
+        schemas.keys().cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Remove a runtime-registered schema from memory — the in-memory half of
+/// `DELETE /schemas/{name}` (the store half lives in `schema_registry`).
+///
+/// The `GLOBAL_SCHEMAS` write guard is held across all three removals, in
+/// exactly the order the load path acquires (`load_schema_from_content` also
+/// nests SCHEMAS → CONFIGS while holding the first guard). Holding across the
+/// removals is what makes the memory half delete one whole generation
+/// against a racing re-register (`POST /schemas/load`): if the load wins
+/// first, the DELETE sees the name gone and 404s; if the DELETE wins first,
+/// it removes all three halves of one generation. Releasing SCHEMAS between
+/// the two map deletions (the earlier shape) let the interleaving "delete →
+/// re-register both maps → delete configs only" leave a schema alive with no
+/// view config. The store statement of a DELETE, however, runs after this
+/// guard — see the handler's doc: DELETE vs re-register is last-writer-wins,
+/// not an atomic transaction (`SCHEMA_PERSISTENCE.md` §4).
+///
+/// `forget_default_alias_of` is deliberately NOT touched: removing an alias
+/// source must not silently re-merge `default` with whatever the alias
+/// pointed at — the boot duplication logic owns that. A schema re-created
+/// later goes through `load_schema_from_content`, which re-establishes every
+/// alias and hash properly.
+pub async fn remove_schema(schema_name: &str) -> Result<(), String> {
+    let schemas_lock = GLOBAL_SCHEMAS
+        .get()
+        .ok_or("Global schemas not initialized")?;
+    {
+        let mut schemas_guard = schemas_lock.write().await;
+        if schemas_guard.remove(schema_name).is_none() {
+            return Err(format!("Schema '{schema_name}' not found"));
+        }
+        if let Some(configs_lock) = GLOBAL_SCHEMA_CONFIGS.get() {
+            configs_lock.write().await.remove(schema_name);
+        }
+        if let Some(hashes_lock) = GLOBAL_SCHEMA_CONTENT_HASHES.get() {
+            hashes_lock.write().await.remove(schema_name);
+        }
+    }
+
+    log::info!(
+        "Schema '{}' removed from the in-memory registry",
+        crate::server::schema_registry::log_safe(schema_name)
+    );
+    Ok(())
+}
+
+pub async fn load_schema_from_content(
+    schema_name: &str,
+    yaml_content: &str,
+    clickhouse_client: Option<Client>,
+    validate_schema: bool,
+) -> Result<(), String> {
+    println!("Loading schema '{}' from YAML content", schema_name);
+
+    // Through the client, like the schemas loaded at startup: it reads the
+    // columns that auto_discover_columns asks for and each table's engine.
+    match load_schema_and_config_from_yaml_content(yaml_content, clickhouse_client.as_ref()).await {
+        Ok((schema, config)) => {
+            println!(
+                "✓ Successfully loaded schema '{}' from YAML content",
+                schema_name
+            );
+
+            // Validate schema against ClickHouse if requested
+            if validate_schema {
+                if let Some(client) = clickhouse_client.as_ref() {
+                    println!(
+                        "  Validating schema '{}' against ClickHouse...",
+                        schema_name
+                    );
+                    match config
+                        .validate_schema(&mut crate::graph_catalog::SchemaValidator::new(
+                            client.clone(),
+                        ))
+                        .await
+                    {
+                        Ok(_) => println!("  ✓ Schema validation passed"),
+                        Err(e) => {
+                            log::warn!("  ✗ Schema validation failed: {}", e);
+                            return Err(format!("Schema validation failed: {}", e));
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "  ⚠ Schema validation requested but no ClickHouse client available"
+                    );
+                    log::warn!("    Skipping validation - some queries may fail at runtime");
+                }
+            }
+
+            // Warn (not block) if this name was already registered with different content.
+            warn_on_schema_content_collision(schema_name, yaml_content).await;
+
+            // Give its labels their id codes now, in sorted order, as the
+            // schemas loaded at startup get theirs; the codes are
+            // process-wide, and a label met later is numbered in the order
+            // a query first returns it.
+            preregister_schema_labels(&schema);
+
+            // Add to multi-schema storage
+            let schemas_lock = GLOBAL_SCHEMAS
+                .get()
+                .ok_or("Global schemas not initialized")?;
+            let mut schemas_guard = schemas_lock.write().await;
+            schemas_guard.insert(schema_name.to_string(), schema.clone());
+            // Reloading `default` or the schema it aliases makes them two
+            // graphs: `default` keeps the copy it was registered with.
+            forget_default_alias_of(schema_name);
+
+            let configs_lock = GLOBAL_SCHEMA_CONFIGS
+                .get()
+                .ok_or("Global view configs not initialized")?;
+            let mut configs_guard = configs_lock.write().await;
+            configs_guard.insert(schema_name.to_string(), config);
+
+            println!(
+                "✓ Schema '{}' loaded successfully and registered in GLOBAL_SCHEMAS",
+                schema_name
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to load schema '{}': {}", schema_name, e)),
+    }
+}
+
+pub async fn get_graph_catalog(clickhouse_client: Client) -> Result<GraphSchema, String> {
+    let graph_catalog_query = "SELECT id, schema_json FROM graph_catalog FINAL";
+    let graph_catalog_result: Result<GraphCatalog, clickhouse::error::Error> = clickhouse_client
+        .query(graph_catalog_query)
+        .fetch_one::<GraphCatalog>()
+        .await;
+
+    match graph_catalog_result {
+        Ok(graph_catalog) => {
+            let graph_schema: GraphSchema = serde_json::from_str(&graph_catalog.schema_json)
+                .map_err(|e| format!("Schema parsing error: {}", e))?;
+
+            Ok(graph_schema)
+        }
+        Err(err) => {
+            // if it is a connection error then send error to the client from server
+            // if the graph catalog table is not present then create a one.
+            let err_msg: String = err.to_string();
+            // println!("err_msg -> {:?}", err_msg);
+
+            if err_msg.contains("UNKNOWN_TABLE") {
+                println!("Creating the graph_catalog table");
+                let create_graph_catalog_query = "
+                CREATE TABLE graph_catalog (
+                    id UInt64,
+                    schema_json String
+                ) ENGINE = ReplacingMergeTree()
+                ORDER BY id";
+
+                let _ = clickhouse_client
+                    .clone()
+                    .with_option("wait_end_of_query", "1")
+                    .query(create_graph_catalog_query)
+                    .execute()
+                    .await
+                    .map_err(|e| format!("Clickhouse Error: {}", e));
+
+                let graph_catalog = GraphCatalog {
+                    id: 1,
+                    schema_json: r#"{"version": 1,"nodes": {},"relationships": {}, "relationships_indexes": {}}"#.to_string(),
+                };
+                let mut insert = clickhouse_client
+                    .insert("graph_catalog")
+                    .map_err(|e| format!("Clickhouse Error: {}", e))?;
+                insert
+                    .write(&graph_catalog)
+                    .await
+                    .map_err(|e| format!("Clickhouse Error: {}", e))?;
+                insert
+                    .end()
+                    .await
+                    .map_err(|e| format!("Clickhouse Error: {}", e))?;
+
+                let graph_schema: GraphSchema = serde_json::from_str(&graph_catalog.schema_json)
+                    .map_err(|e| format!("Schema parsing error: {}", e))?;
+
+                Ok(graph_schema)
+            } else {
+                Err(format!("Clickhouse Error: {}", err_msg))
+            }
+        }
+    }
+}
+
+pub async fn validate_schema(graph_schema_element: &[GraphSchemaElement]) -> Result<(), String> {
+    for element in graph_schema_element {
+        if let GraphSchemaElement::Rel(relationship_schema) = element {
+            // here check if both from_node and to_node tables are present or not in the schema
+
+            let schemas_lock = GLOBAL_SCHEMAS
+                .get()
+                .ok_or("Schema registry not initialized during validate_schema. Server initialization may have failed.".to_string())?
+                .read()
+                .await;
+
+            let graph_schema_lock = schemas_lock
+                .get("default")
+                .ok_or("Default schema not found during validation. Ensure a schema has been loaded before validating relationships.".to_string())?;
+
+            if !graph_schema_lock
+                .all_node_schemas()
+                .contains_key(&relationship_schema.from_node)
+                || !graph_schema_lock
+                    .all_node_schemas()
+                    .contains_key(&relationship_schema.to_node)
+            {
+                return Err("From and To node tables must be present before creating a relationship between them".to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn add_to_schema(
+    clickhouse_client: Client,
+    graph_schema_elements: Vec<GraphSchemaElement>,
+) -> Result<(), String> {
+    // Get "default" schema from GLOBAL_SCHEMAS registry
+    let schemas_lock = GLOBAL_SCHEMAS
+        .get()
+        .ok_or_else(|| "Schema registry not initialized".to_string())?;
+    let mut schemas = schemas_lock.write().await;
+    let graph_schema = schemas
+        .get_mut("default")
+        .ok_or_else(|| "Default schema not found".to_string())?;
+
+    for element in graph_schema_elements {
+        match element {
+            GraphSchemaElement::Node(boxed_schema) => {
+                let node_schema = *boxed_schema;
+                graph_schema.insert_node_schema(node_schema.table_name.to_string(), node_schema);
+                graph_schema.increment_version();
+            }
+            GraphSchemaElement::Rel(boxed_schema) => {
+                let relationship_schema = *boxed_schema;
+                graph_schema.insert_rel_schema(
+                    relationship_schema.table_name.to_string(),
+                    relationship_schema,
+                );
+                graph_schema.increment_version();
+            }
+        }
+    }
+
+    // The insert_* mutators above only touch `relationships`/`nodes`; the derived
+    // `rel_type_index`/`denormalized_nodes` must be rebuilt so subsequent lookups
+    // resolve simple relationship type names (same defect class as #1081).
+    graph_schema.rebuild_derived_indexes();
+
+    let schema_json = serde_json::to_string(&*graph_schema)
+        .map_err(|e| format!("Schema serialization error: {}", e))?;
+
+    let graph_catalog = GraphCatalog { id: 1, schema_json };
+
+    let mut insert = clickhouse_client
+        .insert("graph_catalog")
+        .map_err(|e| format!("Clickhouse Error: {}", e))?;
+    insert
+        .write(&graph_catalog)
+        .await
+        .map_err(|e| format!("Clickhouse Error: {}", e))?;
+    insert
+        .end()
+        .await
+        .map_err(|e| format!("Clickhouse Error: {}", e))?;
+
+    Ok(())
+}
+
+// This function periodically checks for schema updates.
+// This will be helpful in distributed environment where schema has changed.
+// In distributed environment, I think Keeper Map engine makes sense.
+pub async fn monitor_schema_updates(ch_client: Client) {
+    // TODO Currently checking after every min. Make it an option to set by user.
+    let mut ticker = interval(Duration::from_secs(60));
+
+    loop {
+        ticker.tick().await;
+
+        // Check if global schema registry is initialized before proceeding
+        let global_schemas = match GLOBAL_SCHEMAS.get() {
+            Some(schemas) => schemas,
+            None => {
+                log::warn!("Schema monitor: Schema registry not initialized, skipping check");
+                continue;
+            }
+        };
+
+        // Get current in-memory schema version
+        let mem_version = {
+            let schemas_guard = global_schemas.read().await;
+            let in_mem_schema = match schemas_guard.get("default") {
+                Some(schema) => schema,
+                None => {
+                    log::warn!("Schema monitor: Default schema not found, skipping check");
+                    continue;
+                }
+            };
+            in_mem_schema.get_version()
+        };
+
+        // Fetch the schema from ClickHouse
+        let remote_schema = match get_graph_catalog(ch_client.clone()).await {
+            Ok(schema) => schema,
+            Err(err) => {
+                log::warn!("Schema monitor: Error fetching remote schema: {}", err);
+                continue;
+            }
+        };
+
+        // Compare versions and update if needed
+        if remote_schema.get_version() != mem_version {
+            let mut schemas_guard = global_schemas.write().await;
+            if let Some(schema) = schemas_guard.get_mut("default") {
+                *schema = remote_schema.clone();
+
+                println!(
+                    "✓ Schema monitor: Default schema updated from version {} to {}",
+                    mem_version,
+                    remote_schema.get_version()
+                );
+            }
+        }
+    }
+}
+
+// Load schema from YAML configuration file

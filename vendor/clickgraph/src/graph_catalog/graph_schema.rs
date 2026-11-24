@@ -1,0 +1,3985 @@
+//! Graph schema definitions and operations
+//!
+//! Some methods are reserved for future online validation and runtime checks.
+//!
+//! Note: The following functions are intentionally unused (reserved for future):
+//! - `validate_table_exists`, `validate_column_exists`, `get_column_type`: For runtime schema validation
+//! - `is_relationship_compatible`, `is_node_type_compatible`: For polymorphic node type matching
+#![allow(dead_code)]
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
+
+use super::config::Identifier;
+use super::engine_detection::TableEngine;
+use super::errors::GraphSchemaError;
+use super::expression_parser::PropertyValue;
+use super::filter_parser::SchemaFilter;
+use super::schema_types::SchemaType;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NodeSchema {
+    pub database: String,
+    pub table_name: String,
+    pub column_names: Vec<String>,
+    pub primary_keys: String,
+    pub node_id: NodeIdSchema,
+    pub property_mappings: HashMap<String, PropertyValue>,
+    /// The properties were discovered from the table (`auto_discover_columns`),
+    /// so `property_mappings` lists every property: a name not there (an
+    /// excluded column, say) is not a property and reads as NULL, never as
+    /// the same-named column.
+    #[serde(default)]
+    pub closed_properties: bool,
+    /// Optional: List of view parameters for parameterized views
+    /// Example: Some(vec!["tenant_id".to_string(), "region".to_string()])
+    pub view_parameters: Option<Vec<String>>,
+    /// Table engine type (for FINAL keyword support)
+    #[serde(skip)]
+    pub engine: Option<TableEngine>,
+    /// Optional: Whether to use FINAL keyword for this table
+    /// - None: Auto-detect based on engine type
+    /// - Some(true): Always use FINAL
+    /// - Some(false): Never use FINAL
+    pub use_final: Option<bool>,
+
+    /// Optional: SQL predicate filter applied to all queries on this node
+    /// Column references are prefixed with table alias at query time
+    #[serde(skip)]
+    pub filter: Option<SchemaFilter>,
+
+    // ===== Denormalized node support =====
+    /// If true, this node is denormalized on one or more edge tables
+    /// (no physical node table exists)
+    #[serde(skip)]
+    pub is_denormalized: bool,
+
+    /// Property mappings when this node appears as from_node in a relationship
+    /// Only used for denormalized nodes
+    /// Example: {"code": "origin_code", "city": "origin_city"}
+    #[serde(skip)]
+    pub from_properties: Option<HashMap<String, String>>,
+
+    /// Property mappings when this node appears as to_node in a relationship
+    /// Only used for denormalized nodes
+    /// Example: {"code": "dest_code", "city": "dest_city"}
+    #[serde(skip)]
+    pub to_properties: Option<HashMap<String, String>>,
+
+    /// The edge table(s) that provide denormalized properties
+    /// Only used for denormalized nodes
+    /// Example: Some("flights")
+    #[serde(skip)]
+    pub denormalized_source_table: Option<String>,
+
+    // ===== Polymorphic table support =====
+    /// Optional: Column containing node type discriminator (for shared tables)
+    /// Used when multiple node labels share the same table
+    /// Example: "type" column distinguishes Post vs Comment in Message table
+    #[serde(skip)]
+    pub label_column: Option<String>,
+
+    /// Optional: Value in label_column that identifies this node type
+    /// Required when label_column is specified
+    /// Example: "Comment" for Comment nodes in Message table where type='Comment'
+    #[serde(skip)]
+    pub label_value: Option<String>,
+
+    // ===== Neo4j elementId support =====
+    /// Types for node_id columns (for performant elementId queries)
+    /// Populated from:
+    /// 1. Auto-detection (querying ClickHouse system.columns) - preferred
+    /// 2. Schema YAML (type/types field) - for sql_only mode
+    ///
+    /// Required for Neo4j compatibility (elementId function support).
+    #[serde(skip)]
+    pub node_id_types: Option<Vec<SchemaType>>,
+
+    /// Optional: chdb data source URI (for embedded mode).
+    /// Used by the data loader to create a `CREATE VIEW` in the chdb session.
+    #[serde(skip)]
+    pub source: Option<String>,
+
+    /// Optional: Property types for DDL generation (Cypher property name -> SchemaType)
+    /// When present, DDL columns use the specified ClickHouse type instead of String
+    #[serde(skip)]
+    pub property_types: HashMap<String, SchemaType>,
+
+    /// The backend type of each of its table's columns where known (read
+    /// at load or declared, docs/design/VALUE_TYPES.md T1), by column name:
+    /// what a property mapped to a column is (T2: an `Array` column's
+    /// property is a list).
+    #[serde(skip)]
+    pub column_types: HashMap<String, crate::graph_catalog::schema_types::KeyPartType>,
+
+    /// Optional: How the node ID column is filled when Cypher CREATE omits
+    /// it (Decision 0.2 of the embedded-writes design). `None` is treated as
+    /// `Uuid` — the DDL `DEFAULT generateUUIDv4()` fills the column. Other
+    /// strategies (`Provided`, `Snowflake`) are dispatched by
+    /// `clickhouse_query_generator::auto_id_decision`.
+    #[serde(skip)]
+    pub id_generation: Option<crate::clickhouse_query_generator::IdStrategy>,
+}
+
+impl NodeSchema {
+    /// The column type of property `p` where known ([`property_column_type`]).
+    /// A node embedded in edge tables reads its properties per role: not
+    /// known.
+    pub fn property_column_type(
+        &self,
+        p: &str,
+    ) -> Option<&crate::graph_catalog::schema_types::KeyPartType> {
+        if self.is_denormalized {
+            return None;
+        }
+        property_column_type(
+            &self.property_mappings,
+            self.closed_properties,
+            &self.column_types,
+            p,
+        )
+    }
+
+    /// Determine if FINAL should be used for this node
+    pub fn should_use_final(&self) -> bool {
+        // 1. Check explicit override (user choice takes precedence)
+        if let Some(use_final) = self.use_final {
+            return use_final;
+        }
+
+        // 2. Auto-detect: Use FINAL for engines that need it for correctness
+        // (Conservative: only deduplication/collapsing engines)
+        if let Some(ref engine) = self.engine {
+            engine.requires_final_for_correctness()
+        } else {
+            // No engine information - default to false
+            false
+        }
+    }
+
+    /// Check if this node type has a given Cypher property name.
+    /// Checks property_mappings (standard), from_properties, and to_properties (denormalized).
+    pub fn has_cypher_property(&self, cypher_prop: &str) -> bool {
+        if self.property_mappings.contains_key(cypher_prop) {
+            return true;
+        }
+        if let Some(ref from_props) = self.from_properties {
+            if from_props.contains_key(cypher_prop) {
+                return true;
+            }
+        }
+        if let Some(ref to_props) = self.to_properties {
+            if to_props.contains_key(cypher_prop) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The full set of physical DB column names this node schema can resolve
+    /// a property to, across ALL three resolution sources checked by
+    /// `has_cypher_property`/`resolve_property`-style lookups: `property_mappings`
+    /// (standard/polymorphic), and `from_properties`/`to_properties`
+    /// (denormalized — a node whose real columns live on an edge table under
+    /// role-specific names, e.g. `schemas/dev/flights_denormalized.yaml`'s
+    /// `Airport` node with empty `property_mappings` and its columns entirely
+    /// in `from_node_properties`/`to_node_properties`).
+    ///
+    /// Canonical accessor for "is this physical column valid for this node's
+    /// table" checks (e.g. #476/#520 UNION branch NULL-padding in
+    /// `to_sql_query.rs`'s `table_valid_columns`) — callers must route
+    /// through this rather than reading `property_mappings` alone, which
+    /// silently misses denormalized columns.
+    pub fn all_valid_physical_columns(&self) -> HashSet<String> {
+        let mut cols: HashSet<String> = HashSet::new();
+        for value in self.property_mappings.values() {
+            if let PropertyValue::Column(col) = value {
+                cols.insert(col.clone());
+            }
+        }
+        if let Some(ref from_props) = self.from_properties {
+            cols.extend(from_props.values().cloned());
+        }
+        if let Some(ref to_props) = self.to_properties {
+            cols.extend(to_props.values().cloned());
+        }
+        cols
+    }
+
+    /// #549: merge this node's role-specific denormalized property map
+    /// (`from_properties`/`to_properties`) with any ADDITIONAL properties
+    /// declared in `property_mappings` that aren't already covered by the
+    /// role-specific map. Complements `all_valid_physical_columns()` (which
+    /// answers "is this column valid" via a flat set) by preserving
+    /// NAME→COLUMN mapping semantics for property *resolution*.
+    ///
+    /// `RelationshipSchema::from_node_properties`/`to_node_properties` are
+    /// populated FROM this at schema-load time (`graph_catalog::config`'s
+    /// `build_relationship_schema`), and virtually every downstream
+    /// property-resolution site (`PatternSchemaContext::extract_denorm_props`,
+    /// ...) reads the relationship-level
+    /// field rather than this node-level one — routing the merge through here
+    /// ONCE at schema-load time fixes all of them, rather than requiring each
+    /// call site to independently remember to also consult
+    /// `property_mappings`. Before this fix, a `property_mappings`-sourced
+    /// property on a node that ALSO had role-specific from/to maps was never
+    /// included in the role-specific map at all, so any downstream reference
+    /// to it (e.g. across a WITH-aggregate CTE barrier) was silently dropped
+    /// from the projection entirely — not NULL-padded, just absent — causing
+    /// a ClickHouse "Unknown identifier" error.
+    ///
+    /// Returns `None` exactly when this node has no role-specific mapping for
+    /// this role (i.e. it isn't denormalized on this side) — callers must
+    /// preserve that `None`-ness (it drives `is_denormalized`-adjacent checks
+    /// downstream, e.g. `RelationshipSchema::from_node_properties.is_some()`),
+    /// never conflating "no role mapping" with "empty map".
+    ///
+    /// Role-specific mappings ALWAYS win on a property-name collision, and
+    /// `node_id` property names are excluded from the merge entirely.
+    /// `build_node_property_mappings` (`graph_catalog::config`) auto-adds an
+    /// IDENTITY entry to `property_mappings` for every `node_id` property
+    /// name that wasn't manually mapped — for a denormalized node that
+    /// identity mapping is spurious: e.g. `flights_denormalized.yaml`'s
+    /// `Airport` gets `code -> code` but no physical `code` column exists
+    /// (only `origin_code`/`dest_code`), and zeek's `IP` gets
+    /// `"id.orig_h" -> "id.orig_h"`, a column its role maps deliberately
+    /// expose only under the Cypher name `ip`. Merging those would either
+    /// resolve to a dangling physical column (Airport, if it won a collision)
+    /// or grow a phantom extra property on a real, already-working schema
+    /// (zeek, where the id NAME differs from every role-map name so
+    /// `or_insert` would not catch it). A denormalized node's identity
+    /// columns are always covered by its role-specific maps (schema
+    /// validation requires them, and node_id resolution goes through them),
+    /// so skipping the id names loses nothing.
+    pub fn denorm_role_properties(&self, is_from_node: bool) -> Option<HashMap<String, String>> {
+        let role_props = if is_from_node {
+            self.from_properties.as_ref()
+        } else {
+            self.to_properties.as_ref()
+        }?;
+
+        let id_names = self.node_id.columns();
+        let mut result = role_props.clone();
+        for (prop_name, prop_value) in &self.property_mappings {
+            if id_names.contains(&prop_name.as_str()) {
+                continue;
+            }
+            result
+                .entry(prop_name.clone())
+                .or_insert_with(|| prop_value.raw_column_name());
+        }
+        Some(result)
+    }
+
+    /// Check if this engine supports FINAL (regardless of whether we use it by default)
+    pub fn can_use_final(&self) -> bool {
+        if let Some(ref engine) = self.engine {
+            engine.supports_final()
+        } else {
+            false
+        }
+    }
+
+    /// Helper for tests: Create a NodeSchema with default denormalized fields (traditional node pattern)
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // 9 fields are intrinsic to NodeSchema; test-only constructor
+    pub fn new_traditional(
+        database: String,
+        table_name: String,
+        column_names: Vec<String>,
+        primary_keys: String,
+        node_id: NodeIdSchema,
+        property_mappings: HashMap<String, PropertyValue>,
+        view_parameters: Option<Vec<String>>,
+        engine: Option<TableEngine>,
+        use_final: Option<bool>,
+    ) -> Self {
+        NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database,
+            table_name,
+            column_names,
+            primary_keys,
+            node_id,
+            property_mappings,
+            view_parameters,
+            engine,
+            use_final,
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RelationshipSchema {
+    pub database: String,
+    pub table_name: String,
+    pub column_names: Vec<String>,
+    /// The properties were discovered from the table (`auto_discover_columns`),
+    /// so `property_mappings` lists every property: a name not there (an
+    /// excluded column, say) is not a property and reads as NULL, never as
+    /// the same-named column.
+    #[serde(default)]
+    pub closed_properties: bool,
+    /// 🟢 GRAPH SPACE: Node label for source node (e.g., "User")
+    /// Used for query planning, pattern matching, and property resolution
+    pub from_node: String,
+    /// 🟢 GRAPH SPACE: Node label for target node (e.g., "Product")
+    /// Used for query planning, pattern matching, and property resolution
+    pub to_node: String,
+    /// 🔵 RELATIONAL SPACE: Table name for source node (e.g., "users_bench")
+    /// Used for SQL generation and JOIN construction
+    pub from_node_table: String,
+    /// 🔵 RELATIONAL SPACE: Table name for target node (e.g., "products_bench")
+    /// Used for SQL generation and JOIN construction
+    pub to_node_table: String,
+    pub from_id: Identifier, // FK column(s) for source node ID (e.g., "user1_id" or ["bank_id", "account_number"])
+    pub to_id: Identifier, // FK column(s) for target node ID (e.g., "user2_id" or ["to_bank_id", "to_account_number"])
+    pub from_node_id_dtype: SchemaType,
+    pub to_node_id_dtype: SchemaType,
+    /// #1360: each end column's discovered type, per part of a composite id.
+    /// The `*_dtype` fields above can hold only one type, which is why a
+    /// `[k String, v Date]` key could never be cast correctly. Empty when
+    /// discovery did not run or could not see the table, which the walk key
+    /// reads as "unknown" and leaves the SQL exactly as it was before.
+    #[serde(default)]
+    pub from_node_id_part_types: Vec<crate::graph_catalog::schema_types::KeyPartType>,
+    #[serde(default)]
+    pub to_node_id_part_types: Vec<crate::graph_catalog::schema_types::KeyPartType>,
+    pub property_mappings: HashMap<String, PropertyValue>,
+    /// Optional: List of view parameters for parameterized views
+    pub view_parameters: Option<Vec<String>>,
+    /// Table engine type (for FINAL keyword support)
+    #[serde(skip)]
+    pub engine: Option<TableEngine>,
+    /// Optional: Whether to use FINAL keyword for this table
+    /// - None: Auto-detect based on engine type
+    /// - Some(true): Always use FINAL
+    /// - Some(false): Never use FINAL
+    pub use_final: Option<bool>,
+
+    /// Optional: SQL predicate filter applied to all queries on this relationship
+    /// Column references are prefixed with table alias at query time
+    #[serde(skip)]
+    pub filter: Option<SchemaFilter>,
+
+    // ===== New fields for enhanced schema support =====
+    /// Optional: Composite edge ID (for uniqueness filters)
+    /// If None, defaults to [from_id, to_id]
+    /// Example: Some(Composite(["FlightDate", "FlightNum", "Origin", "Dest"]))
+    #[serde(skip)]
+    pub edge_id: Option<Identifier>,
+
+    /// Optional: Polymorphic edge discriminator columns
+    /// Used to filter rows by edge type and node types at query time
+    #[serde(skip)]
+    pub type_column: Option<String>,
+    #[serde(skip)]
+    pub from_label_column: Option<String>,
+    #[serde(skip)]
+    pub to_label_column: Option<String>,
+
+    /// Optional: Valid labels for polymorphic from side (closed-world validation)
+    /// When specified, only these labels are allowed for the source node
+    /// Example: Some(["User", "Group"]) for MEMBER_OF edge
+    #[serde(skip)]
+    pub from_label_values: Option<Vec<String>>,
+
+    /// Optional: Valid labels for polymorphic to side (closed-world validation)
+    /// When specified, only these labels are allowed for the target node
+    /// Example: Some(["Folder", "File"]) for CONTAINS edge
+    #[serde(skip)]
+    pub to_label_values: Option<Vec<String>>,
+
+    /// Optional: Denormalized node properties (source node)
+    /// Maps graph property names to table columns
+    /// Example: {"city": "OriginCityName", "state": "OriginState"}
+    #[serde(skip)]
+    pub from_node_properties: Option<HashMap<String, String>>,
+
+    /// Optional: Denormalized node properties (target node)
+    /// Maps graph property names to table columns
+    /// Example: {"city": "DestCityName", "state": "DestState"}
+    #[serde(skip)]
+    pub to_node_properties: Option<HashMap<String, String>>,
+
+    /// If true, this is an FK-edge pattern where the edge is represented by a
+    /// foreign key column on one of the node tables (no separate edge table).
+    ///
+    /// Two variants:
+    /// 1. Self-referencing: edge table = from_node table = to_node table
+    ///    - Example: `fs_objects.parent_id → fs_objects.object_id`
+    ///    - Query: `(child:Object)-[:PARENT]->(parent:Object)`
+    ///    - SQL:   `child.parent_id = parent.object_id`
+    ///
+    /// 2. Non-self-referencing: edge table = from_node table ≠ to_node table
+    ///    - Example: `orders.customer_id → customers.customer_id`
+    ///    - Query: `(o:Order)-[:PLACED_BY]->(c:Customer)`
+    ///    - SQL:   `o.customer_id = c.customer_id`
+    ///
+    /// Detection: edge table matches from_node OR to_node table, with no
+    /// denormalized node properties (from_node_properties/to_node_properties).
+    #[serde(skip)]
+    pub is_fk_edge: bool,
+
+    /// Optional: Edge traversal constraint expression
+    /// SQL expression with 'from.property' and 'to.property' references
+    /// Compiled to additional JOIN ON condition beyond ID equality
+    /// Use AND/OR for composite logic
+    ///
+    /// Examples:
+    ///   - "from.timestamp < to.timestamp"  (chronological ordering)
+    ///   - "from.app_id = to.app_id"  (context preservation)
+    ///   - "from.timestamp + 300 > to.timestamp AND from.country = to.country"
+    ///
+    /// Applied as:
+    /// - Single-hop: Additional condition in JOIN ON clause
+    /// - VLP: Additional condition in recursive CTE JOIN
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<String>,
+
+    // ===== Neo4j elementId support =====
+    /// Types for edge_id columns (for performant elementId queries)
+    /// Populated from:
+    /// 1. Auto-detection (querying ClickHouse system.columns)
+    /// 2. Schema YAML (type/types field)
+    ///
+    /// Required for Neo4j compatibility (elementId function support for relationships).
+    #[serde(skip)]
+    pub edge_id_types: Option<Vec<SchemaType>>,
+
+    /// Optional: chdb data source URI (for embedded mode).
+    #[serde(skip)]
+    pub source: Option<String>,
+
+    /// Optional: Property types for DDL generation (Cypher property name -> SchemaType)
+    /// When present, DDL columns use the specified ClickHouse type instead of String
+    #[serde(skip)]
+    pub property_types: HashMap<String, SchemaType>,
+
+    /// The backend type of each of its table's columns where known (read
+    /// at load or declared, docs/design/VALUE_TYPES.md T1), by column name:
+    /// what a property mapped to a column is (T2: an `Array` column's
+    /// property is a list).
+    #[serde(skip)]
+    pub column_types: HashMap<String, crate::graph_catalog::schema_types::KeyPartType>,
+}
+
+/// The column type of property `p` of an element mapping properties by
+/// `mappings` (VALUE_TYPES.md T2): its mapped column's, or, undeclared where
+/// properties are not `closed`, the same-named column's; `None` when not
+/// known (an expression mapping, an unknown type).
+fn property_column_type<'a>(
+    mappings: &HashMap<String, PropertyValue>,
+    closed: bool,
+    types: &'a HashMap<String, crate::graph_catalog::schema_types::KeyPartType>,
+    p: &str,
+) -> Option<&'a crate::graph_catalog::schema_types::KeyPartType> {
+    match mappings.get(p) {
+        Some(PropertyValue::Column(c)) => types.get(c),
+        Some(_) => None,
+        None if closed => None,
+        None => types.get(p),
+    }
+}
+
+/// What one column of a relationship's identity is
+/// ([`RelationshipSchema::identity_columns`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityPart<'a> {
+    /// A part of its `edge_id`, this column.
+    Edge(&'a str),
+    /// Part `i` of its stored `from` end.
+    From(usize),
+    /// Part `i` of its stored `to` end.
+    To(usize),
+}
+
+impl RelationshipSchema {
+    /// Whether a part of its `edge_id` may be NULL, as its column's type says
+    /// (ELEMENT_IDENTITY.md I6d; unknown types: not).
+    pub fn edge_id_nullable(&self) -> bool {
+        self.edge_id.as_ref().is_some_and(|id| {
+            id.columns().iter().any(|c| {
+                self.column_types
+                    .get(*c)
+                    .is_some_and(|t| t.nullable && !t.raw.is_empty())
+            })
+        })
+    }
+
+    /// The columns identifying one of its relationships (#887, I6d): its
+    /// `edge_id`; where a part of that may be NULL, its stored `(from, to)`
+    /// ends and then its `edge_id`, which tell such relationships apart as
+    /// their element ids (`TYPE:\N:from->to-`) do (its first column is then
+    /// NULL only where it is: an OPTIONAL MATCH's); without one, its ends.
+    pub fn identity_columns(&self) -> Vec<&str> {
+        let ends = || {
+            self.from_id
+                .columns()
+                .into_iter()
+                .chain(self.to_id.columns())
+        };
+        match &self.edge_id {
+            Some(id) if self.edge_id_nullable() => ends().chain(id.columns()).collect(),
+            Some(id) => id.columns(),
+            None => ends().collect(),
+        }
+    }
+
+    /// What identity column `i` ([`Self::identity_columns`]) is.
+    pub fn identity_part(&self, i: usize) -> Option<IdentityPart<'_>> {
+        let edge: Vec<&str> = match &self.edge_id {
+            Some(id) => id.columns(),
+            None => Vec::new(),
+        };
+        let (from, to) = (self.from_id.columns().len(), self.to_id.columns().len());
+        let ends = match &self.edge_id {
+            None => true,
+            Some(_) => self.edge_id_nullable(),
+        };
+        if !ends {
+            return edge.get(i).map(|c| IdentityPart::Edge(c));
+        }
+        match i {
+            i if i < from => Some(IdentityPart::From(i)),
+            i if i < from + to => Some(IdentityPart::To(i - from)),
+            i => edge.get(i - from - to).map(|c| IdentityPart::Edge(c)),
+        }
+    }
+
+    /// The column type of property `p` where known ([`property_column_type`]).
+    pub fn property_column_type(
+        &self,
+        p: &str,
+    ) -> Option<&crate::graph_catalog::schema_types::KeyPartType> {
+        property_column_type(
+            &self.property_mappings,
+            self.closed_properties,
+            &self.column_types,
+            p,
+        )
+    }
+
+    /// True when the relationship is a plain (separate or polymorphic) edge
+    /// table: NOT an FK-edge (edge = FK column on a node table) and with no
+    /// embedded/denormalized node properties on either side. Schema-pattern
+    /// classification belongs here (axis-dispatch rule); callers outside
+    /// `graph_catalog` should use this instead of testing the raw flags.
+    pub fn is_plain_edge_table(&self) -> bool {
+        !self.is_fk_edge && self.from_node_properties.is_none() && self.to_node_properties.is_none()
+    }
+
+    /// An FK edge: each relationship is a node's row (of one of its ends'
+    /// tables) holding a reference to the other end, so it is gone with the
+    /// node whose row it is, and with the node it references (no row
+    /// joins it).
+    pub fn is_node_row_reference(&self) -> bool {
+        self.is_fk_edge
+    }
+
+    /// P-4c S4 / S8a: every row of the relationship's table is one
+    /// relationship, from the node its `from_id` names to the node its
+    /// `to_id` names, between nodes of its declared labels: a separate edge
+    /// table, or (S8a) an FK edge, whose table is one of its ends' node
+    /// tables (each row a node holding a reference to the other end), or
+    /// (S8b) an edge table embedding its ends' properties (each row a
+    /// relationship naming its ends, whose nodes are the relation
+    /// `GraphSchema::lowering_view` gives their label). No type or label
+    /// discriminator columns, no `$any` side. A row whose end is NULL or
+    /// names no node joins no node, so it is no relationship. Its endpoints
+    /// must also be nodes of their own rows (`NodeSchema::
+    /// is_standard_own_table`) for the edge to be scanned with node joins.
+    pub fn is_edge_row_table(&self) -> bool {
+        self.has_fixed_endpoint_labels()
+    }
+
+    /// P-4c S7b3a: every row of the relationship joins a node of `from_node`
+    /// to one of `to_node` — the schema fixes its endpoints' labels (no type
+    /// or label discriminator column, no `$any` side), whatever its table
+    /// layout. Otherwise a row's labels are its own, and the declared ones
+    /// say nothing about which labels a path through it can reach.
+    pub fn has_fixed_endpoint_labels(&self) -> bool {
+        !self.is_polymorphic()
+            && self.from_label_column.is_none()
+            && self.to_label_column.is_none()
+            && self.from_node != "$any"
+            && self.to_node != "$any"
+    }
+
+    /// True when the relationship is a **polymorphic** edge: all edge types
+    /// share one physical table, discriminated by a type column. Schema-pattern
+    /// classification belongs here (axis-dispatch rule); callers outside
+    /// `graph_catalog` should use this instead of testing the raw discriminator
+    /// field. Note `is_plain_edge_table()` is ALSO true for a polymorphic edge
+    /// (it has no denormalized node properties), so a caller that needs "plain
+    /// AND monomorphic" must combine `is_plain_edge_table() && !is_polymorphic()`.
+    pub fn is_polymorphic(&self) -> bool {
+        self.type_column.is_some()
+    }
+
+    /// True for a **self-referencing FK-edge** — an FK-edge whose from- and
+    /// to-node are the same table with no denormalized node properties (e.g.
+    /// `(child:Object)-[:PARENT]->(parent:Object)` on one `fs_objects` table, or
+    /// `(e:Employee)-[:REPORTS_TO]->(m:Employee)` on `emp`). Both endpoints map
+    /// to the same physical table, which is currently mis-planned as a single
+    /// scan with no self-join. The #584 coupled-rel-var aggregate remap must NOT
+    /// fire here: rewriting `count(r)` → `count(m.<col>)` would fabricate
+    /// valid-but-wrong SQL from what legitimately errors LOUD (Code 47) on main
+    /// (ground rule 1). A non-self-referencing FK-edge (Order≠Customer) and a
+    /// fully-denormalized coupled edge (from_node_properties present, distinct
+    /// labels) are both excluded and still remap. Axis-dispatch: this pattern
+    /// classification belongs in `graph_catalog`.
+    pub fn is_self_referencing_fk_edge(&self) -> bool {
+        self.is_fk_edge
+            && self.from_node_table == self.to_node_table
+            && self.from_node_properties.is_none()
+            && self.to_node_properties.is_none()
+    }
+
+    /// Determine if FINAL should be used for this relationship
+    pub fn should_use_final(&self) -> bool {
+        // 1. Check explicit override (user choice takes precedence)
+        if let Some(use_final) = self.use_final {
+            return use_final;
+        }
+
+        // 2. Auto-detect: Use FINAL for engines that need it for correctness
+        if let Some(ref engine) = self.engine {
+            engine.requires_final_for_correctness()
+        } else {
+            false
+        }
+    }
+
+    /// Check if this engine supports FINAL
+    pub fn can_use_final(&self) -> bool {
+        if let Some(ref engine) = self.engine {
+            engine.supports_final()
+        } else {
+            false
+        }
+    }
+
+    /// Get the fully qualified table name (database.table)
+    pub fn full_table_name(&self) -> String {
+        format!("{}.{}", self.database, self.table_name)
+    }
+
+    /// #529: physical DB columns valid for THIS relationship's own row —
+    /// the relationship-owned companion to `NodeSchema::all_valid_physical_columns`.
+    /// Covers `property_mappings`, the edge's own identity column(s)
+    /// (`edge_id`, falling back to `from_id`/`to_id`), and any denormalized
+    /// from/to-side node property columns embedded on the same physical row
+    /// (`from_node_properties`/`to_node_properties`).
+    ///
+    /// Used by `table_valid_columns` (#476/#529) so a bare aggregate argument
+    /// on the relationship variable itself (e.g. `count(r)` normalized to
+    /// `r.<edge id column>`) isn't incorrectly NULL-padded out of every UNION
+    /// branch just because the anchor NODE schema alone doesn't know about a
+    /// column that actually belongs to the relationship's own row (coupled/
+    /// embedded-edge schemas, where node and relationship share one table).
+    pub fn all_valid_physical_columns(&self) -> HashSet<String> {
+        let mut cols: HashSet<String> = HashSet::new();
+        for value in self.property_mappings.values() {
+            if let PropertyValue::Column(col) = value {
+                cols.insert(col.clone());
+            }
+        }
+        if let Some(ref edge_id) = self.edge_id {
+            cols.extend(edge_id.columns().iter().map(|c| c.to_string()));
+        }
+        cols.extend(self.from_id.columns().iter().map(|c| c.to_string()));
+        cols.extend(self.to_id.columns().iter().map(|c| c.to_string()));
+        if let Some(ref from_props) = self.from_node_properties {
+            cols.extend(from_props.values().cloned());
+        }
+        if let Some(ref to_props) = self.to_node_properties {
+            cols.extend(to_props.values().cloned());
+        }
+        cols
+    }
+}
+
+impl NodeSchema {
+    /// Get the fully qualified table name (database.table)
+    pub fn full_table_name(&self) -> String {
+        // A node relation (`GraphSchema::lowering_view`, P-4c S8b) is a CTE
+        // of the query, read by its name.
+        if self.database.is_empty() {
+            return self.table_name.clone();
+        }
+        format!("{}.{}", self.database, self.table_name)
+    }
+
+    /// P-4c S4: the node is the standard layout — its own table, one row per
+    /// node, not embedded in an edge table and not sharing a table with other
+    /// labels through a label column. The bound-plan lowering scans only these
+    /// directly (other layouts come in S8 through `PatternSchemaContext`).
+    pub fn is_standard_own_table(&self) -> bool {
+        !self.is_denormalized && self.label_column.is_none()
+    }
+
+    /// #492 review RN5: The node's identity columns as PHYSICAL table columns
+    /// (node_id property names resolved through property_mappings; identity
+    /// fallback when unmapped). Used to compare two node-table rows for
+    /// identity, e.g. FK-edge relationship-uniqueness guards.
+    pub fn id_physical_columns(&self) -> Vec<String> {
+        self.node_id
+            .columns()
+            .iter()
+            .map(|prop| {
+                self.property_mappings
+                    .get(*prop)
+                    .map(|pv| pv.raw().to_string())
+                    .unwrap_or_else(|| prop.to_string())
+            })
+            .collect()
+    }
+
+    /// #492: Cypher property names whose denormalized from- OR to-side DB
+    /// column equals `db_col`, in deterministic (sorted) order.
+    ///
+    /// Used to translate a property reference that was schema-mapped against
+    /// ONE adjacent edge's side of a denormalized chain (e.g. `b.code` →
+    /// `Dest`, b as the first hop's to-node) back to its Cypher name so the
+    /// renderer can re-map it onto the side of the edge the alias is actually
+    /// bound to (`Origin`, b as the second hop's from-node).
+    pub fn denorm_properties_for_side_column(&self, db_col: &str) -> Vec<String> {
+        let mut names: Vec<String> = [self.from_properties.as_ref(), self.to_properties.as_ref()]
+            .into_iter()
+            .flatten()
+            .flat_map(|props| {
+                props
+                    .iter()
+                    .filter(|(_, col)| col.as_str() == db_col)
+                    .map(|(name, _)| name.clone())
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+impl GraphSchema {
+    /// #492 review RN5: For an FK-edge relationship (the edge row IS a node
+    /// table row carrying the FK — no separate edge table), return which
+    /// endpoint's node table physically owns the relationship row:
+    /// `Some(true)` = the from-side node table, `Some(false)` = the to-side.
+    /// `None` for relationships with their own table. Mirrors the join-side
+    /// resolution in `pattern_schema`'s `FkEdgeJoin` strategy.
+    pub fn fk_edge_anchor_is_from(&self, rel: &RelationshipSchema) -> Option<bool> {
+        if !rel.is_fk_edge {
+            return None;
+        }
+        let edge_table = rel.full_table_name();
+        let from_table = self
+            .node_schema_opt(&rel.from_node)
+            .map(|n| n.full_table_name());
+        let to_table = self
+            .node_schema_opt(&rel.to_node)
+            .map(|n| n.full_table_name());
+        if from_table.as_deref() == Some(edge_table.as_str()) {
+            Some(true)
+        } else if to_table.as_deref() == Some(edge_table.as_str()) {
+            Some(false)
+        } else {
+            // Shouldn't happen if is_fk_edge is set correctly — mirror the
+            // FkEdgeJoin fallback (edge treated as the from-side node table).
+            Some(true)
+        }
+    }
+
+    /// Whether an FK edge's owner (the node whose rows are its rows) is its
+    /// from-node ([`Self::fk_edge_anchor_is_from`]), or `None` when `rel` is
+    /// no FK edge. When both ends are labels of the edge's table (labels
+    /// sharing a table), the owner is the end whose columns hold its node's
+    /// id (`from_id: id, to_id: parent` is the from-node's row).
+    fn fk_edge_owner_is_from(&self, rel: &RelationshipSchema) -> Option<bool> {
+        let anchor = self.fk_edge_anchor_is_from(rel)?;
+        if rel.from_node == rel.to_node {
+            return Some(anchor);
+        }
+        let on_table = |label: &str| {
+            self.node_schema_opt(label)
+                .filter(|n| n.full_table_name() == rel.full_table_name())
+        };
+        let holds_id = |n: &NodeSchema, end: &Identifier| {
+            let mut own = n.id_physical_columns();
+            let mut cols: Vec<String> = end.columns().iter().map(|c| c.to_string()).collect();
+            own.sort();
+            cols.sort();
+            own == cols
+        };
+        match (on_table(&rel.from_node), on_table(&rel.to_node)) {
+            (Some(f), Some(t)) => match (holds_id(f, &rel.from_id), holds_id(t, &rel.to_id)) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => Some(anchor),
+            },
+            _ => Some(anchor),
+        }
+    }
+
+    /// P-4c S8a – S8c: the schema the bound-plan lowering reads, or `None`
+    /// when it is this one: discriminator columns as row filters
+    /// ([`Self::with_discriminators_as_filters`]), FK edges as tables of
+    /// relationships ([`Self::with_fk_edges_as_edge_rows`]) and labels
+    /// embedded in edge tables as node relations
+    /// ([`Self::with_node_relations`]), each over the one before.
+    pub fn lowering_view(&self) -> Option<GraphSchema> {
+        let filtered = self.with_discriminators_as_filters();
+        let base = filtered.as_ref().unwrap_or(self);
+        let fk = base.with_fk_edges_as_edge_rows();
+        let base = fk.as_ref().unwrap_or(base);
+        base.with_node_relations().or(fk).or(filtered)
+    }
+
+    /// P-4c S8b: record every definition of each label (the build keeps one
+    /// per label in `nodes`).
+    /// Set the union labels (`config::UnionLabelDefinition`), validated.
+    pub fn set_union_labels(&mut self, union_labels: BTreeMap<String, BTreeSet<String>>) {
+        self.union_labels = union_labels;
+    }
+
+    /// The node labels whose nodes carry the union label `label`, if it is
+    /// one.
+    pub fn union_label_members(&self, label: &str) -> Option<&BTreeSet<String>> {
+        self.union_labels.get(label)
+    }
+
+    /// The union labels a node of `label` also carries, in name order.
+    pub fn union_labels_of(&self, label: &str) -> Vec<&str> {
+        self.union_labels
+            .iter()
+            .filter(|(_, members)| members.contains(label))
+            .map(|(u, _)| u.as_str())
+            .collect()
+    }
+
+    /// Every union label, with its node labels.
+    pub fn union_labels(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.union_labels
+    }
+
+    pub fn set_node_definitions(&mut self, definitions: BTreeMap<String, Vec<NodeSchema>>) {
+        self.node_definitions = definitions;
+    }
+
+    /// The node relation read under the name `table`
+    /// ([`Self::with_node_relations`]).
+    pub fn node_relation(&self, table: &str) -> Option<&NodeRelation> {
+        self.node_relations.get(table)
+    }
+
+    /// Every node relation, by the name it is read under.
+    pub fn node_relations(&self) -> impl Iterator<Item = (&String, &NodeRelation)> {
+        self.node_relations.iter()
+    }
+
+    /// P-4c S8b: the schema with each label whose nodes are embedded in
+    /// edge tables (a denormalized node: `from_node_properties` /
+    /// `to_node_properties` over the table of an edge it is an end of) read
+    /// as a node relation, and each label of its own table that edges only
+    /// carry the id of (a "foreign" denormalized node) as that table; `None`
+    /// when no label is either.
+    ///
+    /// An embedded label's nodes are the distinct ids its roles hold: each
+    /// role of each definition (`from_node_properties`, `to_node_properties`)
+    /// is a source, the rows of its table (with the definition's `filter:`,
+    /// view parameters and FINAL), its columns for the label's properties.
+    /// A node is one id (a row whose id is NULL is no node); its property
+    /// is the value its sources hold (the schema says a property is the
+    /// node's, so all rows of one id hold one value). The node becomes an
+    /// own-table node over the relation named `__cg_nodes_<label>`, a CTE
+    /// the lowering builds from [`NodeRelation`]: its columns are the
+    /// label's property names. A label whose id a role does not hold, or
+    /// whose definitions mix embedded and own tables, is left as it is (not
+    /// lowered).
+    pub fn with_node_relations(&self) -> Option<GraphSchema> {
+        // Labels with a denormalized definition, or several definitions
+        // (the catalog's `nodes` keeps one of them).
+        let mut labels: BTreeSet<&String> = self
+            .nodes
+            .iter()
+            .filter(|(key, ns)| ns.is_denormalized && !key.contains("::"))
+            .map(|(key, _)| key)
+            .collect();
+        for (label, defs) in &self.node_definitions {
+            if defs.len() > 1 || defs.iter().any(|d| d.is_denormalized) {
+                labels.insert(label);
+            }
+        }
+        if labels.is_empty() {
+            return None;
+        }
+        let mut out = self.clone();
+        let mut changed = false;
+        for label in labels {
+            let mut defs: Vec<&NodeSchema> = self
+                .node_definitions
+                .get(label.as_str())
+                .map(|d| d.iter().collect())
+                .unwrap_or_default();
+            if defs.is_empty() {
+                defs = self.nodes.get(label).into_iter().collect();
+            }
+            let hosts_edge = |ns: &NodeSchema| {
+                ns.is_denormalized
+                    && self.relationships.values().any(|r| {
+                        r.full_table_name() == ns.full_table_name()
+                            && (r.from_node == *label || r.to_node == *label)
+                    })
+            };
+            let embedded = defs.iter().filter(|d| hosts_edge(d)).count();
+            match (embedded, defs.as_slice()) {
+                // Its own table's rows are its nodes; the edges' copies of
+                // its id are a way to read them.
+                (0, [own]) => {
+                    if own.is_denormalized {
+                        let mut node = (*own).clone();
+                        node.is_denormalized = false;
+                        node.from_properties = None;
+                        node.to_properties = None;
+                        node.denormalized_source_table = None;
+                        out.nodes.insert(label.clone(), node);
+                        changed = true;
+                    }
+                }
+                (n, _) if n == defs.len() => {
+                    let Some((relation, node)) = Self::embedded_relation(label, &defs) else {
+                        out.nodes.remove(label);
+                        changed = true;
+                        continue;
+                    };
+                    // An edge's end embedded in one of the relation's
+                    // sources names the id's columns in the source's id
+                    // order (a composite end may list them in another).
+                    for (key, rel) in &self.relationships {
+                        let mut read = rel.clone();
+                        for from_end in [true, false] {
+                            let (end_label, end) = match from_end {
+                                true => (&rel.from_node, &mut read.from_id),
+                                false => (&rel.to_node, &mut read.to_id),
+                            };
+                            if end_label != label {
+                                continue;
+                            }
+                            if let Some(ordered) = relation.ordered_end(&rel.full_table_name(), end)
+                            {
+                                *end = ordered;
+                            }
+                        }
+                        if read.from_id != rel.from_id || read.to_id != rel.to_id {
+                            out.relationships.insert(key.clone(), read);
+                        }
+                    }
+                    out.node_relations.insert(node.table_name.clone(), relation);
+                    out.nodes.insert(label.clone(), node);
+                    changed = true;
+                }
+                // Embedded in some tables and its own in others, or several
+                // own tables: one relation of them is not built yet; the
+                // label is left out of the view (not lowered) rather than
+                // read as one of its definitions.
+                _ => {
+                    out.nodes.remove(label);
+                    changed = true;
+                }
+            }
+        }
+        changed.then_some(out)
+    }
+
+    /// The relation of `label`'s embedded definitions `defs`, and the node
+    /// schema reading it ([`Self::with_node_relations`]).
+    fn embedded_relation(label: &str, defs: &[&NodeSchema]) -> Option<(NodeRelation, NodeSchema)> {
+        let mut id: Option<Vec<String>> = None;
+        let mut sources: Vec<NodeSource> = Vec::new();
+        for def in defs {
+            let roles: Vec<&HashMap<String, String>> = [&def.from_properties, &def.to_properties]
+                .into_iter()
+                .flatten()
+                .filter(|m| !m.is_empty())
+                .collect();
+            // `node_id` names the id's properties, or (as some schemas
+            // write it) a role's columns of them.
+            let mut props = Vec::new();
+            for n in def.node_id.id.columns() {
+                let p = if roles.iter().any(|m| m.contains_key(n)) {
+                    n.to_string()
+                } else {
+                    roles
+                        .iter()
+                        .find_map(|m| m.iter().find(|(_, c)| c.as_str() == n))
+                        .map(|(p, _)| p.clone())?
+                };
+                props.push(p);
+            }
+            match &id {
+                Some(known) if *known != props => return None,
+                _ => id = Some(props.clone()),
+            }
+            for m in roles {
+                if props.iter().any(|p| !m.contains_key(p)) {
+                    return None;
+                }
+                let mut columns: Vec<(String, String)> =
+                    m.iter().map(|(p, c)| (p.clone(), c.clone())).collect();
+                columns.sort();
+                let source = NodeSource {
+                    table: def.full_table_name(),
+                    view_parameters: def.view_parameters.clone(),
+                    use_final: def.should_use_final(),
+                    filter: def.filter.clone(),
+                    columns,
+                };
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
+        let id = id?;
+        if sources.is_empty() {
+            return None;
+        }
+        let properties: Vec<String> = sources
+            .iter()
+            .flat_map(|s| s.columns.iter().map(|(p, _)| p.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let name = format!("__cg_nodes_{label}");
+        let first = defs[0];
+        // The columns' types of every definition's table (a column named alike
+        // in two of them: the first's), for `NodeRelation::column_types`.
+        let mut column_types = std::collections::HashMap::new();
+        for def in defs.iter() {
+            for (column, ty) in &def.column_types {
+                column_types
+                    .entry(column.clone())
+                    .or_insert_with(|| ty.clone());
+            }
+        }
+        let node = NodeSchema {
+            column_types: Default::default(),
+            database: String::new(),
+            table_name: name,
+            column_names: properties.clone(),
+            primary_keys: id.join(", "),
+            node_id: NodeIdSchema {
+                part_types: Vec::new(),
+                id: match id.as_slice() {
+                    [one] => Identifier::Single(one.clone()),
+                    _ => Identifier::Composite(id.clone()),
+                },
+                dtype: first.node_id.dtype,
+            },
+            property_mappings: properties
+                .iter()
+                .map(|p| (p.clone(), PropertyValue::Column(p.clone())))
+                .collect(),
+            closed_properties: false,
+            view_parameters: None,
+            engine: None,
+            use_final: Some(false),
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: first.node_id_types.clone(),
+            source: None,
+            property_types: first.property_types.clone(),
+            id_generation: None,
+        };
+        Some((
+            NodeRelation {
+                label: label.to_string(),
+                id,
+                properties,
+                sources,
+                column_types,
+            },
+            node,
+        ))
+    }
+
+    /// P-4c S8c: the schema with each table's discriminators written as row
+    /// filters, or `None` when no table has any:
+    ///
+    /// * **Polymorphic relationships** (rows of several types or end labels
+    ///   in one table, told apart by a type column and label columns) are a
+    ///   definition per type and pair of end labels, `T::From::To`, its rows
+    ///   those the discriminators name (`type_column = 'T'`,
+    ///   `from_label_column = 'From'`, …) and its own `filter:`. An end
+    ///   written `$any` is each label of the schema, or of its
+    ///   `from_label_values` / `to_label_values` when given: a row whose label
+    ///   column names another label holds no relationship.
+    /// * **Node labels sharing a table** through a label column are their
+    ///   table's rows of `label_column = label_value` (and their `filter:`).
+    ///
+    /// A table whose discriminators cannot be written as a filter (a quote or
+    /// backslash in a value, a backtick in a column) and an `$any` end
+    /// without a label column (its row does not say which node it holds) are
+    /// left as they are, and a pair of labels another definition of the type
+    /// already joins stays polymorphic: not lowered.
+    pub fn with_discriminators_as_filters(&self) -> Option<GraphSchema> {
+        let mut out: Option<GraphSchema> = None;
+        for (label, ns) in &self.nodes {
+            let (Some(column), Some(value)) = (&ns.label_column, &ns.label_value) else {
+                continue;
+            };
+            let Some(filter) = discriminated(ns.filter.as_ref(), &[(column, value)]) else {
+                continue;
+            };
+            let mut node = ns.clone();
+            node.filter = Some(filter);
+            node.label_column = None;
+            node.label_value = None;
+            out.get_or_insert_with(|| self.clone())
+                .nodes
+                .insert(label.clone(), node);
+        }
+        let labels: Vec<&String> = self.nodes.keys().filter(|k| !k.contains("::")).collect();
+        let mut expanded: Vec<(&String, Vec<(String, RelationshipSchema)>)> = Vec::new();
+        for (key, rel) in &self.relationships {
+            if rel.has_fixed_endpoint_labels() {
+                continue;
+            }
+            let rel_type = key.split("::").next().unwrap_or(key);
+            if let Some(definitions) = self.discriminated_definitions(rel_type, rel, &labels) {
+                expanded.push((key, definitions));
+            }
+        }
+        if expanded.is_empty() {
+            return out;
+        }
+        let o = out.get_or_insert_with(|| self.clone());
+        for (key, definitions) in expanded {
+            o.relationships.remove(key);
+            o.relationships.extend(definitions);
+        }
+        o.rebuild_derived_indexes();
+        out
+    }
+
+    /// The definitions `rel` (polymorphic, of `rel_type`) is read as
+    /// ([`Self::with_discriminators_as_filters`]), or `None` when it cannot
+    /// be.
+    fn discriminated_definitions(
+        &self,
+        rel_type: &str,
+        rel: &RelationshipSchema,
+        labels: &[&String],
+    ) -> Option<Vec<(String, RelationshipSchema)>> {
+        // Each label an end can be, with the column its rows name it in.
+        let ends = |node: &String, column: &Option<String>, values: &Option<Vec<String>>| {
+            if node != "$any" {
+                return Some(vec![(node.clone(), column.clone())]);
+            }
+            let column = column.as_ref()?;
+            Some(
+                labels
+                    .iter()
+                    .filter(|l| values.as_ref().is_none_or(|vs| vs.contains(l)))
+                    .map(|l| ((*l).clone(), Some(column.clone())))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let froms = ends(
+            &rel.from_node,
+            &rel.from_label_column,
+            &rel.from_label_values,
+        )?;
+        let tos = ends(&rel.to_node, &rel.to_label_column, &rel.to_label_values)?;
+        let mut out = Vec::new();
+        for (fl, fcol) in &froms {
+            for (tl, tcol) in &tos {
+                let key = format!("{rel_type}::{fl}::{tl}");
+                if self.relationships.contains_key(&key) {
+                    // Another definition of the type between these labels:
+                    // the catalog holds one per key (and its type index
+                    // hides `rel`'s), so the pair is left polymorphic, which
+                    // the lowering refuses, rather than read as either.
+                    let mut both = rel.clone();
+                    both.from_node = fl.clone();
+                    both.to_node = tl.clone();
+                    out.push((key, both));
+                    continue;
+                }
+                let mut conditions: Vec<(&str, &str)> = Vec::new();
+                if let Some(c) = &rel.type_column {
+                    conditions.push((c, rel_type));
+                }
+                if let Some(c) = fcol {
+                    conditions.push((c, fl));
+                }
+                if let Some(c) = tcol {
+                    conditions.push((c, tl));
+                }
+                let filter = discriminated(rel.filter.as_ref(), &conditions)?;
+                let table = |label: &String| {
+                    self.nodes
+                        .get(label)
+                        .map_or_else(|| label.clone(), |n| n.table_name.clone())
+                };
+                let mut d = rel.clone();
+                d.from_node_table = table(fl);
+                d.to_node_table = table(tl);
+                d.from_node = fl.clone();
+                d.to_node = tl.clone();
+                d.type_column = None;
+                d.from_label_column = None;
+                d.to_label_column = None;
+                d.from_label_values = None;
+                d.to_label_values = None;
+                d.filter = Some(filter);
+                out.push((key, d));
+            }
+        }
+        Some(out)
+    }
+
+    /// P-4c S8a: the schema with each FK edge written as a table of
+    /// relationships reads it (`RelationshipSchema::is_edge_row_table`: a
+    /// row's `from_id` holds its from-node's id, its `to_id` its to-node's),
+    /// or `None` when no FK edge needs rewriting. Two readings of an FK edge
+    /// are this catalog's, not the YAML's surface:
+    ///
+    /// * **Ends of a self-referencing FK edge** (#632): its rows are nodes of
+    ///   its one label, each related to the node its reference names,
+    ///   whichever of `from_id` / `to_id` the schema writes the reference in
+    ///   (`from_id: parent_id, to_id: object_id`, the documented form, and
+    ///   `from_id: comment_id, to_id: reply_of_id` are both the row's node to
+    ///   the node it references; legacy's `FkEdgeJoin` and its walk read it
+    ///   so). The reference is the side whose columns are not the node's id.
+    ///   Written as edge-table ends: `from_id` the node's id, `to_id` the
+    ///   reference.
+    /// * **Table options**: an FK edge's rows are its owning node's rows, so
+    ///   where the edge declares no view parameters its table is read with
+    ///   that node's, and with FINAL when the node's is.
+    pub fn with_fk_edges_as_edge_rows(&self) -> Option<GraphSchema> {
+        let mut out: Option<GraphSchema> = None;
+        for (key, rel) in &self.relationships {
+            let Some(from_is_owner) = self.fk_edge_owner_is_from(rel) else {
+                continue;
+            };
+            let owner_label = if from_is_owner {
+                &rel.from_node
+            } else {
+                &rel.to_node
+            };
+            let Some(owner) = self.node_schema_opt(owner_label) else {
+                continue;
+            };
+            let mut read = rel.clone();
+            if rel.from_node == rel.to_node {
+                let own = owner.id_physical_columns();
+                let own_id = match own.as_slice() {
+                    [one] => Identifier::Single(one.clone()),
+                    _ => Identifier::Composite(own.clone()),
+                };
+                let reference = if rel.from_id.columns() == own_id.columns() {
+                    rel.to_id.clone()
+                } else {
+                    rel.from_id.clone()
+                };
+                read.from_id = own_id;
+                read.to_id = reference;
+            }
+            if read.view_parameters.is_none() {
+                read.view_parameters = owner.view_parameters.clone();
+            }
+            // `use_final` is always set once loaded (unset is the engine's
+            // answer, else false), so "the edge declares none" cannot be
+            // told apart: either definition asking for FINAL reads the rows
+            // with it.
+            if owner.should_use_final() {
+                read.use_final = Some(true);
+            }
+            // Its rows are its owner's: the owner's `filter:` (and, for
+            // labels sharing a table, its label condition, S8c) holds of
+            // them; another label's row of the same id is no reference
+            // (review).
+            if owner.filter.is_some() {
+                let Some(filter) = both_filters(rel.filter.as_ref(), owner.filter.as_ref()) else {
+                    // Unreachable: two filters that parse, ANDed, parse.
+                    continue;
+                };
+                read.filter = Some(filter);
+            }
+            if read.from_id == rel.from_id
+                && read.to_id == rel.to_id
+                && read.view_parameters == rel.view_parameters
+                && read.should_use_final() == rel.should_use_final()
+                && read.filter == rel.filter
+            {
+                continue;
+            }
+            out.get_or_insert_with(|| self.clone())
+                .relationships
+                .insert(key.clone(), read);
+        }
+        out
+    }
+
+    /// #492: Reverse-lookup the Cypher property names whose denormalized
+    /// from-/to-side column equals `db_col` (see
+    /// [`NodeSchema::denorm_properties_for_side_column`]). Scoped to `label`
+    /// when known; otherwise searches every node schema (deterministic:
+    /// `nodes` is a `BTreeMap` and per-schema results are sorted).
+    pub fn denorm_properties_for_side_column(
+        &self,
+        label: Option<&str>,
+        db_col: &str,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = match label.and_then(|l| self.nodes.get(l)) {
+            Some(node_schema) => node_schema.denorm_properties_for_side_column(db_col),
+            None => self
+                .nodes
+                .values()
+                .flat_map(|ns| ns.denorm_properties_for_side_column(db_col))
+                .collect(),
+        };
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+/// P-4c S8b: the nodes of a label embedded in edge tables, as a relation
+/// (`GraphSchema::with_node_relations`): one row per id held by any of its
+/// sources, a column per property.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeRelation {
+    pub label: String,
+    /// The id's properties (columns of the relation).
+    pub id: Vec<String>,
+    /// Every property its sources hold (the id's among them), sorted.
+    pub properties: Vec<String>,
+    pub sources: Vec<NodeSource>,
+    /// Column types of the underlying table(s), keyed by column name
+    /// (VALUE_TYPES.md T1). Used to tell complex (Array/Map/Tuple/Dynamic)
+    /// properties apart from scalar ones for embedded nodes. (#1490)
+    pub column_types:
+        std::collections::HashMap<String, crate::graph_catalog::schema_types::KeyPartType>,
+}
+
+/// `a` and `b` (either may be absent) as one schema filter.
+fn both_filters(a: Option<&SchemaFilter>, b: Option<&SchemaFilter>) -> Option<SchemaFilter> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let filter = SchemaFilter::new(&format!("({}) AND ({})", a.raw, b.raw)).ok()?;
+            filter.to_sql("e").ok()?;
+            Some(filter)
+        }
+        (a, b) => a.or(b).cloned(),
+    }
+}
+
+/// `filter` (when given) and each `column = 'value'` of `conditions`, as one
+/// schema filter; `None` when a condition cannot be written in the filter
+/// grammar (a backtick in the column; a quote in the value, or a backslash,
+/// which ClickHouse reads as an escape).
+fn discriminated(
+    filter: Option<&SchemaFilter>,
+    conditions: &[(&str, &str)],
+) -> Option<SchemaFilter> {
+    let mut parts: Vec<String> = filter.map(|f| format!("({})", f.raw)).into_iter().collect();
+    for (column, value) in conditions {
+        if column.contains('`') || value.contains('\'') || value.contains('\\') {
+            return None;
+        }
+        parts.push(format!("`{column}` = '{value}'"));
+    }
+    let filter = SchemaFilter::new(&parts.join(" AND ")).ok()?;
+    // The whole text is the predicate (`new` checks a prefix).
+    filter.to_sql("e").ok()?;
+    Some(filter)
+}
+
+impl NodeRelation {
+    /// The columns of `end` (an edge end on `table`) in the order of the
+    /// relation's id, when a source on `table` holds the id in exactly those
+    /// columns; `None` otherwise (the end is read as written).
+    pub fn ordered_end(&self, table: &str, end: &Identifier) -> Option<Identifier> {
+        let mut written: Vec<&str> = end.columns();
+        written.sort_unstable();
+        self.sources
+            .iter()
+            .filter(|s| s.table == table)
+            .find_map(|s| {
+                let columns: Option<Vec<String>> = self
+                    .id
+                    .iter()
+                    .map(|p| {
+                        s.columns
+                            .iter()
+                            .find(|(q, _)| q == p)
+                            .map(|(_, c)| c.clone())
+                    })
+                    .collect();
+                let columns = columns?;
+                let mut sorted: Vec<&str> = columns.iter().map(String::as_str).collect();
+                sorted.sort_unstable();
+                (sorted == written).then(|| match columns.as_slice() {
+                    [one] => Identifier::Single(one.clone()),
+                    _ => Identifier::Composite(columns.clone()),
+                })
+            })
+    }
+}
+
+/// One role of one definition of an embedded label: the rows of `table`
+/// (with its options), each holding a node's id and properties in
+/// `columns` (property, column), sorted by property.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeSource {
+    pub table: String,
+    pub view_parameters: Option<Vec<String>>,
+    pub use_final: bool,
+    pub filter: Option<SchemaFilter>,
+    pub columns: Vec<(String, String)>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum Direction {
+    Outgoing,
+    Incoming,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Direction::Incoming => f.write_str("incoming"),
+            Direction::Outgoing => f.write_str("outgoing"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GraphSchemaElement {
+    Node(Box<NodeSchema>),
+    Rel(Box<RelationshipSchema>),
+}
+
+/// Node identifier schema - supports both single and composite node IDs.
+///
+/// **Semantic Clarification (December 2025):**
+/// `node_id` specifies PROPERTY NAMES (graph layer), not column names (relational layer).
+/// The actual database column names are resolved through property_mappings.
+///
+/// For traditional nodes with own tables:
+/// - `id` contains property name(s) that map to columns via property_mappings
+/// - If not in property_mappings, identity mapping is auto-generated (property_name → column_name)
+/// - Example: `node_id: user_id` → auto-generates `property_mappings: {user_id: user_id}`
+///
+/// For denormalized nodes (virtual nodes on edge tables):
+/// - `id` contains property name(s) that get resolved via from_node_properties/to_node_properties
+/// - Example: `node_id: ip` with `from_node_properties: {ip: "id.orig_h"}`
+///
+/// This provides backward compatibility: existing schemas work unchanged with auto-generated
+/// identity mappings. This mirrors `Identifier` used for `edge_id` in relationship schemas.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeIdSchema {
+    /// The identifier - can be single column or composite
+    pub id: Identifier,
+    /// Generic data type (Integer, String, etc.) - used for validation
+    pub dtype: crate::graph_catalog::schema_types::SchemaType,
+    /// #1360: each part's discovered type, in `id`'s column order. `dtype` can
+    /// describe only one type, so a composite id like `[k String, v Date]`
+    /// cannot be described by it; this can. Empty when discovery did not run,
+    /// which means "unknown" and leaves the SQL as it was before.
+    #[serde(default)]
+    pub part_types: Vec<crate::graph_catalog::schema_types::KeyPartType>,
+}
+
+impl NodeIdSchema {
+    /// Create a new NodeIdSchema with a single column identifier
+    pub fn single(column: String, dtype: crate::graph_catalog::schema_types::SchemaType) -> Self {
+        NodeIdSchema {
+            id: Identifier::Single(column),
+            dtype,
+            part_types: Vec::new(),
+        }
+    }
+
+    /// Create a new NodeIdSchema with a composite identifier
+    pub fn composite(
+        columns: Vec<String>,
+        dtype: crate::graph_catalog::schema_types::SchemaType,
+    ) -> Self {
+        NodeIdSchema {
+            id: Identifier::Composite(columns),
+            dtype,
+            part_types: Vec::new(),
+        }
+    }
+
+    /// #1360: attach the discovered per-part types (see
+    /// [`NodeIdSchema::part_types`]).
+    pub fn with_part_types(
+        mut self,
+        part_types: Vec<crate::graph_catalog::schema_types::KeyPartType>,
+    ) -> Self {
+        self.part_types = part_types;
+        self
+    }
+
+    /// #1360: the discovered type of part `index`, or `None` when unknown. The
+    /// walk key leaves a column alone when this is `None`.
+    pub fn part_type(
+        &self,
+        index: usize,
+    ) -> Option<&crate::graph_catalog::schema_types::KeyPartType> {
+        self.part_types.get(index)
+    }
+
+    /// Whether a part of the id is spelled by SQL only
+    /// ([`KeyPartType::is_spelled_in_sql`]): a node returned whole then
+    /// carries its element id from SQL (#1528).
+    pub fn is_spelled_in_sql(&self) -> bool {
+        self.part_types.iter().any(|t| t.is_spelled_in_sql())
+    }
+
+    /// Get the column name for single-column identifiers.
+    ///
+    /// **Panics** if called on composite identifier.
+    /// For composite-safe access, use `columns()` or `sql_tuple()`.
+    pub fn column(&self) -> &str {
+        match self.id.as_single() {
+            Ok(col) => col,
+            Err(_) => panic!(
+                "Attempted to access single column on composite node identifier. \
+                This is a schema configuration error - composite node IDs should use \
+                columns() for safe access or sql_tuple() for SQL generation."
+            ),
+        }
+    }
+
+    /// Get the column name for single-column identifiers, with error handling.
+    ///
+    /// Preferred for new code over `column()` to handle composite identifiers gracefully.
+    pub fn column_or_error(&self) -> Result<&str, String> {
+        self.id.as_single().map_err(|e| e.to_string())
+    }
+
+    /// Check if this is a composite identifier
+    pub fn is_composite(&self) -> bool {
+        self.id.is_composite()
+    }
+
+    /// Get all columns in the identifier
+    pub fn columns(&self) -> Vec<&str> {
+        self.id.columns()
+    }
+
+    /// Get all columns with alias prefix
+    pub fn columns_with_alias(&self, alias: &str) -> Vec<String> {
+        self.id
+            .columns()
+            .iter()
+            .map(|col| format!("{}.{}", alias, col))
+            .collect()
+    }
+
+    /// Generate SQL tuple expression
+    /// For single column: "alias.column"
+    /// For composite: "(alias.col1, alias.col2, ...)"
+    pub fn sql_tuple(&self, alias: &str) -> String {
+        self.id.to_sql_tuple(alias)
+    }
+
+    /// Generate SQL equality condition for JOIN
+    /// For single: "left_alias.col = right_alias.col"
+    /// For composite: "(left_alias.c1, left_alias.c2) = (right_alias.c1, right_alias.c2)"
+    pub fn sql_equality(&self, left_alias: &str, right_alias: &str) -> String {
+        let left = self.sql_tuple(left_alias);
+        let right = self.sql_tuple(right_alias);
+        format!("{} = {}", left, right)
+    }
+}
+
+/// Metadata for denormalized node property access
+/// Pre-computed at schema load time for efficient query generation
+#[derive(Debug, Clone)]
+pub struct PropertySource {
+    /// Relationship type that contains this property (e.g., "FLIGHT")
+    pub relationship_type: String,
+    /// Which side: "from" or "to"
+    pub side: String,
+    /// Table column name
+    pub column_name: String,
+}
+
+/// Pre-computed metadata for a denormalized node label
+/// Stores all possible ways to access properties for this node
+#[derive(Debug, Clone)]
+pub struct ProcessedNodeMetadata {
+    /// Node label (e.g., "Airport")
+    pub label: String,
+
+    /// Property sources: property_name -> list of sources
+    /// Each property may be available in multiple edge tables
+    /// Example: "city" -> [PropertySource{rel="FLIGHT", side="from", col="OriginCityName"},
+    ///                     PropertySource{rel="FLIGHT", side="to", col="DestCityName"}]
+    pub property_sources: HashMap<String, Vec<PropertySource>>,
+
+    /// ID sources: which edges can provide the node ID
+    /// Maps relationship_type -> (side, id_column)
+    /// Example: "FLIGHT" -> ("from", "Origin"), ("to", "Dest")
+    pub id_sources: HashMap<String, Vec<(String, String)>>,
+}
+
+impl ProcessedNodeMetadata {
+    /// Create new metadata for a node label
+    pub fn new(label: String) -> Self {
+        ProcessedNodeMetadata {
+            label,
+            property_sources: HashMap::new(),
+            id_sources: HashMap::new(),
+        }
+    }
+
+    /// Add a property source
+    pub fn add_property_source(&mut self, property: String, source: PropertySource) {
+        self.property_sources
+            .entry(property)
+            .or_default()
+            .push(source);
+    }
+
+    /// Add an ID source
+    pub fn add_id_source(&mut self, rel_type: String, side: String, id_column: String) {
+        self.id_sources
+            .entry(rel_type)
+            .or_default()
+            .push((side, id_column));
+    }
+
+    /// Get property sources for a given property name
+    pub fn get_property_sources(&self, property: &str) -> Option<&[PropertySource]> {
+        self.property_sources.get(property).map(Vec::as_slice)
+    }
+
+    /// Get all relationship types that have this node
+    pub fn get_relationship_types(&self) -> Vec<String> {
+        self.id_sources.keys().cloned().collect()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+// Deserialize routes through `GraphSchemaDe`, which rebuilds the `#[serde(skip)]`
+// derived indexes below. `#[derive(Deserialize)]` alone would leave them empty on
+// every round-trip through the `graph_catalog` JSON persistence path (#1081).
+#[serde(from = "GraphSchemaDe")]
+pub struct GraphSchema {
+    version: u32,
+    database: String,
+    nodes: BTreeMap<String, NodeSchema>,
+    relationships: BTreeMap<String, RelationshipSchema>,
+
+    /// Denormalized node metadata (computed at schema load)
+    /// Maps node label -> metadata
+    #[serde(skip)]
+    denormalized_nodes: BTreeMap<String, ProcessedNodeMetadata>,
+
+    /// Secondary index: relationship type name -> composite keys
+    /// Enables O(1) lookup of all relationships by type without scanning
+    /// Example: "HAS_TAG" -> ["HAS_TAG::Post::Tag", "HAS_TAG::Comment::Tag", "HAS_TAG::Message::Tag"]
+    #[serde(skip)]
+    rel_type_index: BTreeMap<String, Vec<String>>,
+
+    /// Vector index configurations for similarity search
+    /// Maps index name -> config (label, property, similarity metric)
+    #[serde(skip)]
+    vector_indexes: BTreeMap<String, VectorIndexConfig>,
+
+    /// Full-text index configurations for text search
+    /// Maps index name -> config (label, properties, analyzer)
+    #[serde(skip)]
+    fulltext_indexes: BTreeMap<String, FulltextIndexConfig>,
+
+    /// P-4c S8b: node relations of the lowering's view of the schema
+    /// ([`GraphSchema::with_node_relations`]), by the name they are read
+    /// under. Empty in a loaded schema.
+    #[serde(skip)]
+    node_relations: BTreeMap<String, NodeRelation>,
+
+    /// Every definition of each label, from the YAML (`nodes` keeps one
+    /// per label). Empty in a schema not built from YAML.
+    #[serde(skip)]
+    node_definitions: BTreeMap<String, Vec<NodeSchema>>,
+
+    /// Union labels (`config::UnionLabelDefinition`): each, the node labels
+    /// whose nodes also carry it.
+    #[serde(default)]
+    union_labels: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Deserialization shadow for [`GraphSchema`]: only the persisted (non-`skip`)
+/// fields. Serde deserializes into this, then [`From`] rebuilds the derived
+/// indexes via [`GraphSchema::rebuild_derived_indexes`]. This is what closes
+/// #1081 — a `GraphSchema` recovered from JSON otherwise had an empty
+/// `rel_type_index`, so simple relationship-type lookups silently failed. All
+/// fields default so older or partial persisted schemas still load.
+#[derive(Deserialize)]
+struct GraphSchemaDe {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    database: String,
+    #[serde(default)]
+    nodes: BTreeMap<String, NodeSchema>,
+    #[serde(default)]
+    relationships: BTreeMap<String, RelationshipSchema>,
+    #[serde(default)]
+    union_labels: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl From<GraphSchemaDe> for GraphSchema {
+    fn from(de: GraphSchemaDe) -> Self {
+        let mut schema = GraphSchema {
+            version: de.version,
+            database: de.database,
+            nodes: de.nodes,
+            relationships: de.relationships,
+            denormalized_nodes: BTreeMap::new(),
+            rel_type_index: BTreeMap::new(),
+            // Vector / full-text index configs are not derivable from
+            // relationships and are not persisted in graph_catalog JSON, so they
+            // come back empty here (unchanged from the previous derive behavior).
+            vector_indexes: BTreeMap::new(),
+            fulltext_indexes: BTreeMap::new(),
+            node_relations: BTreeMap::new(),
+            node_definitions: BTreeMap::new(),
+            union_labels: de.union_labels,
+        };
+        schema.rebuild_derived_indexes();
+        schema
+    }
+}
+
+/// Runtime vector index configuration (resolved from schema definition)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VectorIndexConfig {
+    /// Index name
+    pub name: String,
+    /// Node label this index applies to
+    pub label: String,
+    /// Cypher property name containing the vector
+    pub property: String,
+    /// Resolved ClickHouse column name (from property_mappings)
+    pub column: String,
+    /// ClickHouse table (database.table)
+    pub table: String,
+    /// Vector dimensions (for validation, None = skip validation)
+    pub dimensions: Option<u32>,
+    /// Similarity metric: "cosine" or "euclidean"
+    pub similarity: String,
+}
+
+/// Runtime full-text index configuration (resolved from schema definition)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FulltextIndexConfig {
+    /// Index name
+    pub name: String,
+    /// Node label this index applies to
+    pub label: String,
+    /// Cypher property names to search across
+    pub properties: Vec<String>,
+    /// Resolved ClickHouse column names (from property_mappings)
+    pub columns: Vec<String>,
+    /// ClickHouse table (database.table)
+    pub table: String,
+    /// Search analyzer: "standard", "ngram", or "exact"
+    pub analyzer: String,
+}
+
+impl GraphSchema {
+    /// Create a composite key for a relationship: "type::from_node::to_node"
+    /// This allows multiple relationships with the same type but different node combinations
+    pub fn make_rel_composite_key(type_name: &str, from_node: &str, to_node: &str) -> String {
+        format!("{}::{}::{}", type_name, from_node, to_node)
+    }
+
+    pub fn build(
+        version: u32,
+        database: String,
+        nodes: HashMap<String, NodeSchema>,
+        relationships: HashMap<String, RelationshipSchema>,
+    ) -> GraphSchema {
+        // Convert to BTreeMap for deterministic iteration order
+        let nodes: BTreeMap<String, NodeSchema> = nodes.into_iter().collect();
+        let relationships: BTreeMap<String, RelationshipSchema> =
+            relationships.into_iter().collect();
+
+        // Build denormalized node metadata
+        let denormalized_nodes = Self::build_denormalized_metadata(&relationships);
+
+        // Build secondary index for fast relationship type lookup
+        let rel_type_index = Self::build_rel_type_index(&relationships);
+
+        GraphSchema {
+            version,
+            database,
+            nodes,
+            relationships,
+            denormalized_nodes,
+            rel_type_index,
+            vector_indexes: BTreeMap::new(),
+            fulltext_indexes: BTreeMap::new(),
+            node_relations: BTreeMap::new(),
+            node_definitions: BTreeMap::new(),
+            union_labels: BTreeMap::new(),
+        }
+    }
+
+    /// Build with vector and fulltext index configurations
+    pub fn build_with_indexes(
+        version: u32,
+        database: String,
+        nodes: HashMap<String, NodeSchema>,
+        relationships: HashMap<String, RelationshipSchema>,
+        vector_indexes: BTreeMap<String, VectorIndexConfig>,
+        fulltext_indexes: BTreeMap<String, FulltextIndexConfig>,
+    ) -> GraphSchema {
+        let mut schema = Self::build(version, database, nodes, relationships);
+        schema.vector_indexes = vector_indexes;
+        schema.fulltext_indexes = fulltext_indexes;
+        schema
+    }
+
+    /// Build secondary index: relationship type -> list of composite keys
+    /// Enables O(1) lookup by type name without iterating through all relationships
+    ///
+    /// NOTE: When both simple key ("TYPE") and composite key ("TYPE::FROM::TO") exist
+    /// for the same relationship, we only include the composite key. This is because
+    /// the config.rs inserts both for backward compatibility, but we only want to
+    /// resolve to ONE actual table.
+    fn build_rel_type_index(
+        relationships: &BTreeMap<String, RelationshipSchema>,
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+        // First pass: collect all composite keys (those containing "::")
+        // Skip simple keys that have a corresponding composite key
+        let mut composite_types: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for composite_key in relationships.keys() {
+            if composite_key.contains("::") {
+                // Extract base type name from composite key
+                if let Some(type_name) = composite_key.split("::").next() {
+                    composite_types.insert(type_name.to_string());
+                }
+            }
+        }
+
+        // Second pass: build index, skipping simple keys when composite exists
+        for composite_key in relationships.keys() {
+            let type_name = if composite_key.contains("::") {
+                // This is a composite key - extract the type name (before first ::)
+                composite_key
+                    .split("::")
+                    .next()
+                    .unwrap_or(composite_key.as_str())
+            } else {
+                // This is a simple key - skip if we have composite keys for this type
+                if composite_types.contains(composite_key) {
+                    log::debug!(
+                        "Skipping simple key '{}' in favor of composite key",
+                        composite_key
+                    );
+                    continue;
+                }
+                composite_key.as_str()
+            };
+
+            index
+                .entry(type_name.to_string())
+                .or_default()
+                .push(composite_key.clone());
+        }
+
+        // Sort each Vec for deterministic ordering (HashMap iteration order is random)
+        for keys in index.values_mut() {
+            keys.sort();
+        }
+
+        index
+    }
+
+    /// Recompute the `#[serde(skip)]` derived indexes (`rel_type_index` and
+    /// `denormalized_nodes`) from `self.relationships`.
+    ///
+    /// MUST be called after deserialization or after any mutation of
+    /// `relationships` — both leave the derived indexes empty/stale. `build()`
+    /// populates them at construction; this is the after-the-fact equivalent.
+    /// Vector / full-text index configs are NOT derivable from relationships and
+    /// are intentionally left untouched. See #1081.
+    pub(crate) fn rebuild_derived_indexes(&mut self) {
+        self.denormalized_nodes = Self::build_denormalized_metadata(&self.relationships);
+        self.rel_type_index = Self::build_rel_type_index(&self.relationships);
+    }
+
+    /// Build denormalized node metadata from relationships
+    /// Scans all relationships to find denormalized node properties
+    fn build_denormalized_metadata(
+        relationships: &BTreeMap<String, RelationshipSchema>,
+    ) -> BTreeMap<String, ProcessedNodeMetadata> {
+        let mut metadata_map: BTreeMap<String, ProcessedNodeMetadata> = BTreeMap::new();
+
+        // Collect all actual relationship types (extract from composite keys)
+        // Composite keys are in format "TYPE::FROM::TO"
+        let mut processed_rels = std::collections::HashSet::new();
+
+        for (rel_key, rel_schema) in relationships {
+            // Extract relationship type from composite key (TYPE::FROM::TO -> TYPE)
+            let rel_type = if rel_key.contains("::") {
+                rel_key.split("::").next().unwrap().to_string()
+            } else {
+                rel_key.clone()
+            };
+
+            // Process this relationship type
+            if !processed_rels.insert(rel_type.clone()) {
+                continue; // Already processed this type
+            }
+
+            // Process from_node denormalized properties
+            if let Some(ref from_props) = rel_schema.from_node_properties {
+                let from_label = &rel_schema.from_node;
+                let metadata = metadata_map
+                    .entry(from_label.clone())
+                    .or_insert_with(|| ProcessedNodeMetadata::new(from_label.clone()));
+
+                // Add property sources
+                for (prop_name, col_name) in from_props {
+                    metadata.add_property_source(
+                        prop_name.clone(),
+                        PropertySource {
+                            relationship_type: rel_type.clone(),
+                            side: "from".to_string(),
+                            column_name: col_name.clone(),
+                        },
+                    );
+                }
+
+                // Add ID source
+                metadata.add_id_source(
+                    rel_type.clone(),
+                    "from".to_string(),
+                    rel_schema.from_id.to_string(),
+                );
+            }
+
+            // Process to_node denormalized properties
+            if let Some(ref to_props) = rel_schema.to_node_properties {
+                let to_label = &rel_schema.to_node;
+                let metadata = metadata_map
+                    .entry(to_label.clone())
+                    .or_insert_with(|| ProcessedNodeMetadata::new(to_label.clone()));
+
+                // Add property sources
+                for (prop_name, col_name) in to_props {
+                    metadata.add_property_source(
+                        prop_name.clone(),
+                        PropertySource {
+                            relationship_type: rel_type.clone(),
+                            side: "to".to_string(),
+                            column_name: col_name.clone(),
+                        },
+                    );
+                }
+
+                // Add ID source
+                metadata.add_id_source(
+                    rel_type.clone(),
+                    "to".to_string(),
+                    rel_schema.to_id.to_string(),
+                );
+            }
+        }
+
+        metadata_map
+    }
+
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    pub fn insert_node_schema(&mut self, node_label: String, node_schema: NodeSchema) {
+        self.nodes.insert(node_label, node_schema);
+    }
+
+    pub fn insert_relationship_schema(
+        &mut self,
+        type_name: String,
+        rel_schema: RelationshipSchema,
+    ) {
+        self.relationships.insert(type_name, rel_schema);
+    }
+
+    // Helper methods for validation
+    fn validate_table_exists(&self, _table: &str) -> Result<(), GraphSchemaError> {
+        // TODO: Implement actual ClickHouse table existence check
+        // For now, assume table exists
+        Ok(())
+    }
+
+    fn validate_column_exists(&self, _table: &str, _column: &str) -> Result<(), GraphSchemaError> {
+        // TODO: Implement actual ClickHouse column existence check
+        // For now, assume column exists
+        Ok(())
+    }
+
+    fn get_column_type(&self, _table: &str, _column: &str) -> Result<String, GraphSchemaError> {
+        // TODO: Implement actual ClickHouse column type lookup
+        // For now, return a default type
+        Ok("UInt64".to_string())
+    }
+
+    pub fn insert_rel_schema(&mut self, rel_label: String, rel_schema: RelationshipSchema) {
+        self.relationships.insert(rel_label, rel_schema);
+    }
+
+    pub fn get_version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn increment_version(&mut self) {
+        self.version += 1;
+    }
+
+    pub fn node_schema(&self, node_label: &str) -> Result<&NodeSchema, GraphSchemaError> {
+        log::debug!(
+            "node_schema: Looking for node_label='{}' in schema (has {} nodes: {:?})",
+            node_label,
+            self.nodes.len(),
+            self.nodes.keys().take(5).collect::<Vec<_>>()
+        );
+
+        self.nodes.get(node_label).ok_or_else(|| {
+            log::warn!(
+                "node_schema: Node '{}' NOT FOUND. Available nodes: {:?}",
+                node_label,
+                self.nodes.keys().collect::<Vec<_>>()
+            );
+            GraphSchemaError::Node {
+                node_label: node_label.to_string(),
+            }
+        })
+    }
+
+    pub fn get_rel_schema(&self, rel_label: &str) -> Result<&RelationshipSchema, GraphSchemaError> {
+        log::debug!(
+            "⚠️ get_rel_schema (OLD METHOD) called with rel_label='{}'",
+            rel_label
+        );
+
+        // First try exact match (composite key lookup)
+        if let Some(schema) = self.relationships.get(rel_label) {
+            log::debug!("get_rel_schema: Found exact match for '{}'", rel_label);
+            return Ok(schema);
+        }
+
+        // If not found and it's a simple type name (no "::"), use rel_type_index for O(1) lookup
+        if !rel_label.contains("::") {
+            if let Some(composite_keys) = self.rel_type_index.get(rel_label) {
+                if let Some(first_key) = composite_keys.first() {
+                    if let Some(schema) = self.relationships.get(first_key) {
+                        log::debug!(
+                            "get_rel_schema: Found relationship '{}' for type '{}' using rel_type_index",
+                            first_key, rel_label
+                        );
+                        return Ok(schema);
+                    }
+                }
+            }
+
+            // If no matches found with rel_type_index
+            log::error!(
+                "❌ get_rel_schema: No relationship schema found for type '{}' in rel_type_index",
+                rel_label
+            );
+            return Err(GraphSchemaError::Relation {
+                rel_label: rel_label.to_string(),
+            });
+        }
+
+        // If not found, return error
+        log::error!(
+            "❌ get_rel_schema: No relationship schema found for '{}'",
+            rel_label
+        );
+        Err(GraphSchemaError::Relation {
+            rel_label: rel_label.to_string(),
+        })
+    }
+
+    /// Get relationship schema by type and node types (supports composite keys)
+    pub fn get_rel_schema_with_nodes(
+        &self,
+        rel_type: &str,
+        from_node: Option<&str>,
+        to_node: Option<&str>,
+    ) -> Result<&RelationshipSchema, GraphSchemaError> {
+        // If both nodes specified, try composite key first
+        if let (Some(from), Some(to)) = (from_node, to_node) {
+            let composite_key = Self::make_rel_composite_key(rel_type, from, to);
+            log::debug!(
+                "get_rel_schema_with_nodes: Looking for composite key '{}'",
+                composite_key
+            );
+            if let Some(schema) = self.relationships.get(&composite_key) {
+                log::debug!(
+                    "get_rel_schema_with_nodes: Found schema for composite key '{}'",
+                    composite_key
+                );
+                return Ok(schema);
+            }
+            log::debug!(
+                "get_rel_schema_with_nodes: Composite key '{}' not found",
+                composite_key
+            );
+        }
+
+        // Use rel_type_index for O(1) lookup (replaces slower prefix search)
+        // This finds composite keys matching the relationship type (e.g., "FOLLOWS::User::User")
+        if let Some(composite_keys) = self.rel_type_index.get(rel_type) {
+            // When partial node info is available, filter candidates by matching from/to
+            if from_node.is_some() || to_node.is_some() {
+                let mut matched_key = None;
+                for key in composite_keys {
+                    if let Some(schema) = self.relationships.get(key) {
+                        let from_ok = from_node.is_none()
+                            || from_node == Some(schema.from_node.as_str())
+                            || schema.from_node == "$any";
+                        let to_ok = to_node.is_none()
+                            || to_node == Some(schema.to_node.as_str())
+                            || schema.to_node == "$any";
+                        if from_ok && to_ok {
+                            matched_key = Some(key);
+                            break;
+                        }
+                    }
+                }
+                if let Some(key) = matched_key {
+                    if let Some(schema) = self.relationships.get(key) {
+                        log::debug!(
+                            "get_rel_schema_with_nodes: Found schema for composite key '{}' filtered by from={:?} to={:?}",
+                            key, from_node, to_node
+                        );
+                        return Ok(schema);
+                    }
+                }
+            }
+            // No partial info or no match found — fall back to first
+            if let Some(key) = composite_keys.first() {
+                if let Some(schema) = self.relationships.get(key) {
+                    log::debug!(
+                        "get_rel_schema_with_nodes: Found schema for composite key '{}' when looking for type '{}'",
+                        key, rel_type
+                    );
+                    return Ok(schema);
+                }
+            }
+        }
+
+        // Fallback: Try simple key lookup (for backward compatibility with integration tests)
+        if let Some(schema) = self.relationships.get(rel_type) {
+            log::debug!(
+                "get_rel_schema_with_nodes: Found schema for simple key '{}'",
+                rel_type
+            );
+            return Ok(schema);
+        }
+
+        Err(GraphSchemaError::Relation {
+            rel_label: rel_type.to_string(),
+        })
+    }
+
+    /// Get all relationship schemas matching a type name
+    /// O(1) lookup using secondary index instead of O(n) iteration
+    pub fn rel_schemas_for_type(&self, rel_type: &str) -> Vec<&RelationshipSchema> {
+        // Use secondary index for O(1) lookup
+        if let Some(composite_keys) = self.rel_type_index.get(rel_type) {
+            composite_keys
+                .iter()
+                .filter_map(|key| self.relationships.get(key))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Find all relationship types that match a generic pattern, filtering by node type compatibility.
+    ///
+    /// Looks up all composite keys for a relationship type via `rel_type_index` (O(1)),
+    /// then filters by exact label matching against `from_node`/`to_node` in the schema.
+    ///
+    /// No implicit subtype/inheritance: labels must match exactly, consistent with
+    /// Neo4j where labels are flat tags. If a query uses `:Company` and the schema
+    /// defines the relationship for `:Organisation`, an explicit relationship variant
+    /// for `Company` must exist in the schema.
+    ///
+    /// Parameters:
+    /// - generic_name: The relationship type name (e.g., "HAS_TAG", "IS_LOCATED_IN")
+    /// - from_label: Optional source node label to filter by
+    /// - to_label: Optional target node label to filter by
+    ///
+    /// Returns all matching composite keys, or empty vec if none found.
+    pub fn expand_generic_relationship_type(
+        &self,
+        generic_name: &str,
+        from_label: Option<&str>,
+        to_label: Option<&str>,
+    ) -> Vec<String> {
+        // Use composite key index for direct O(1) lookup by type name
+        // No more pattern matching - rely on proper schema definition
+
+        // Get all composite keys for this relationship type from the index
+        let composite_keys = match self.rel_type_index.get(generic_name) {
+            Some(keys) => keys.clone(),
+            None => {
+                return Vec::new(); // Type not found in schema
+            }
+        };
+
+        // If no node labels provided, return all matches
+        if from_label.is_none() && to_label.is_none() {
+            if !composite_keys.is_empty() {
+                log::debug!(
+                    "Found {} relationship(s) with type '{}': {:?}",
+                    composite_keys.len(),
+                    generic_name,
+                    composite_keys
+                );
+            }
+            return composite_keys;
+        }
+
+        // Filter by node label compatibility — pure graph-space matching.
+        // No implicit subtype/inheritance: labels must match exactly,
+        // consistent with Neo4j where labels are flat tags.
+        let mut compatible: Vec<String> = Vec::new();
+        for composite_key in &composite_keys {
+            if let Some(schema) = self.relationships.get(composite_key) {
+                let from_ok =
+                    from_label.is_none_or(|f| schema.from_node == f || schema.from_node == "$any");
+                let to_ok =
+                    to_label.is_none_or(|t| schema.to_node == t || schema.to_node == "$any");
+                if from_ok && to_ok {
+                    compatible.push(composite_key.clone());
+                }
+            }
+        }
+
+        if !compatible.is_empty() {
+            log::debug!(
+                "Found {} compatible '{}' relationship(s) for ({:?})-[]->({:?}): {:?}",
+                compatible.len(),
+                generic_name,
+                from_label,
+                to_label,
+                compatible
+            );
+        }
+
+        compatible
+    }
+
+    /// Check if a relationship is compatible with given source/target node labels.
+    ///
+    /// Handles polymorphic nodes by checking if the relationship's from_node/to_node
+    /// matches any concrete type that the polymorphic node can represent.
+    ///
+    /// Example:
+    /// - Relationship: POST_HAS_TAG (Post → Tag)
+    /// - Query node: Message (polymorphic: Post | Comment)
+    /// - Result: COMPATIBLE (because Message can be Post)
+    fn is_relationship_compatible(
+        &self,
+        rel_schema: &RelationshipSchema,
+        from_label: Option<&str>,
+        to_label: Option<&str>,
+    ) -> bool {
+        // Check from_node compatibility
+        let from_ok = if let Some(from) = from_label {
+            self.is_node_type_compatible(&rel_schema.from_node, from)
+        } else {
+            true // No constraint on source node
+        };
+
+        // Check to_node compatibility
+        let to_ok = if let Some(to) = to_label {
+            self.is_node_type_compatible(&rel_schema.to_node, to)
+        } else {
+            true // No constraint on target node
+        };
+
+        from_ok && to_ok
+    }
+
+    /// Check if a relationship node type is compatible with a query node label.
+    ///
+    /// Returns true if:
+    /// 1. They match exactly (Post == Post)
+    /// 2. Query label is polymorphic and the relationship node type could be one of its concrete types
+    ///    
+    /// For polymorphic nodes like Message (Post|Comment):
+    /// - Message with label_column="type" represents entities from Post and Comment tables
+    /// - POST_HAS_TAG with from_node="Post" is compatible (Post is a Message type)
+    /// - FORUM_HAS_TAG with from_node="Forum" is NOT compatible (Forum is not a Message type)
+    ///
+    /// Detection heuristic:
+    /// - If query node has label_column (polymorphic) and rel node exists as a separate node,
+    ///   check if a relationship exists that connects them via the type discriminator
+    fn is_node_type_compatible(&self, rel_node_type: &str, query_label: &str) -> bool {
+        // Direct match
+        if rel_node_type == query_label {
+            return true;
+        }
+
+        // Check if query label is polymorphic
+        if let Some(query_node_schema) = self.nodes.get(query_label) {
+            // Polymorphic node check: has label_column (type discriminator)
+            if query_node_schema.label_column.is_some() {
+                // For Message with label_column="type", check if rel_node_type (e.g., "Post")
+                // is a valid type by checking:
+                // 1. If there's a node definition for rel_node_type (e.g., Post exists)
+                // 2. If that node's table could map to the same data as the polymorphic node
+
+                // Heuristic: If the rel_node_type exists as a node AND has a relationship
+                // defined with that type, it's likely a concrete type
+
+                // Better heuristic for LDBC: Check if rel_node_type appears in relationship
+                // names that involve this polymorphic node's concrete types
+                // E.g., POST_HAS_TAG suggests Post is a concrete type
+                // COMMENT_HAS_TAG suggests Comment is a concrete type
+                // FORUM_HAS_TAG does NOT match Message pattern
+
+                // Check if we have relationships named like "{REL_NODE_TYPE}_*"
+                // If Message is polymorphic and we see POST_HAS_TAG and COMMENT_HAS_TAG,
+                // then Post and Comment are the concrete types
+
+                // For now, use a simple check: does the table name match?
+                // Message points to Message table, Post points to Post table
+                // If rel_node_type table != query_label table, but query has label_column,
+                // check if rel_node_type could be a valid type value
+
+                if let Some(_rel_node_schema) = self.nodes.get(rel_node_type) {
+                    // If the polymorphic node's table is different from the concrete node's table,
+                    // they're not compatible (Message table vs Post table)
+                    // UNLESS the polymorphic node is a view that unions multiple tables
+
+                    // Simplified check: If polymorphic node table name matches or contains
+                    // the concrete type name, it's compatible
+                    // E.g., Message table for Message label, Post table for Post label
+                    // Since Message is a union view, check if it could contain Post rows
+
+                    // Most reliable: check if the rel_node_type appears in the label_value
+                    // But label_value is not always set. Alternative: check naming convention
+
+                    // LDBC-specific heuristic: Message represents Post and Comment
+                    // because we see POST_* and COMMENT_* relationships in the schema
+                    // This is implicit in the schema design
+
+                    // For now, return true if rel_node exists (backward compatibility)
+                    // but log that we're using a weak heuristic
+                    log::debug!(
+                        "Weak heuristic: '{}' node type compatible with '{}' polymorphic node (both exist as nodes)",
+                        rel_node_type,
+                        query_label
+                    );
+
+                    // BETTER CHECK: See if relationship pattern suggests they're related
+                    // Count relationships that start with rel_node_type prefix
+                    let rel_prefix = format!("{}_", rel_node_type.to_uppercase());
+                    let has_typed_relationships = self
+                        .relationships
+                        .keys()
+                        .any(|k| k.starts_with(&rel_prefix));
+
+                    if has_typed_relationships {
+                        // This suggests rel_node_type is a concrete entity type
+                        // Now check if it makes sense as a component of the polymorphic node
+
+                        // For Message (union view of Post+Comment), Post and Comment have different tables
+                        // But they're still valid because Message is designed to represent both
+                        //
+                        // Key insight: If the polymorphic node has a label_column but different table,
+                        // it's likely a union view. In this case, the concrete types ARE compatible
+                        // even though tables differ.
+                        //
+                        // Only reject if the concrete type is clearly unrelated (different domain)
+                        // E.g., Forum is not part of Message union
+
+                        // Heuristic: Check if rel_node_type name appears in the polymorphic table name
+                        // Message doesn't contain "Forum" → Forum incompatible
+                        // Message doesn't contain "Post" or "Comment" either (weak check)
+
+                        // Better: For polymorphic union nodes, check if table names suggest union
+                        // Message table with type column suggests it's a union
+                        // If query is for Message and rel is Post, check if "post" or "Post" appears
+                        // in any relationship type involving Message
+
+                        // Most practical: Accept Post and Comment as Message components,
+                        // reject Forum. Use the presence of "Message" in relationship definitions
+                        // or explicit type checking.
+
+                        // FINAL HEURISTIC: If polymorphic table name is a generic/abstract name
+                        // (like "Message") and concrete is specific (like "Post"), accept it
+                        // UNLESS the concrete type name suggests it's from a different domain
+
+                        // Check if rel_node_type is explicitly excluded
+                        // Forum is NOT a Message, but Post and Comment ARE
+                        let polymorphic_table_lc = query_node_schema.table_name.to_lowercase();
+                        let concrete_type_lc = rel_node_type.to_lowercase();
+
+                        // If the polymorphic node and concrete type are in the same "family"
+                        // (both related to messaging), accept. Reject if clearly different.
+                        // Heuristic: Forum != Message (different concepts)
+                        //            Post ~= Message (Post is a type of Message)
+                        //            Comment ~= Message (Comment is a type of Message)
+
+                        // Simple check: if concrete type is "Forum" and polymorphic is "Message", reject
+                        if polymorphic_table_lc == "message" && concrete_type_lc == "forum" {
+                            log::debug!(
+                                "Rejecting Forum as incompatible with Message (different domain)"
+                            );
+                            return false;
+                        }
+
+                        // Accept other combinations for union views
+                        log::debug!(
+                            "Accepting '{}' as compatible with '{}' polymorphic union",
+                            rel_node_type,
+                            query_label
+                        );
+                        return true;
+                    }
+
+                    return true; // Fallback to permissive
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn get_relationships_schemas(&self) -> &BTreeMap<String, RelationshipSchema> {
+        &self.relationships
+    }
+
+    pub fn all_node_schemas(&self) -> &BTreeMap<String, NodeSchema> {
+        &self.nodes
+    }
+
+    /// Get all vector index configurations
+    pub fn vector_indexes(&self) -> &BTreeMap<String, VectorIndexConfig> {
+        &self.vector_indexes
+    }
+
+    /// Look up a vector index by name
+    pub fn get_vector_index(&self, name: &str) -> Option<&VectorIndexConfig> {
+        self.vector_indexes.get(name)
+    }
+
+    /// Get all fulltext index configurations
+    pub fn fulltext_indexes(&self) -> &BTreeMap<String, FulltextIndexConfig> {
+        &self.fulltext_indexes
+    }
+
+    /// Look up a fulltext index by name
+    pub fn get_fulltext_index(&self, name: &str) -> Option<&FulltextIndexConfig> {
+        self.fulltext_indexes.get(name)
+    }
+
+    /// Expand a polymorphic `$any` node type to all concrete node labels.
+    /// Returns a single-element vec for concrete types, all node labels for `$any`.
+    pub fn expand_node_type(&self, node_type: &str) -> Vec<String> {
+        if node_type == "$any" {
+            self.nodes.keys().cloned().collect()
+        } else {
+            vec![node_type.to_string()]
+        }
+    }
+
+    /// Like [`expand_node_type`](Self::expand_node_type), but constrains a `$any`
+    /// endpoint by an explicit allow-list when the relationship declares one.
+    ///
+    /// A polymorphic edge may omit `from_node`/`to_node` (defaulting to `$any`)
+    /// yet still carry `from_label_values`/`to_label_values` naming the concrete
+    /// endpoint labels it actually targets (e.g. `to_label_values: [Folder, File]`).
+    /// In that case `$any` means "any of *these* labels", not "any node label",
+    /// so expanding it to every node in the schema over-fans the candidate set
+    /// (see #827). When the allow-list is present and non-empty it wins; otherwise
+    /// this falls back to the unconstrained expansion (concrete type unchanged;
+    /// bare `$any` with no allow-list still expands to all labels).
+    pub fn expand_node_type_constrained(
+        &self,
+        node_type: &str,
+        label_values: Option<&[String]>,
+    ) -> Vec<String> {
+        if node_type == "$any" {
+            if let Some(values) = label_values {
+                if !values.is_empty() {
+                    return values.to_vec();
+                }
+            }
+        }
+        self.expand_node_type(node_type)
+    }
+
+    pub fn node_schema_opt(&self, node_label: &str) -> Option<&NodeSchema> {
+        self.nodes.get(node_label)
+    }
+
+    pub fn get_relationships_schema_opt(&self, rel_label: &str) -> Option<&RelationshipSchema> {
+        // First try exact match (composite key lookup)
+        if let Some(schema) = self.relationships.get(rel_label) {
+            return Some(schema);
+        }
+
+        // If not found and it's a simple type name (no "::"), use rel_type_index for O(1) lookup
+        if !rel_label.contains("::") {
+            if let Some(composite_keys) = self.rel_type_index.get(rel_label) {
+                if let Some(first_key) = composite_keys.first() {
+                    if let Some(schema) = self.relationships.get(first_key) {
+                        return Some(schema);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get the rel_type_index for debugging purposes
+    pub fn get_rel_type_index(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.rel_type_index
+    }
+
+    /// Get unique relationship type names (without node type suffixes).
+    /// Returns only base type names like "FOLLOWS", not "FOLLOWS::User::User".
+    ///
+    /// This is the standard helper for iterating relationship types without duplicates.
+    /// The schema stores both simple keys ("FOLLOWS") and composite keys ("FOLLOWS::User::User")
+    /// for backward compatibility, but most code should use this function to avoid duplicates.
+    pub fn get_unique_relationship_types(&self) -> Vec<String> {
+        self.relationships
+            .keys()
+            .filter(|key| !key.contains("::"))
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_denormalized_node_metadata(
+        &self,
+        node_label: &str,
+    ) -> Option<&ProcessedNodeMetadata> {
+        self.denormalized_nodes.get(node_label)
+    }
+
+    /// Check if a node label has denormalized properties
+    pub fn is_denormalized_node(&self, node_label: &str) -> bool {
+        self.denormalized_nodes.contains_key(node_label)
+    }
+
+    /// Get all denormalized node labels
+    pub fn get_denormalized_node_labels(&self) -> Vec<&String> {
+        self.denormalized_nodes.keys().collect()
+    }
+}
+
+// ============================================================================
+// Denormalized Edge Table Detection Functions
+// ============================================================================
+
+/// Classification of edge table storage patterns
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeTablePattern {
+    /// Traditional: Both nodes have separate tables from the edge
+    Traditional,
+    /// Fully denormalized: Both nodes share the same table as the edge
+    FullyDenormalized,
+    /// Mixed: One node shares edge table, the other has its own table
+    Mixed {
+        from_denormalized: bool,
+        to_denormalized: bool,
+    },
+}
+
+/// Detect if a node is using denormalized edge table pattern
+///
+/// A node is denormalized when:
+/// 1. It shares the same physical table as the edge
+/// 2. The edge has from_node_properties or to_node_properties defined
+/// 3. The node has empty or minimal property_mappings (properties come from edge)
+pub fn is_node_denormalized_on_edge(
+    node: &NodeSchema,
+    edge: &RelationshipSchema,
+    is_from_node: bool,
+) -> bool {
+    // Foreign-edge (id-via-FK) case: a denormalized node reached through an edge
+    // in a DIFFERENT physical table. Its node_id is carried by the edge's FK
+    // column (build_standard_edge_schema synthesizes the {node_id → from_id/to_id}
+    // mapping into the edge's from/to_node_properties), so the node is embedded in
+    // the edge — no separate scan/join of the node's source table. Treat it as
+    // denormalized-on-edge so join planning picks the embedded strategy instead of
+    // a Traditional self-join of the edge table.
+    if node.full_table_name() != edge.full_table_name() {
+        let foreign_embedded = node.is_denormalized && edge_has_node_properties(edge, is_from_node);
+        if !foreign_embedded {
+            log::debug!(
+                "  ❌ Not denormalized: different tables (node={}, edge={})",
+                node.full_table_name(),
+                edge.full_table_name()
+            );
+        }
+        return foreign_embedded;
+    }
+
+    // 🔄 REFACTORED: Check NODE-LEVEL denormalized properties (not edge-level)
+    // Node must have denormalized properties for this direction
+    let has_denormalized_props = if is_from_node {
+        node.from_properties.is_some() && !node.from_properties.as_ref().unwrap().is_empty()
+    } else {
+        node.to_properties.is_some() && !node.to_properties.as_ref().unwrap().is_empty()
+    };
+
+    if !has_denormalized_props {
+        log::debug!(
+            "  ❌ Not denormalized: no {} properties for node label (table={}, is_denorm={})",
+            if is_from_node { "from" } else { "to" },
+            node.full_table_name(),
+            node.is_denormalized
+        );
+        return false;
+    }
+
+    // Check if node is marked as denormalized and has the right source table
+    let result = node.is_denormalized
+        && node
+            .denormalized_source_table
+            .as_ref()
+            .map(|t| t == &edge.full_table_name())
+            .unwrap_or(false);
+
+    log::debug!(
+        "  {} Node denormalization check: table={}, is_denorm={}, source_table={:?}, result={}",
+        if result { "✅" } else { "❌" },
+        node.full_table_name(),
+        node.is_denormalized,
+        node.denormalized_source_table,
+        result
+    );
+
+    result
+}
+
+/// Check if the edge has denormalized properties for a node position
+///
+/// This checks if the edge table contains the node's properties, allowing
+/// the node data to be read directly from the edge table without a separate JOIN.
+///
+/// Use this to determine if a node should use the edge table as its data source.
+pub fn edge_has_node_properties(edge: &RelationshipSchema, is_from_node: bool) -> bool {
+    if is_from_node {
+        edge.from_node_properties
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
+    } else {
+        edge.to_node_properties
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
+    }
+}
+
+/// Check if BOTH nodes in a relationship use the denormalized pattern
+pub fn is_fully_denormalized_edge_table(
+    left_node: &NodeSchema,
+    edge: &RelationshipSchema,
+    right_node: &NodeSchema,
+) -> bool {
+    is_node_denormalized_on_edge(left_node, edge, true)
+        && is_node_denormalized_on_edge(right_node, edge, false)
+}
+
+/// Classify the edge table pattern (traditional, fully denormalized, or mixed)
+pub fn classify_edge_table_pattern(
+    left_node: &NodeSchema,
+    edge: &RelationshipSchema,
+    right_node: &NodeSchema,
+) -> EdgeTablePattern {
+    let from_denorm = is_node_denormalized_on_edge(left_node, edge, true);
+    let to_denorm = is_node_denormalized_on_edge(right_node, edge, false);
+
+    let pattern = match (from_denorm, to_denorm) {
+        (true, true) => EdgeTablePattern::FullyDenormalized,
+        (false, false) => EdgeTablePattern::Traditional,
+        (from_d, to_d) => EdgeTablePattern::Mixed {
+            from_denormalized: from_d,
+            to_denormalized: to_d,
+        },
+    };
+
+    log::info!(
+        "🔍 Edge pattern classification: {:?} for table {} (from_denorm={}, to_denorm={})",
+        pattern,
+        edge.full_table_name(),
+        from_denorm,
+        to_denorm
+    );
+
+    pattern
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_processed_node_metadata_creation() {
+        let nodes = HashMap::new();
+        let mut relationships = HashMap::new();
+
+        // Create a denormalized relationship (OnTime flights example)
+        let mut from_props = HashMap::new();
+        from_props.insert("city".to_string(), "OriginCityName".to_string());
+        from_props.insert("state".to_string(), "OriginState".to_string());
+
+        let mut to_props = HashMap::new();
+        to_props.insert("city".to_string(), "DestCityName".to_string());
+        to_props.insert("state".to_string(), "DestState".to_string());
+
+        let flight_rel = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "default".to_string(),
+            table_name: "ontime".to_string(),
+            column_names: vec!["Origin".to_string(), "Dest".to_string()],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("Origin"),
+            to_id: Identifier::from("Dest"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: Some(Identifier::Composite(vec![
+                "FlightDate".to_string(),
+                "FlightNum".to_string(),
+            ])),
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: Some(from_props),
+            to_node_properties: Some(to_props),
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        relationships.insert("FLIGHT::Airport::Airport".to_string(), flight_rel);
+
+        // Build schema
+        let schema = GraphSchema::build(1, "default".to_string(), nodes, relationships);
+
+        // Verify metadata was built
+        assert!(schema.is_denormalized_node("Airport"));
+
+        let metadata = schema.get_denormalized_node_metadata("Airport").unwrap();
+        assert_eq!(metadata.label, "Airport");
+
+        // Check property sources
+        let city_sources = metadata.get_property_sources("city").unwrap();
+        assert_eq!(city_sources.len(), 2); // from and to sides
+
+        assert_eq!(city_sources[0].relationship_type, "FLIGHT");
+        assert_eq!(city_sources[0].side, "from");
+        assert_eq!(city_sources[0].column_name, "OriginCityName");
+
+        assert_eq!(city_sources[1].relationship_type, "FLIGHT");
+        assert_eq!(city_sources[1].side, "to");
+        assert_eq!(city_sources[1].column_name, "DestCityName");
+
+        // Check ID sources
+        let rel_types = metadata.get_relationship_types();
+        assert_eq!(rel_types.len(), 1);
+        assert!(rel_types.contains(&"FLIGHT".to_string()));
+    }
+
+    /// #1081: `rel_type_index` is `#[serde(skip)]`, so a `GraphSchema` recovered
+    /// through serde (the `graph_catalog` JSON persistence path, and the 60s
+    /// `monitor_schema_updates` background refresh) came back with an EMPTY index.
+    /// Resolving a simple relationship type name (`RELATED_TO`) then fell off the
+    /// fast path — which, in a chained pattern `(a)-[:T]->(b)-[:T2]->(c)`,
+    /// corrupted the intermediate node's label to the relationship's own qualified
+    /// name (`RELATED_TO::Topic::Topic`). Intermittent in production (only after a
+    /// monitor tick replaced the built schema), deterministic here.
+    ///
+    /// This uses a standard (non-denormalized) self-referential relationship,
+    /// matching the `vector_graphrag` schema that surfaced #1081: its composite
+    /// keys survive serde as map keys, so rebuilding `rel_type_index` from
+    /// `relationships` is a complete fix. (Denormalized metadata is a separate,
+    /// deeper matter — most `RelationshipSchema` fields incl. `from_node_properties`
+    /// are themselves `#[serde(skip)]`, so denorm schemas do not survive a
+    /// `graph_catalog` round-trip at all; tracked separately, not #1081.)
+    #[test]
+    fn test_rel_type_index_survives_serde_roundtrip() {
+        let mut relationships = HashMap::new();
+        let related_to = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "default".to_string(),
+            table_name: "topic_related_to".to_string(),
+            column_names: vec!["topic_id".to_string(), "related_topic_id".to_string()],
+            from_node: "Topic".to_string(),
+            to_node: "Topic".to_string(),
+            from_node_table: "topics".to_string(),
+            to_node_table: "topics".to_string(),
+            from_id: Identifier::from("topic_id"),
+            to_id: Identifier::from("related_topic_id"),
+            from_node_id_dtype: SchemaType::Integer,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: None,
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+        relationships.insert("RELATED_TO::Topic::Topic".to_string(), related_to);
+
+        let schema = GraphSchema::build(1, "default".to_string(), HashMap::new(), relationships);
+
+        // Freshly built schema resolves the simple type name via the fast path.
+        assert!(!schema.get_rel_type_index().is_empty());
+        assert!(schema
+            .get_rel_schema_with_nodes("RELATED_TO", Some("Topic"), Some("Topic"))
+            .is_ok());
+
+        // Round-trip through the graph_catalog JSON persistence path.
+        let json = serde_json::to_string(&schema).unwrap();
+        let restored: GraphSchema = serde_json::from_str(&json).unwrap();
+
+        // Both FAIL before the #1081 fix (empty rel_type_index after deserialize).
+        assert!(
+            !restored.get_rel_type_index().is_empty(),
+            "#1081: rel_type_index must be rebuilt after deserialize"
+        );
+        assert!(
+            restored
+                .get_rel_schema_with_nodes("RELATED_TO", Some("Topic"), Some("Topic"))
+                .is_ok(),
+            "#1081: simple relationship-type lookup must work after deserialize"
+        );
+    }
+
+    #[test]
+    fn test_multiple_denormalized_nodes() {
+        let mut relationships = HashMap::new();
+
+        // Create User->Post relationship with denormalized User properties
+        let mut user_props = HashMap::new();
+        user_props.insert("name".to_string(), "author_name".to_string());
+
+        let authored_rel = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "default".to_string(),
+            table_name: "posts".to_string(),
+            column_names: vec!["user_id".to_string(), "post_id".to_string()],
+            from_node: "User".to_string(),
+            to_node: "Post".to_string(),
+            from_node_table: "users".to_string(),
+            to_node_table: "posts".to_string(),
+            from_id: Identifier::from("user_id"),
+            to_id: Identifier::from("post_id"),
+            from_node_id_dtype: SchemaType::Integer,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: Some(user_props),
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        relationships.insert("AUTHORED::User::Post".to_string(), authored_rel);
+
+        let schema = GraphSchema::build(1, "default".to_string(), HashMap::new(), relationships);
+
+        // User should be denormalized, Post should not
+        assert!(schema.is_denormalized_node("User"));
+        assert!(!schema.is_denormalized_node("Post"));
+
+        let labels = schema.get_denormalized_node_labels();
+        assert_eq!(labels.len(), 1);
+        assert!(labels.contains(&&"User".to_string()));
+    }
+
+    /// #584: `is_self_referencing_fk_edge` gates the coupled-rel-var aggregate
+    /// remap. It must fire ONLY for an FK-edge whose from/to tables are equal
+    /// (no denorm props) — the mis-planned single-scan shape whose `count(r)`
+    /// must stay a loud error rather than be remapped to a silent-wrong count.
+    #[test]
+    fn test_is_self_referencing_fk_edge_classification() {
+        // Minimal RelationshipSchema builder over the fields relevant here.
+        let make = |is_fk: bool,
+                    from_tbl: &str,
+                    to_tbl: &str,
+                    from_np: Option<HashMap<String, String>>,
+                    to_np: Option<HashMap<String, String>>| RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "default".to_string(),
+            table_name: from_tbl.to_string(),
+            column_names: vec![],
+            from_node: "A".to_string(),
+            to_node: "B".to_string(),
+            from_node_table: from_tbl.to_string(),
+            to_node_table: to_tbl.to_string(),
+            from_id: Identifier::from("f_id"),
+            to_id: Identifier::from("t_id"),
+            from_node_id_dtype: SchemaType::Integer,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: from_np,
+            to_node_properties: to_np,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: is_fk,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Self-referencing FK-edge (emp→emp, REPORTS_TO): TRUE — stay loud.
+        assert!(
+            make(true, "emp", "emp", None, None).is_self_referencing_fk_edge(),
+            "FK-edge with equal from/to tables and no denorm props is self-referencing"
+        );
+
+        // Non-self-referencing FK-edge (orders_fk→customers_fk, PLACED_BY): FALSE — remap.
+        assert!(
+            !make(true, "orders_fk", "customers_fk", None, None).is_self_referencing_fk_edge(),
+            "FK-edge with distinct from/to tables is NOT self-referencing"
+        );
+
+        // Fully-denormalized coupled edge on one table (has denorm props): FALSE — remap.
+        let mut np = HashMap::new();
+        np.insert("name".to_string(), "col".to_string());
+        assert!(
+            !make(false, "dns_log", "dns_log", Some(np.clone()), Some(np))
+                .is_self_referencing_fk_edge(),
+            "denormalized coupled edge (denorm props present) is NOT a self-referencing FK-edge"
+        );
+
+        // Plain separate edge table: FALSE.
+        assert!(
+            !make(false, "users", "posts", None, None).is_self_referencing_fk_edge(),
+            "plain separate edge table is NOT a self-referencing FK-edge"
+        );
+    }
+
+    // ========================================================================
+    // Denormalized Edge Table Detection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_fully_denormalized_pattern() {
+        // Pattern: Airport nodes use flights table (fully denormalized)
+        let mut from_props = HashMap::new();
+        from_props.insert("code".to_string(), "origin_code".to_string());
+        from_props.insert("city".to_string(), "origin_city".to_string());
+
+        let mut to_props = HashMap::new();
+        to_props.insert("code".to_string(), "dest_code".to_string());
+        to_props.insert("city".to_string(), "dest_city".to_string());
+
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            property_mappings: HashMap::new(), // Empty = denormalized
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: true,
+            from_properties: Some(from_props.clone()),
+            to_properties: Some(to_props.clone()),
+            denormalized_source_table: Some("test.flights".to_string()),
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let flight_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(), // Same table
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("dest_code"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: Some(from_props),
+            to_node_properties: Some(to_props),
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Test detection
+        assert!(is_node_denormalized_on_edge(&airport, &flight_edge, true));
+        assert!(is_node_denormalized_on_edge(&airport, &flight_edge, false));
+        assert!(is_fully_denormalized_edge_table(
+            &airport,
+            &flight_edge,
+            &airport
+        ));
+
+        let pattern = classify_edge_table_pattern(&airport, &flight_edge, &airport);
+        assert_eq!(pattern, EdgeTablePattern::FullyDenormalized);
+    }
+
+    #[test]
+    fn test_detect_traditional_pattern() {
+        // Pattern: Airport nodes have separate airports table (traditional)
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "airports".to_string(), // Different table
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            property_mappings: {
+                let mut props = HashMap::new();
+                props.insert(
+                    "code".to_string(),
+                    PropertyValue::Column("airport_code".to_string()),
+                );
+                props.insert(
+                    "city".to_string(),
+                    PropertyValue::Column("city_name".to_string()),
+                );
+                props
+            },
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let flight_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(), // Different table
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("dest_code"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: None, // No denormalized props
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Test detection
+        assert!(!is_node_denormalized_on_edge(&airport, &flight_edge, true));
+        assert!(!is_node_denormalized_on_edge(&airport, &flight_edge, false));
+        assert!(!is_fully_denormalized_edge_table(
+            &airport,
+            &flight_edge,
+            &airport
+        ));
+
+        let pattern = classify_edge_table_pattern(&airport, &flight_edge, &airport);
+        assert_eq!(pattern, EdgeTablePattern::Traditional);
+    }
+
+    #[test]
+    fn test_detect_mixed_pattern_from_denormalized() {
+        // Pattern: Airport uses flights table (denormalized), User uses users table (traditional)
+        let mut from_props_airport = HashMap::new();
+        from_props_airport.insert("code".to_string(), "origin_code".to_string());
+        from_props_airport.insert("city".to_string(), "origin_city".to_string());
+
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(), // Same as edge
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            property_mappings: HashMap::new(), // Empty
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: true,
+            from_properties: Some(from_props_airport.clone()),
+            to_properties: None,
+            denormalized_source_table: Some("test.flights".to_string()),
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let user = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "users".to_string(), // Different from edge
+            column_names: vec![],
+            primary_keys: "user_id".to_string(),
+            node_id: NodeIdSchema::single("user_id".to_string(), SchemaType::Integer),
+            property_mappings: {
+                let mut props = HashMap::new();
+                props.insert(
+                    "user_id".to_string(),
+                    PropertyValue::Column("id".to_string()),
+                );
+                props.insert(
+                    "name".to_string(),
+                    PropertyValue::Column("full_name".to_string()),
+                );
+                props
+            },
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let mut from_props = HashMap::new();
+        from_props.insert("code".to_string(), "origin_code".to_string());
+        from_props.insert("city".to_string(), "origin_city".to_string());
+
+        let booked_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "User".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "users".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("user_id"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_label_values: None,
+            to_label_values: None,
+            from_node_properties: Some(from_props),
+            to_node_properties: None, // User is traditional
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Test detection
+        assert!(is_node_denormalized_on_edge(&airport, &booked_edge, true));
+        assert!(!is_node_denormalized_on_edge(&user, &booked_edge, false));
+        assert!(!is_fully_denormalized_edge_table(
+            &airport,
+            &booked_edge,
+            &user
+        ));
+
+        let pattern = classify_edge_table_pattern(&airport, &booked_edge, &user);
+        assert_eq!(
+            pattern,
+            EdgeTablePattern::Mixed {
+                from_denormalized: true,
+                to_denormalized: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_mixed_pattern_to_denormalized() {
+        // Pattern: User uses users table (traditional), Post uses posts table which is also edge table
+        let user = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "users".to_string(),
+            column_names: vec![],
+            primary_keys: "user_id".to_string(),
+            node_id: NodeIdSchema::single("user_id".to_string(), SchemaType::Integer),
+            property_mappings: {
+                let mut props = HashMap::new();
+                props.insert(
+                    "name".to_string(),
+                    PropertyValue::Column("full_name".to_string()),
+                );
+                props
+            },
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let mut to_props_post = HashMap::new();
+        to_props_post.insert("post_id".to_string(), "id".to_string());
+        to_props_post.insert("title".to_string(), "post_title".to_string());
+
+        let post = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "posts".to_string(), // Same as edge
+            column_names: vec![],
+            primary_keys: "post_id".to_string(),
+            node_id: NodeIdSchema::single("post_id".to_string(), SchemaType::Integer),
+            property_mappings: HashMap::new(), // Empty - denormalized
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: true,
+            from_properties: None,
+            to_properties: Some(to_props_post.clone()),
+            denormalized_source_table: Some("test.posts".to_string()),
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let mut to_props = HashMap::new();
+        to_props.insert("post_id".to_string(), "id".to_string());
+        to_props.insert("title".to_string(), "post_title".to_string());
+
+        let authored_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "posts".to_string(),
+            column_names: vec![],
+            from_node: "User".to_string(),
+            to_node: "Post".to_string(),
+            from_node_table: "users".to_string(),
+            to_node_table: "posts".to_string(),
+            from_id: Identifier::from("author_id"),
+            to_id: Identifier::from("id"),
+            from_node_id_dtype: SchemaType::Integer,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: None,
+            to_node_properties: Some(to_props),
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Test detection
+        assert!(!is_node_denormalized_on_edge(&user, &authored_edge, true));
+        assert!(is_node_denormalized_on_edge(&post, &authored_edge, false));
+
+        let pattern = classify_edge_table_pattern(&user, &authored_edge, &post);
+        assert_eq!(
+            pattern,
+            EdgeTablePattern::Mixed {
+                from_denormalized: false,
+                to_denormalized: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_edge_case_minimal_property_mappings() {
+        // Pattern: Node has 1-2 property_mappings but still denormalized
+        // (allows for computed properties or special cases)
+        let mut from_props_min = HashMap::new();
+        from_props_min.insert("code".to_string(), "origin_code".to_string());
+        from_props_min.insert("city".to_string(), "origin_city".to_string());
+
+        let mut to_props_min = HashMap::new();
+        to_props_min.insert("code".to_string(), "dest_code".to_string());
+
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            property_mappings: {
+                let mut props = HashMap::new();
+                // One or two direct mappings allowed
+                props.insert(
+                    "computed_field".to_string(),
+                    PropertyValue::Column("calc_value".to_string()),
+                );
+                props
+            },
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: true,
+            from_properties: Some(from_props_min.clone()),
+            to_properties: Some(to_props_min.clone()),
+            denormalized_source_table: Some("test.flights".to_string()),
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let mut from_props = HashMap::new();
+        from_props.insert("code".to_string(), "origin_code".to_string());
+        from_props.insert("city".to_string(), "origin_city".to_string());
+
+        let mut to_props = HashMap::new();
+        to_props.insert("code".to_string(), "dest_code".to_string());
+
+        let flight_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("dest_code"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: Some(from_props),
+            to_node_properties: Some(to_props),
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Should still be detected as denormalized (1-2 mappings allowed)
+        assert!(is_node_denormalized_on_edge(&airport, &flight_edge, true));
+        assert!(is_fully_denormalized_edge_table(
+            &airport,
+            &flight_edge,
+            &airport
+        ));
+    }
+
+    #[test]
+    fn test_edge_case_same_table_no_denorm_props() {
+        // Edge case: Node uses edge table BUT edge has no from/to_node_properties
+        // This should NOT be detected as denormalized (misconfiguration)
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let flight_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(), // Same table
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("dest_code"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: None, // Missing!
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Should NOT be detected as denormalized (missing props)
+        assert!(!is_node_denormalized_on_edge(&airport, &flight_edge, true));
+        assert!(!is_node_denormalized_on_edge(&airport, &flight_edge, false));
+        assert!(!is_fully_denormalized_edge_table(
+            &airport,
+            &flight_edge,
+            &airport
+        ));
+
+        let pattern = classify_edge_table_pattern(&airport, &flight_edge, &airport);
+        assert_eq!(pattern, EdgeTablePattern::Traditional);
+    }
+
+    #[test]
+    fn test_edge_case_different_database_same_table_name() {
+        // Edge case: Same table name but different databases
+        // Should NOT be detected as denormalized
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "db1".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let mut from_props = HashMap::new();
+        from_props.insert("code".to_string(), "origin_code".to_string());
+
+        let flight_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "db2".to_string(), // Different database!
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("dest_code"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: Some(from_props),
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Should NOT be detected (different databases)
+        assert!(!is_node_denormalized_on_edge(&airport, &flight_edge, true));
+    }
+
+    #[test]
+    fn test_edge_case_too_many_property_mappings() {
+        // Edge case: Node has many property_mappings (>2)
+        // Should NOT be detected as denormalized
+        let airport = NodeSchema {
+            column_types: Default::default(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            primary_keys: "code".to_string(),
+            node_id: NodeIdSchema::single("code".to_string(), SchemaType::String),
+            is_denormalized: false,
+            from_properties: None,
+            to_properties: None,
+            denormalized_source_table: None,
+            label_column: None,
+            label_value: None,
+            property_mappings: {
+                let mut props = HashMap::new();
+                props.insert(
+                    "prop1".to_string(),
+                    PropertyValue::Column("col1".to_string()),
+                );
+                props.insert(
+                    "prop2".to_string(),
+                    PropertyValue::Column("col2".to_string()),
+                );
+                props.insert(
+                    "prop3".to_string(),
+                    PropertyValue::Column("col3".to_string()),
+                );
+                props.insert(
+                    "prop4".to_string(),
+                    PropertyValue::Column("col4".to_string()),
+                );
+                props // More than 2 = traditional pattern
+            },
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            node_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+            id_generation: None,
+        };
+
+        let mut from_props = HashMap::new();
+        from_props.insert("code".to_string(), "origin_code".to_string());
+
+        let flight_edge = RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "test".to_string(),
+            table_name: "flights".to_string(),
+            column_names: vec![],
+            from_node: "Airport".to_string(),
+            to_node: "Airport".to_string(),
+            from_node_table: "airports".to_string(),
+            to_node_table: "airports".to_string(),
+            from_id: Identifier::from("origin_code"),
+            to_id: Identifier::from("dest_code"),
+            from_node_id_dtype: SchemaType::String,
+            to_node_id_dtype: SchemaType::String,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: Some(from_props),
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Should NOT be detected (too many property_mappings)
+        assert!(!is_node_denormalized_on_edge(&airport, &flight_edge, true));
+    }
+
+    /// Regression test: when two node labels map to the same table (e.g., City and Place
+    /// both use the Place table), relationship disambiguation must use label matching,
+    /// not table-name matching.
+    #[test]
+    fn test_expand_generic_filters_by_label_not_table() {
+        let mut nodes = HashMap::new();
+        let mut city = NodeSchema::new_traditional(
+            "db".to_string(),
+            "Place".to_string(),
+            vec![],
+            "id".to_string(),
+            NodeIdSchema {
+                part_types: Vec::new(),
+                id: Identifier::from("id"),
+                dtype: SchemaType::Integer,
+            },
+            HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        city.filter = Some(SchemaFilter::new("type = 'City'").unwrap());
+        nodes.insert("City".to_string(), city);
+
+        nodes.insert(
+            "Place".to_string(),
+            NodeSchema::new_traditional(
+                "db".to_string(),
+                "Place".to_string(),
+                vec![],
+                "id".to_string(),
+                NodeIdSchema {
+                    part_types: Vec::new(),
+                    id: Identifier::from("id"),
+                    dtype: SchemaType::Integer,
+                },
+                HashMap::new(),
+                None,
+                None,
+                None,
+            ),
+        );
+
+        let mut relationships = HashMap::new();
+        let base_rel = || RelationshipSchema {
+            column_types: Default::default(),
+            from_node_id_part_types: Vec::new(),
+            to_node_id_part_types: Vec::new(),
+            closed_properties: false,
+            database: "db".to_string(),
+            table_name: String::new(),
+            column_names: vec![],
+            from_node: String::new(),
+            to_node: String::new(),
+            from_node_table: String::new(),
+            to_node_table: String::new(),
+            from_id: Identifier::from("from_id"),
+            to_id: Identifier::from("to_id"),
+            from_node_id_dtype: SchemaType::Integer,
+            to_node_id_dtype: SchemaType::Integer,
+            property_mappings: HashMap::new(),
+            view_parameters: None,
+            engine: None,
+            use_final: None,
+            filter: None,
+            edge_id: None,
+            type_column: None,
+            from_label_column: None,
+            to_label_column: None,
+            from_node_properties: None,
+            to_node_properties: None,
+            from_label_values: None,
+            to_label_values: None,
+            is_fk_edge: false,
+            constraints: None,
+            edge_id_types: None,
+            source: None,
+            property_types: HashMap::new(),
+        };
+
+        // Person IS_LOCATED_IN City (uses Place table)
+        let mut rel1 = base_rel();
+        rel1.table_name = "Person_isLocatedIn_Place".to_string();
+        rel1.from_node = "Person".to_string();
+        rel1.to_node = "City".to_string();
+        rel1.from_node_table = "Person".to_string();
+        rel1.to_node_table = "Place".to_string();
+        relationships.insert("IS_LOCATED_IN::Person::City".to_string(), rel1);
+
+        // Organisation IS_LOCATED_IN Place (uses Place table)
+        let mut rel2 = base_rel();
+        rel2.table_name = "Org_isLocatedIn_Place".to_string();
+        rel2.from_node = "Organisation".to_string();
+        rel2.to_node = "Place".to_string();
+        rel2.from_node_table = "Organisation".to_string();
+        rel2.to_node_table = "Place".to_string();
+        relationships.insert("IS_LOCATED_IN::Organisation::Place".to_string(), rel2);
+
+        let schema = GraphSchema::build(1, "db".to_string(), nodes, relationships);
+
+        // Query: (x)-[:IS_LOCATED_IN]->(city:City)
+        // Must pick Person::City, NOT Organisation::Place (even though City and Place share a table)
+        let result = schema.expand_generic_relationship_type("IS_LOCATED_IN", None, Some("City"));
+        assert_eq!(result, vec!["IS_LOCATED_IN::Person::City"]);
+
+        // Query: (org:Organisation)-[:IS_LOCATED_IN]->(p:Place)
+        let result = schema.expand_generic_relationship_type(
+            "IS_LOCATED_IN",
+            Some("Organisation"),
+            Some("Place"),
+        );
+        assert_eq!(result, vec!["IS_LOCATED_IN::Organisation::Place"]);
+
+        // Query: (x)-[:IS_LOCATED_IN]->(y) — no labels, returns all
+        let mut result = schema.expand_generic_relationship_type("IS_LOCATED_IN", None, None);
+        result.sort();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_expand_node_type_constrained_honors_label_values_827() {
+        // Schema with four node labels; a polymorphic edge whose `$any` endpoint
+        // legally targets only two of them (via `to_label_values`).
+        let mut nodes = HashMap::new();
+        for label in ["User", "Group", "Folder", "File"] {
+            nodes.insert(
+                label.to_string(),
+                NodeSchema::new_traditional(
+                    "db".to_string(),
+                    label.to_string(),
+                    vec![],
+                    "id".to_string(),
+                    NodeIdSchema {
+                        part_types: Vec::new(),
+                        id: Identifier::from("id"),
+                        dtype: SchemaType::Integer,
+                    },
+                    HashMap::new(),
+                    None,
+                    None,
+                    None,
+                ),
+            );
+        }
+        let schema = GraphSchema::build(1, "db".to_string(), nodes, HashMap::new());
+
+        // Bare `$any` with no allow-list → every node label (unchanged legacy).
+        let mut all = schema.expand_node_type_constrained("$any", None);
+        all.sort();
+        assert_eq!(all, vec!["File", "Folder", "Group", "User"]);
+
+        // `$any` constrained by `to_label_values` → only the declared labels (#827).
+        let allow = vec!["Folder".to_string(), "File".to_string()];
+        let mut constrained = schema.expand_node_type_constrained("$any", Some(&allow));
+        constrained.sort();
+        assert_eq!(constrained, vec!["File", "Folder"]);
+
+        // An empty allow-list is ignored → falls back to full expansion (never
+        // collapses the candidate set to nothing).
+        let empty: Vec<String> = vec![];
+        let mut none_listed = schema.expand_node_type_constrained("$any", Some(&empty));
+        none_listed.sort();
+        assert_eq!(none_listed, vec!["File", "Folder", "Group", "User"]);
+
+        // A concrete (non-`$any`) type is returned as-is, allow-list irrelevant.
+        assert_eq!(
+            schema.expand_node_type_constrained("User", Some(&allow)),
+            vec!["User"]
+        );
+    }
+}

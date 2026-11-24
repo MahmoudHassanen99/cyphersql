@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cyphersql"
+version = "0.1.0"
+description = "Zero-ETL openCypher-to-SQL compiler supporting ClickHouse, Trino, Postgres, MySQL, and DuckDB."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mahmoud Hassanen" }]
+dependencies = [
+    "sqlglot>=25.0.0",
+    "pyyaml>=6.0",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "cyphersql._core"
+features = ["pyo3/extension-module"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["vendor", ".git", "target", "dist"]

@@ -1,0 +1,70 @@
+# OnTime Flight Data - Denormalized Edge Table ANTI-PATTERN (#1038)
+#
+# NEGATIVE FIXTURE — this schema is intentionally INVALID and is REJECTED at
+# schema-load by validate_denormalized_nodes (graph_catalog/config.rs). Do NOT
+# copy it as a working example.
+#
+# The Airport node is a denormalized SELF-LOOP (from_node == to_node == Airport,
+# sharing the `flights` edge table). Its from_node_properties (origin role) and
+# to_node_properties (destination role) expose DIFFERENT property key sets:
+# `state` is present only in the destination role (`DestState`; the table has no
+# `OriginState` column). On an UNDIRECTED match the swap-branch re-key attributes
+# the destination's state to the origin node — e.g.
+#   MATCH (a:Airport)-[:FLIGHT]-(b:Airport) RETURN a.code, a.state
+# rendered `a.state` from `DestState` in BOTH union arms, silently reporting the
+# wrong airport's state (live-verified). Per ground rule #1 (fail loud over
+# silent-wrong) the asymmetric key set is now rejected at load instead.
+#
+# Locked by config.rs::tests::test_ontime_mismatched_example_selfloop_rejected_1038.
+# Historical note: originally authored (mislabeled) as a positive
+# "UNION ALL normalization works correctly" example — it never did.
+
+name: ontime_flights_mismatched
+version: "1.0"
+
+graph_schema:
+  nodes:
+    # Airport is a virtual node - data comes from the flights table
+    - label: Airport
+      database: test_integration
+      table: flights  # Same table as the edge!
+      node_id: code  # Logical property name for the airport code
+      property_mappings: {}  # Empty - all properties are denormalized
+      
+      # Properties when Airport appears as origin (from_node)
+      # NOTE: Only 3 properties - missing 'state' compared to to_node_properties
+      from_node_properties:
+        code: Origin
+        city: OriginCityName
+        airport: OriginAirportName
+      
+      # Properties when Airport appears as destination (to_node)
+      # NOTE: Has 'state' property that from_node_properties lacks
+      to_node_properties:
+        code: Dest
+        city: DestCityName
+        state: DestState
+        airport: DestAirportName
+
+  edges:
+    # Flight relationship - node properties declared in Airport node above
+    - type: FLIGHT
+      database: test_integration
+      table: flights
+      from_id: Origin
+      to_id: Dest
+      from_node: Airport
+      to_node: Airport
+      
+      # Composite edge ID (flights can repeat on different dates)
+      edge_id: [FlightDate, FlightNum, Origin, Dest]
+      
+      # Edge properties (specific to the flight itself)
+      property_mappings:
+        flight_date: FlightDate
+        flight_num: FlightNum
+        carrier: Carrier
+        departure_time: DepTime
+        arrival_time: ArrTime
+        distance: Distance
+        delay: ArrDelay

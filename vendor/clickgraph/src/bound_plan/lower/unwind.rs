@@ -1,0 +1,1415 @@
+//! UNWIND (P-4c S7c, `docs/design/EXPLICIT_SCOPE.md` §3, §4.4): one record
+//! per element of a list; an empty list or NULL gives none, and a value that
+//! is not a list gives one record of itself.
+//!
+//! The rows so far become a CTE whose SELECT repeats each of them once per
+//! element (`ARRAY JOIN`, `FunctionMapper::unwind`) and exports the scope
+//! plus the element as a value, and a new segment reads from it (as after a
+//! SKIP / LIMIT).
+//!
+//! Whether the expression is a list is decided here, from the expression
+//! ([`Kind`]): a list literal, `collect()`, `range()`, … is a list; a
+//! literal, an arithmetic or comparison, a property whose type the schema
+//! declares is not (UNWIND reads it as the list of itself, or of nothing
+//! when NULL); a value of unknown type (a parameter, an undeclared property,
+//! …) is read as a list and fails the query when it is not one, rather than
+//! repeating a row per entry of a map.
+//!
+//! Rows in an order (after an ORDER BY) keep it, and each row's elements
+//! follow it in list order: the rows are numbered in their order first (a
+//! CTE), and the next rows are ordered by that number, then by the
+//! element's position.
+//!
+//! A node, relationship or path in the list is `Unsupported` (S7e lists),
+//! as is a property of the element (a map).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::graph_catalog::expression_parser::PropertyValue;
+use crate::graph_catalog::schema_types::{KeyPartType, SchemaType};
+use crate::query_planner::logical_expr::{self as lx, LogicalExpr};
+use crate::render_plan::render_expr::{Literal, RenderCase, RenderExpr, TableAlias};
+use crate::render_plan::RenderPlan;
+use crate::render_plan::{ArrayJoin, OrderByItem, OrderByOrder};
+use crate::sql_generator::emitters::clickhouse::to_sql_query::{
+    order_keys_to_sql_plain, render_expr_to_sql_plain, render_plan_parts_plain, PlainCte,
+};
+use crate::sql_generator::function_mapper::{current_function_mapper, Unwind};
+
+use super::elements::Elem;
+use super::{
+    col_at, parse_var, select, table_ref, unsupported, Body, Exports, LowerError, Lowerer,
+    RowOrder, Scan,
+};
+use crate::bound_plan::types::{BindingKind, VarId};
+
+/// The element a SELECT's `ARRAY JOIN` repeats its row for, and its position
+/// in the list.
+const ELEMENT: &str = "__cg_element";
+const POSITION: &str = "__cg_position";
+/// A row's number in the order of the rows ([`Lowerer::number_rows`]).
+const ROW_NUMBER: &str = "__cg_row";
+/// The alias of the table of one row (`Unwind::one_row`).
+const ONE_ROW: &str = "__cg_one";
+
+impl Lowerer<'_> {
+    /// What a projected, unwound or comprehension variable is.
+    pub(super) fn var_kind(&self, v: VarId) -> Option<Kind> {
+        let before = self
+            .no_column_kinds
+            .get()
+            .then(|| self.kinds_before.get(&v).cloned())
+            .flatten();
+        before
+            .or_else(|| self.kinds.get(&v).cloned())
+            .or_else(|| self.local_kinds.borrow().get(&v).cloned())
+    }
+
+    /// Record `kind`, the kind of `expr`, as variable `v`'s
+    /// ([`Self::set_kind`]).
+    pub(super) fn record_kind(&mut self, v: VarId, expr: &LogicalExpr, kind: Kind) {
+        let before = self.kind_before_column_types(expr);
+        self.set_kind(v, kind, before);
+    }
+
+    /// Variable `v` is of `kind`, and of `before` with properties' column
+    /// types left unread (`kind_before_column_types`). Every variable's kind
+    /// is set here, so the two never disagree on which variables they know.
+    pub(super) fn set_kind(&mut self, v: VarId, kind: Kind, before: Kind) {
+        match before != kind {
+            true => self.kinds_before.insert(v, before),
+            false => self.kinds_before.remove(&v),
+        };
+        self.kinds.insert(v, kind);
+    }
+
+    /// `nodes(p)` / `relationships(p)` (`f`) whose elements are all of one
+    /// label (one definition): what they are. A variable-length part must
+    /// carry them as tuples (the demand pass) and walk one definition. A
+    /// path an OPTIONAL MATCH may leave NULL is not: its list would be NULL.
+    pub(super) fn path_elem(&self, f: &lx::ScalarFnCall) -> Option<Elem> {
+        let (p, nodes) = self.path_part(f)?;
+        if self.grouped_paths.contains(&p) {
+            return None;
+        }
+        let elements = self.paths.get(&p)?;
+        let mut elem: Option<Elem> = None;
+        let mut agree = |e: Elem| -> Option<()> {
+            match &elem {
+                Some(x) if *x != e => None,
+                _ => {
+                    elem = Some(e);
+                    Some(())
+                }
+            }
+        };
+        if nodes {
+            for v in &elements.nodes {
+                agree(self.elem_of(*v)?)?;
+            }
+        }
+        for r in &elements.rels {
+            match self.scans.get(r)? {
+                Scan::Path {
+                    walked: super::Walked::One { schema, rel_type },
+                    node_tuples,
+                    rel_tuples,
+                    ..
+                } => {
+                    if nodes && *node_tuples && schema.from_node == schema.to_node {
+                        agree(Elem::Node(schema.from_node.clone()))?;
+                    } else if !nodes && *rel_tuples {
+                        agree(Elem::Rel {
+                            rel_type: rel_type.clone(),
+                            from: schema.from_node.clone(),
+                            to: schema.to_node.clone(),
+                        })?;
+                    } else {
+                        return None;
+                    }
+                }
+                Scan::Path { .. } => return None,
+                _ if !nodes => agree(self.elem_of(*r)?)?,
+                _ => {}
+            }
+        }
+        elem
+    }
+
+    /// The path and whether `f` is its `nodes()` (else `relationships()`).
+    pub(super) fn path_part(&self, f: &lx::ScalarFnCall) -> Option<(VarId, bool)> {
+        let [LogicalExpr::TableAlias(lx::TableAlias(n))] = f.args.as_slice() else {
+            return None;
+        };
+        let p = parse_var(n).filter(|p| matches!(self.binding(*p).kind, BindingKind::Path))?;
+        if self.binding(p).nullable {
+            return None;
+        }
+        match f.name.to_ascii_lowercase().as_str() {
+            "nodes" => Some((p, true)),
+            "relationships" => Some((p, false)),
+            _ => None,
+        }
+    }
+
+    /// A variable-length relationship's list as a list's elements: what
+    /// they are, when its walk carries them (one definition).
+    pub(super) fn walk_rel_elem(&self, r: VarId) -> Option<Elem> {
+        match self.scans.get(&r)? {
+            Scan::Path {
+                walked: super::Walked::One { schema, rel_type },
+                rel_tuples: true,
+                ..
+            } if !self.binding(r).nullable => Some(Elem::Rel {
+                rel_type: rel_type.clone(),
+                from: schema.from_node.clone(),
+                to: schema.to_node.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// What list `e`'s elements are, as far as ClickHouse's order of a list is
+/// concerned (`Lowerer::scalar_list_one_class`).
+#[derive(Debug, Clone, PartialEq)]
+enum Shape {
+    /// NULL, or an element of `[]`: meets any shape.
+    Any,
+    /// A number literal or a numeric function: integers and floats have a
+    /// common type.
+    Num,
+    Str,
+    Bool,
+    List(Box<Shape>),
+    /// A property whose column is of this one type in every label / type
+    /// (`Dynamic` / `Variant` / `JSON` excluded): a type is its own meet only.
+    Typed(String),
+    /// Not known to be one shape.
+    Mixed,
+}
+
+impl Shape {
+    fn meet(self, other: Shape) -> Shape {
+        match (self, other) {
+            (Shape::Any, s) | (s, Shape::Any) => s,
+            (Shape::List(a), Shape::List(b)) => Shape::List(Box::new(a.meet(*b))),
+            (a, b) if a == b && a != Shape::Mixed => a,
+            _ => Shape::Mixed,
+        }
+    }
+}
+
+impl Lowerer<'_> {
+    /// Whether the elements of list `e` are provably of one type that
+    /// ClickHouse orders natively and Cypher orders the same way: literals of
+    /// numbers, of strings or of booleans, a `range()` / `split()` /
+    /// `keys()`, a `collect` of such, a property of one declared type, and
+    /// the variables that are one of those (a `WITH` item, an unwound
+    /// element). `false`: the elements may be of several types, and the list
+    /// is ordered by the element key (`mixed_order`).
+    pub(super) fn scalar_list_one_class(&self, e: &LogicalExpr) -> bool {
+        matches!(
+            self.shape(e, 8),
+            Shape::List(s) if !matches!(*s, Shape::Mixed | Shape::List(_))
+        )
+    }
+
+    fn shape(&self, e: &LogicalExpr, depth: usize) -> Shape {
+        use lx::Operator as O;
+        if depth == 0 {
+            return Shape::Mixed;
+        }
+        let shape = |x: &LogicalExpr| self.shape(x, depth - 1);
+        match e {
+            LogicalExpr::Literal(lx::Literal::Null) => Shape::Any,
+            LogicalExpr::Literal(lx::Literal::Integer(_) | lx::Literal::Float(_)) => Shape::Num,
+            LogicalExpr::Literal(lx::Literal::String(_)) => Shape::Str,
+            LogicalExpr::Literal(lx::Literal::Boolean(_)) => Shape::Bool,
+            LogicalExpr::List(xs) => Shape::List(Box::new(
+                xs.iter()
+                    .map(shape)
+                    .reduce(Shape::meet)
+                    .unwrap_or(Shape::Any),
+            )),
+            LogicalExpr::TableAlias(lx::TableAlias(n)) => {
+                let Some(v) = parse_var(n) else {
+                    return Shape::Mixed;
+                };
+                if let Some(list) = self.unwound_lists.get(&v) {
+                    // An unwound element is an element of its list.
+                    return match shape(list) {
+                        Shape::List(element) => *element,
+                        _ => Shape::Mixed,
+                    };
+                }
+                match self.projected.get(&v) {
+                    Some(source) => shape(source),
+                    None => Shape::Mixed,
+                }
+            }
+            LogicalExpr::PropertyAccessExp(pa) => {
+                let (PropertyValue::Column(p), Some(v)) =
+                    (&pa.column, parse_var(&pa.table_alias.0))
+                else {
+                    return Shape::Mixed;
+                };
+                let types = self.property_columns(v, p);
+                let Some(first) = types.first().copied().flatten() else {
+                    return Shape::Mixed;
+                };
+                let raw = first.raw.to_ascii_lowercase();
+                let any = ["dynamic", "variant", "json"]
+                    .iter()
+                    .any(|t| raw.contains(t));
+                match types.iter().all(|t| *t == Some(first)) && !any {
+                    true => Shape::Typed(raw),
+                    false => Shape::Mixed,
+                }
+            }
+            LogicalExpr::Operator(op) | LogicalExpr::OperatorApplicationExp(op) => {
+                match (op.operator, op.operands.as_slice()) {
+                    (
+                        O::Subtraction
+                        | O::Multiplication
+                        | O::Division
+                        | O::ModuloDivision
+                        | O::Exponentiation,
+                        _,
+                    ) => Shape::Num,
+                    // `+` is a number's, a string's, or a list's.
+                    (O::Addition, [a, b]) => match (shape(a), shape(b)) {
+                        (Shape::Num, Shape::Num) => Shape::Num,
+                        (Shape::Str, Shape::Str) => Shape::Str,
+                        _ => Shape::Mixed,
+                    },
+                    (O::Addition | O::Distinct, _) => Shape::Mixed,
+                    // The rest (comparisons, `AND`, `IN`, `IS NULL` ...) are
+                    // booleans, as `Lowerer::kind` has them.
+                    _ => Shape::Bool,
+                }
+            }
+            LogicalExpr::ScalarFnCall(f) => match f.name.to_ascii_lowercase().as_str() {
+                "range" => Shape::List(Box::new(Shape::Num)),
+                "split" | "keys" => Shape::List(Box::new(Shape::Str)),
+                "size" | "length" | "tointeger" | "tofloat" | "abs" | "ceil" | "floor"
+                | "round" | "sign" | "sqrt" | "exp" | "log" | "log10" | "rand" => Shape::Num,
+                "tostring" | "tolower" | "toupper" | "trim" | "ltrim" | "rtrim" | "substring"
+                | "replace" | "left" | "right" | "type" => Shape::Str,
+                "toboolean" => Shape::Bool,
+                _ => Shape::Mixed,
+            },
+            LogicalExpr::AggregateFnCall(f) => match f.name.to_ascii_lowercase().as_str() {
+                "collect" => match f.args.first() {
+                    Some(x) => Shape::List(Box::new(shape(x))),
+                    None => Shape::Mixed,
+                },
+                "count" => Shape::Num,
+                _ => Shape::Mixed,
+            },
+            _ => Shape::Mixed,
+        }
+    }
+}
+
+/// A list comprehension's part: `[x IN l WHERE p]` keeps elements, `[x IN l
+/// | e]` maps them (`[x IN l WHERE p | e]` is a map of a filter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Comprehension {
+    Filter,
+    Map,
+}
+
+/// The comprehension `f` is (the AST converter spells one as `arrayFilter` /
+/// `arrayMap` of a lambda of one parameter): which, its parameter, the
+/// predicate or value, and the list.
+pub(super) fn comprehension(
+    f: &lx::ScalarFnCall,
+) -> Option<(Comprehension, VarId, &LogicalExpr, &LogicalExpr)> {
+    let how = if f.name.eq_ignore_ascii_case("arrayFilter") {
+        Comprehension::Filter
+    } else if f.name.eq_ignore_ascii_case("arrayMap") {
+        Comprehension::Map
+    } else {
+        return None;
+    };
+    let [LogicalExpr::Lambda(l), list] = f.args.as_slice() else {
+        return None;
+    };
+    let [x] = l.params.as_slice() else {
+        return None;
+    };
+    Some((how, parse_var(x)?, &l.body, list))
+}
+
+/// What a value is, as far as UNWIND needs to know.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Kind {
+    /// Always NULL.
+    Null,
+    /// Not a list (possibly NULL).
+    Scalar,
+    /// A boolean (possibly NULL): ClickHouse holds it as `UInt8`, so a
+    /// column of it is cast for the result to show `true` / `false`.
+    Boolean,
+    /// A list, of elements of this kind.
+    List(Box<Kind>),
+    /// A node or relationship as a list's element (`elements.rs`): possibly
+    /// NULL.
+    Element(Elem),
+    /// A map of these keys (in key order) and values (S7e3).
+    Map(Vec<(String, Kind)>),
+    /// Not known here.
+    Unknown,
+}
+
+/// The kind of a value of a column of type `t` (T2): a list of its
+/// element's kind, a boolean, a scalar of a known scalar type, else unknown.
+fn column_kind(t: &KeyPartType) -> Kind {
+    let scalar = |t: &KeyPartType| {
+        let raw = t.raw.to_ascii_lowercase();
+        [
+            "int",
+            "uint",
+            "float",
+            "bfloat",
+            "decimal",
+            "string",
+            "fixedstring",
+            "uuid",
+            "date",
+            "enum",
+            "ipv4",
+            "ipv6",
+        ]
+        .iter()
+        .any(|p| raw.starts_with(p))
+    };
+    match t.array_element() {
+        Some(e) => Kind::List(Box::new(column_kind(&e))),
+        None if t.raw.eq_ignore_ascii_case("Bool") => Kind::Boolean,
+        // A value of one scalar type; anything else (a map's or tuple's
+        // entries, a `Dynamic` / `Variant` / `JSON`) is not known here
+        // (review findings).
+        None if scalar(t) => Kind::Scalar,
+        None => Kind::Unknown,
+    }
+}
+
+impl Kind {
+    /// A value that is one or the other.
+    fn either(self, other: Kind) -> Kind {
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Kind::Null, k @ (Kind::Scalar | Kind::Boolean | Kind::Element(_)))
+            | (k @ (Kind::Scalar | Kind::Boolean | Kind::Element(_)), Kind::Null) => k,
+            (Kind::Scalar | Kind::Boolean, Kind::Scalar | Kind::Boolean) => Kind::Scalar,
+            (Kind::List(a), Kind::List(b)) => Kind::List(Box::new(a.either(*b))),
+            // Maps (of one type whatever their keys): the keys either may
+            // have, each value either (NULL for a map without the key).
+            (Kind::Map(a), Kind::Map(b)) => {
+                let mut keys: Vec<String> = a.iter().chain(&b).map(|(k, _)| k.clone()).collect();
+                keys.sort();
+                keys.dedup();
+                let value = |m: &[(String, Kind)], k: &str| {
+                    m.iter()
+                        .find(|(x, _)| x == k)
+                        .map_or(Kind::Null, |(_, v)| v.clone())
+                };
+                Kind::Map(
+                    keys.into_iter()
+                        .map(|k| {
+                            let v = value(&a, &k).either(value(&b, &k));
+                            (k, v)
+                        })
+                        .collect(),
+                )
+            }
+            // A list of values that may be NULL: on ClickHouse held as `[]`
+            // where it is (`null_list.rs`), which what reads it tells by its
+            // source. (A dialect with NULL lists reads it as it is.)
+            (Kind::Null, Kind::List(k)) | (Kind::List(k), Kind::Null)
+                if !matches!(*k, Kind::Element(_)) && super::null_list::null_as_empty() =>
+            {
+                Kind::List(k)
+            }
+            // A list of nodes or relationships that may be NULL.
+            _ => Kind::Unknown,
+        }
+    }
+
+    /// The kind of the records `UNWIND` of a value of this kind gives.
+    pub(super) fn element(&self) -> Kind {
+        match self {
+            Kind::List(e) => (**e).clone(),
+            k @ (Kind::Scalar
+            | Kind::Boolean
+            | Kind::Null
+            | Kind::Unknown
+            | Kind::Element(_)
+            | Kind::Map(_)) => k.clone(),
+        }
+    }
+}
+
+impl<'s> Lowerer<'s> {
+    /// What `e` is ([`Kind`]).
+    pub(super) fn kind(&self, e: &LogicalExpr) -> Kind {
+        use lx::Operator as O;
+        match e {
+            LogicalExpr::Literal(lx::Literal::Null) => Kind::Null,
+            LogicalExpr::Literal(lx::Literal::Boolean(_)) => Kind::Boolean,
+            LogicalExpr::Literal(_) => Kind::Scalar,
+            LogicalExpr::MapLiteral(entries) => {
+                let mut kinds: Vec<(String, Kind)> = entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.kind(v)))
+                    .collect();
+                kinds.sort_by(|a, b| a.0.cmp(&b.0));
+                Kind::Map(kinds)
+            }
+            LogicalExpr::List(xs) => Kind::List(Box::new(
+                xs.iter()
+                    .map(|x| self.kind(x))
+                    .reduce(Kind::either)
+                    .unwrap_or(Kind::Null),
+            )),
+            LogicalExpr::TableAlias(lx::TableAlias(n)) => parse_var(n)
+                .and_then(|v| match self.binding(v).kind {
+                    BindingKind::Node { .. } | BindingKind::Rel { length: None, .. } => {
+                        self.elem_of(v).map(Kind::Element)
+                    }
+                    BindingKind::Rel {
+                        length: Some(_), ..
+                    } => self
+                        .walk_rel_elem(v)
+                        .map(|e| Kind::List(Box::new(Kind::Element(e)))),
+                    _ => self.var_kind(v),
+                })
+                .unwrap_or(Kind::Unknown),
+            LogicalExpr::PropertyAccessExp(pa) => match &pa.column {
+                PropertyValue::Column(p) => {
+                    parse_var(&pa.table_alias.0).map_or(Kind::Unknown, |v| self.property_kind(v, p))
+                }
+                _ => Kind::Unknown,
+            },
+            LogicalExpr::Operator(op) | LogicalExpr::OperatorApplicationExp(op) => {
+                match (op.operator, op.operands.as_slice()) {
+                    (O::Distinct, [x]) => self.kind(x),
+                    // `+` of lists concatenates, and appends a value to a list
+                    // (`Lowerer::list_addition`); with NULL it is NULL.
+                    (O::Addition, [a, b]) => match (self.kind(a), self.kind(b)) {
+                        (Kind::Scalar | Kind::Null, Kind::Scalar | Kind::Null) => Kind::Scalar,
+                        (Kind::Null, Kind::List(_)) | (Kind::List(_), Kind::Null) => Kind::Null,
+                        (Kind::List(x), Kind::List(y)) => Kind::List(Box::new(x.either(*y))),
+                        (Kind::List(x), e @ (Kind::Scalar | Kind::Boolean))
+                        | (e @ (Kind::Scalar | Kind::Boolean), Kind::List(x)) => {
+                            Kind::List(Box::new(x.either(e)))
+                        }
+                        _ => Kind::Unknown,
+                    },
+                    (O::Addition | O::Distinct, _) => Kind::Unknown,
+                    (
+                        O::Subtraction
+                        | O::Multiplication
+                        | O::Division
+                        | O::ModuloDivision
+                        | O::Exponentiation,
+                        _,
+                    ) => Kind::Scalar,
+                    _ => Kind::Boolean,
+                }
+            }
+            LogicalExpr::ScalarFnCall(_)
+                if super::subquery::placeholder_kind(self, e).is_some() =>
+            {
+                super::subquery::placeholder_kind(self, e).unwrap_or(Kind::Unknown)
+            }
+            LogicalExpr::ScalarFnCall(f) if comprehension(f).is_some() => {
+                let Some((how, x, body, list)) = comprehension(f) else {
+                    return Kind::Unknown;
+                };
+                let list = self.kind(list);
+                self.local_kinds.borrow_mut().insert(x, list.element());
+                // A list (or an error, when the list is not one).
+                match (list, how) {
+                    (Kind::Null, _) => Kind::Null,
+                    (l @ Kind::List(_), Comprehension::Filter) => l,
+                    (Kind::Unknown, Comprehension::Filter) => Kind::List(Box::new(Kind::Unknown)),
+                    (Kind::List(_) | Kind::Unknown, Comprehension::Map) => {
+                        Kind::List(Box::new(self.kind(body)))
+                    }
+                    _ => Kind::Unknown,
+                }
+            }
+            LogicalExpr::ScalarFnCall(f) => {
+                let arg = |i: usize| f.args.get(i).map_or(Kind::Unknown, |a| self.kind(a));
+                match f.name.to_ascii_lowercase().as_str() {
+                    "nodes" | "relationships" => self.path_elem(f).map_or(Kind::Unknown, |elem| {
+                        Kind::List(Box::new(Kind::Element(elem)))
+                    }),
+                    "range" | "split" | "keys" => Kind::List(Box::new(Kind::Scalar)),
+                    "toboolean" => Kind::Boolean,
+                    "size" | "length" | "tostring" | "tointeger" | "tofloat" | "abs" | "ceil"
+                    | "floor" | "round" | "sign" | "sqrt" | "exp" | "log" | "log10" | "rand"
+                    | "tolower" | "toupper" | "trim" | "ltrim" | "rtrim" | "substring"
+                    | "replace" | "left" | "right" | "type" => Kind::Scalar,
+                    // (`reverse()` of a string is a string.)
+                    "tail" | "reverse" => match arg(0) {
+                        l @ Kind::List(_) => l,
+                        _ => Kind::Unknown,
+                    },
+                    "head" | "last" => match arg(0) {
+                        Kind::List(e) => e.either(Kind::Null),
+                        _ => Kind::Unknown,
+                    },
+                    "coalesce" => {
+                        let kinds: Vec<Kind> = f
+                            .args
+                            .iter()
+                            .map(|a| self.kind(a))
+                            .filter(|k| *k != Kind::Null)
+                            .collect();
+                        kinds.into_iter().reduce(Kind::either).unwrap_or(Kind::Null)
+                    }
+                    _ => Kind::Unknown,
+                }
+            }
+            LogicalExpr::AggregateFnCall(f) => {
+                let arg = f.args.first().map_or(Kind::Unknown, |a| self.kind(a));
+                match f.name.to_ascii_lowercase().as_str() {
+                    // NULLs are not collected: an element is never NULL.
+                    "collect" => Kind::List(Box::new(arg)),
+                    "count" | "sum" | "avg" => Kind::Scalar,
+                    "min" | "max" => match arg {
+                        Kind::Scalar | Kind::Boolean | Kind::Null => Kind::Scalar,
+                        // Of lists of values that may be NULL (ClickHouse,
+                        // `null_list.rs`): a list, NULL of a group of none.
+                        Kind::List(k)
+                            if !matches!(*k, Kind::Element(_))
+                                && super::null_list::null_as_empty()
+                                && super::null_list::min_max_arg(f).is_some_and(|a| {
+                                    matches!(
+                                        self.list_null(a, &HashMap::new()),
+                                        Ok(super::null_list::ListNull::When(_))
+                                    )
+                                }) =>
+                        {
+                            Kind::List(k)
+                        }
+                        _ => Kind::Unknown,
+                    },
+                    _ => Kind::Unknown,
+                }
+            }
+            LogicalExpr::Case(c) => {
+                let mut kinds: Vec<Kind> = c.when_then.iter().map(|(_, t)| self.kind(t)).collect();
+                kinds.push(c.else_expr.as_ref().map_or(Kind::Null, |e| self.kind(e)));
+                kinds.into_iter().reduce(Kind::either).unwrap_or(Kind::Null)
+            }
+            LogicalExpr::ArraySubscript { array, .. } => match self.kind(array) {
+                // NULL out of range.
+                Kind::List(e) => e.either(Kind::Null),
+                _ => Kind::Unknown,
+            },
+            LogicalExpr::ArraySlicing { array, .. } => match self.kind(array) {
+                l @ Kind::List(_) => l,
+                _ => Kind::Unknown,
+            },
+            _ => Kind::Unknown,
+        }
+    }
+
+    /// What property `p` of node or relationship `v` is: a value of the
+    /// type every label / type of `v` declares, if they do.
+    fn property_kind(&self, v: VarId, p: &str) -> Kind {
+        match self.declared_types(v, p).as_slice() {
+            [] => Kind::Unknown,
+            ts if ts.iter().all(|t| t == &Some(&SchemaType::Boolean)) => Kind::Boolean,
+            ts if ts.iter().all(Option::is_some) => Kind::Scalar,
+            _ => self.column_list_kind(v, p),
+        }
+    }
+
+    /// What `UNWIND e` spreads (#1419): `kind(e)`, and, where that is `Unknown`,
+    /// the kind of a property whose column is a plain value in every label /
+    /// type (`plain_column_kind`). Read by `UNWIND` only: a scalar column's
+    /// kind anywhere else is a later slice's (`column_list_kind`).
+    fn unwind_kind(&self, e: &LogicalExpr) -> Kind {
+        match self.kind(e) {
+            Kind::Unknown => self.plain_column_kind(e).unwrap_or(Kind::Unknown),
+            k => k,
+        }
+    }
+
+    /// A property not declared typed (so its kind is read from its columns)
+    /// whose column in every label / type is a value of one plain type (a
+    /// number, text, date, `Bool`...: `column_kind`'s `Scalar` / `Boolean`):
+    /// that kind. `None` for anything `column_kind` does not know to be one
+    /// (an `Array`, and a `Dynamic` / `Variant` / `JSON` / aggregate-function
+    /// column, which can hold one), or when a column type is not known.
+    fn plain_column_kind(&self, e: &LogicalExpr) -> Option<Kind> {
+        if self.no_column_kinds.get() {
+            return None;
+        }
+        let LogicalExpr::PropertyAccessExp(pa) = e else {
+            return None;
+        };
+        let PropertyValue::Column(p) = &pa.column else {
+            return None;
+        };
+        let v = parse_var(&pa.table_alias.0)?;
+        let kinds: Vec<Kind> = self
+            .property_columns(v, p)
+            .into_iter()
+            .map(|t| t.map(column_kind))
+            .collect::<Option<_>>()?;
+        if kinds.is_empty()
+            || !kinds
+                .iter()
+                .all(|k| matches!(k, Kind::Scalar | Kind::Boolean))
+        {
+            return None;
+        }
+        kinds.into_iter().reduce(Kind::either)
+    }
+
+    /// The kind of `e` with properties' column types left unread: what a
+    /// check written before they were read (T2a) decides on.
+    pub(super) fn kind_before_column_types(&self, e: &LogicalExpr) -> Kind {
+        let before = self.no_column_kinds.replace(true);
+        let kind = self.kind(e);
+        self.no_column_kinds.set(before);
+        kind
+    }
+
+    /// VALUE_TYPES.md T2 (#1485): a property not declared typed whose
+    /// column is an `Array(T)` in every label / type of `v` is a list of
+    /// `T`'s kind; else `Unknown`, as before. Only a list: what a scalar
+    /// column's kind would change is a later slice's.
+    fn column_list_kind(&self, v: VarId, p: &str) -> Kind {
+        if self.no_column_kinds.get() {
+            return Kind::Unknown;
+        }
+        let columns = self.property_columns(v, p);
+        let elements: Option<Vec<Kind>> = columns
+            .iter()
+            .map(|t| {
+                t.and_then(KeyPartType::array_element)
+                    .map(|e| column_kind(&e))
+            })
+            .collect();
+        match elements {
+            Some(kinds) if !kinds.is_empty() => {
+                let first = kinds[0].clone();
+                let element = match kinds.iter().all(|k| *k == first) {
+                    true => first,
+                    false => Kind::Unknown,
+                };
+                Kind::List(Box::new(element))
+            }
+            _ => Kind::Unknown,
+        }
+    }
+
+    /// The column type of property `p` in each label / type of node or
+    /// relationship `v` (`None`: not known there,
+    /// `NodeSchema::property_column_type`).
+    pub(super) fn property_columns(&self, v: VarId, p: &str) -> Vec<Option<&KeyPartType>> {
+        match &self.binding(v).kind {
+            BindingKind::Node { labels } => labels
+                .iter()
+                .map(|l| {
+                    self.schema
+                        .node_schema_opt(l)
+                        .and_then(|s| s.property_column_type(p))
+                })
+                .collect(),
+            BindingKind::Rel {
+                types,
+                length: None,
+            } => types
+                .iter()
+                .flat_map(|t| {
+                    let defs = self.schema.rel_schemas_for_type(t);
+                    if defs.is_empty() {
+                        vec![None]
+                    } else {
+                        defs.iter().map(|s| s.property_column_type(p)).collect()
+                    }
+                })
+                .collect(),
+            _ => vec![None],
+        }
+    }
+
+    /// Whether every declaring type of property `p` of `v` is an integer of
+    /// more than 64 bits (#1536). ClickHouse writes one as a JSON number that
+    /// the server reads as a double, so the final RETURN spells it with
+    /// `toString` to keep every digit.
+    pub(super) fn wide_integer(&self, v: VarId, p: &str) -> bool {
+        let declared: Vec<&KeyPartType> =
+            self.property_columns(v, p).into_iter().flatten().collect();
+        !declared.is_empty() && declared.iter().all(|t| t.is_wider_than_64_bits())
+    }
+
+    /// VALUE_TYPES.md T4a (#1396): the CAST target of the elements of list
+    /// literal `xs` where the backend has no common type for them
+    /// (the dialect's `common_type_where_none`: a `UInt64` and a signed column,
+    /// whose list is otherwise a `Variant` in which equal integers are two
+    /// values). `None` unless every element's type is known (a property of a
+    /// known column type, an integer or NULL literal), and where they have
+    /// one: the SQL as before. The target is Nullable.
+    pub(super) fn list_meeting_type(&self, xs: &[LogicalExpr]) -> Option<String> {
+        let mut known = Vec::new();
+        for x in xs {
+            match x {
+                // A literal is of the narrowest type holding it: a negative
+                // one is signed.
+                LogicalExpr::Literal(lx::Literal::Integer(n)) if *n < 0 => {
+                    known.push(KeyPartType::parse("Int64"))
+                }
+                LogicalExpr::Literal(lx::Literal::Integer(_)) => {}
+                // `-1` is `0 - 1`: of integer literals, a signed integer.
+                LogicalExpr::Operator(op) | LogicalExpr::OperatorApplicationExp(op)
+                    if op.operator == lx::Operator::Subtraction
+                        && op.operands.iter().all(|o| {
+                            matches!(o, LogicalExpr::Literal(lx::Literal::Integer(_)))
+                        }) =>
+                {
+                    known.push(KeyPartType::parse("Int64"))
+                }
+                LogicalExpr::Literal(lx::Literal::Null) => {}
+                LogicalExpr::PropertyAccessExp(pa) => {
+                    let (PropertyValue::Column(p), Some(v)) =
+                        (&pa.column, parse_var(&pa.table_alias.0))
+                    else {
+                        return None;
+                    };
+                    let types = self.property_columns(v, p);
+                    let first = types.first().copied().flatten()?;
+                    if types.iter().any(|t| *t != Some(first)) {
+                        return None;
+                    }
+                    known.push(first.clone());
+                }
+                _ => return None,
+            }
+        }
+        let mut target = self.options.dialect.common_type_where_none(&known)?;
+        // Nullable always: a column element (one there is, the `UInt64`) may
+        // be NULL whatever its declared type says, and NULL literals join.
+        target.nullable = true;
+        Some(self.options.dialect.cast_target(&target))
+    }
+
+    /// Whether `e` is never a boolean: a number or a string (`Kind::Scalar`
+    /// does not tell, as a `CASE` of a boolean or a number is one too). A
+    /// boolean compared with it is not equal, and has no order (#1470).
+    pub(super) fn never_boolean(&self, e: &LogicalExpr) -> bool {
+        use lx::Operator as O;
+        match e {
+            LogicalExpr::Literal(
+                lx::Literal::Integer(_) | lx::Literal::Float(_) | lx::Literal::String(_),
+            ) => true,
+            LogicalExpr::TableAlias(lx::TableAlias(n)) => {
+                parse_var(n).is_some_and(|v| self.never_boolean.contains(&v))
+            }
+            LogicalExpr::PropertyAccessExp(pa) => match &pa.column {
+                PropertyValue::Column(p) => parse_var(&pa.table_alias.0).is_some_and(|v| {
+                    let ts = self.declared_types(v, p);
+                    !ts.is_empty()
+                        && ts
+                            .iter()
+                            .all(|t| t.is_some_and(|t| *t != SchemaType::Boolean))
+                }),
+                _ => false,
+            },
+            LogicalExpr::Operator(op) | LogicalExpr::OperatorApplicationExp(op) => {
+                match op.operator {
+                    O::Subtraction
+                    | O::Multiplication
+                    | O::Division
+                    | O::ModuloDivision
+                    | O::Exponentiation => true,
+                    // Of numbers or strings (a boolean's is an error).
+                    O::Addition => self.kind(e) == Kind::Scalar,
+                    _ => false,
+                }
+            }
+            LogicalExpr::ScalarFnCall(f) => matches!(
+                f.name.to_ascii_lowercase().as_str(),
+                "size"
+                    | "length"
+                    | "tostring"
+                    | "tointeger"
+                    | "tofloat"
+                    | "abs"
+                    | "ceil"
+                    | "floor"
+                    | "round"
+                    | "sign"
+                    | "sqrt"
+                    | "exp"
+                    | "log"
+                    | "log10"
+                    | "rand"
+                    | "tolower"
+                    | "toupper"
+                    | "trim"
+                    | "ltrim"
+                    | "rtrim"
+                    | "substring"
+                    | "replace"
+                    | "left"
+                    | "right"
+                    | "type"
+            ),
+            LogicalExpr::AggregateFnCall(f) => matches!(
+                f.name.to_ascii_lowercase().as_str(),
+                "count" | "sum" | "avg"
+            ),
+            _ => false,
+        }
+    }
+
+    /// The type each label / type of node or relationship `v` declares for
+    /// property `p` (`None`: one that does not).
+    fn declared_types(&self, v: VarId, p: &str) -> Vec<Option<&SchemaType>> {
+        match &self.binding(v).kind {
+            BindingKind::Node { labels } => labels
+                .iter()
+                .map(|l| {
+                    self.schema
+                        .node_schema_opt(l)
+                        .and_then(|s| s.property_types.get(p))
+                })
+                .collect(),
+            BindingKind::Rel {
+                types,
+                length: None,
+            } => types
+                .iter()
+                .flat_map(|t| {
+                    let defs = self.schema.rel_schemas_for_type(t);
+                    if defs.is_empty() {
+                        vec![None]
+                    } else {
+                        defs.iter().map(|s| s.property_types.get(p)).collect()
+                    }
+                })
+                .collect(),
+            _ => match self.var_kind(v) {
+                Some(Kind::Element(elem)) => match self.layout(&elem) {
+                    Ok(l) => vec![l
+                        .node
+                        .and_then(|n| n.property_types.get(p))
+                        .or_else(|| l.rel.and_then(|r| r.property_types.get(p)))],
+                    Err(_) => vec![None],
+                },
+                _ => vec![None],
+            },
+        }
+    }
+
+    /// `UNWIND expr AS var`.
+    pub(super) fn unwind(&mut self, expr: &LogicalExpr, var: VarId) -> Result<(), LowerError> {
+        let Some(spelling) = current_function_mapper().unwind() else {
+            return unsupported("UNWIND in this SQL dialect");
+        };
+        let kind = self.unwind_kind(expr);
+        let before = self.kind_before_column_types(expr).element();
+        self.set_kind(var, kind.element(), before);
+        // A list of no elements, or NULL: no rows.
+        let empty = match (expr, &kind) {
+            (LogicalExpr::List(xs), _) => xs.is_empty(),
+            (_, Kind::Null) => true,
+            _ => false,
+        };
+        // An expression can still be refused (a node in a list), and can be
+        // NULL by the schema (a property of an element that matches nothing).
+        // (A NULL list held as `[]`: no rows, as of NULL.)
+        let probe = self.held_list(expr, &HashMap::new())?;
+        // (`split(null, …)` lowers to `[]`, `null_list.rs`.)
+        if empty
+            || matches!(&probe, RenderExpr::Literal(Literal::Null))
+            || matches!(&probe, RenderExpr::List(xs) if xs.is_empty())
+        {
+            self.empty = true;
+            self.values.insert(var, RenderExpr::Literal(Literal::Null));
+            return Ok(());
+        }
+        // Each row's elements follow it, in list order: the rows are
+        // numbered in their order, or in any (a fixed one) when a later
+        // clause takes the elements in order (`Lowerer::ordered_unwinds`).
+        let ordered = match self.order {
+            RowOrder::Keys(_) => true,
+            RowOrder::Unordered => self.ordered_unwinds.contains(&var),
+            RowOrder::Lost => false,
+        };
+        if ordered && !self.one_row {
+            self.number_rows()?;
+        }
+        let e = self.held_list(expr, &HashMap::new())?;
+        // (A NULL `split()` whose NULL `null_list.rs` does not know: no rows.)
+        let e = match self.list_null(expr, &HashMap::new())? {
+            super::null_list::ListNull::Unknown => self.split_of_null(expr, e, &spelling)?,
+            _ => e,
+        };
+        let element = kind.element();
+        let list = match kind {
+            Kind::List(_) => e,
+            // The list of the value, or of none when it is NULL.
+            Kind::Scalar | Kind::Boolean | Kind::Map(_) => {
+                RenderExpr::Raw((spelling.value_list)(&render_expr_to_sql_plain(&e)))
+            }
+            Kind::Unknown | Kind::Null => {
+                RenderExpr::Raw((spelling.list_only)(&render_expr_to_sql_plain(&e)))
+            }
+            Kind::Element(_) => return unsupported("UNWIND of a node or relationship"),
+        };
+        let alias = self.next_cte_alias();
+        let mut body = Body::default();
+        let mut exports = Exports::default();
+        self.export_scope(&alias, &mut body, &mut exports)?;
+        match element {
+            // Every element is NULL (ClickHouse cannot project the element
+            // of a list typed `Array(Nothing)`).
+            Kind::Null => exports
+                .values
+                .push((var, RenderExpr::Literal(Literal::Null))),
+            _ => {
+                let value = match element {
+                    Kind::Boolean => RenderExpr::Raw(current_function_mapper().cast_bool(ELEMENT)),
+                    _ => RenderExpr::TableAlias(TableAlias(ELEMENT.to_string())),
+                };
+                body.select.push(select(value, &var.name()));
+                exports.values.push((var, col_at(&alias, &var.name())));
+            }
+        }
+        // The rows' order: each row's elements follow it, in list order.
+        let keys = match &self.order {
+            RowOrder::Keys(keys) => Some(keys.clone()),
+            _ if self.one_row => Some(Vec::new()),
+            // Neo4j keeps each row's elements in list order; rows in no
+            // order have no number to keep them together by.
+            RowOrder::Unordered | RowOrder::Lost => None,
+        };
+        match keys {
+            Some(mut keys) => {
+                let position = RenderExpr::TableAlias(TableAlias(POSITION.to_string()));
+                self.numbers.insert(render_expr_to_sql_plain(&position));
+                keys.push(OrderByItem {
+                    expression: position,
+                    order: OrderByOrder::Asc,
+                });
+                body.order_by = keys;
+                body.array_join.push(ArrayJoin {
+                    expression: list,
+                    alias: ELEMENT.to_string(),
+                    position: Some(POSITION.to_string()),
+                });
+            }
+            None => {
+                body.order_lost = true;
+                body.array_join.push(ArrayJoin {
+                    expression: list,
+                    alias: ELEMENT.to_string(),
+                    position: None,
+                });
+            }
+        }
+        if self.from.is_none() {
+            // `UNWIND` first: the rows so far are the one empty record.
+            self.from = Some(table_ref(spelling.one_row.to_string(), ONE_ROW));
+            self.emitted.push(ONE_ROW.to_string());
+        }
+        self.close_segment(body, exports, alias)?;
+        self.one_row = false;
+        Ok(())
+    }
+
+    /// `split(s, d)` is NULL when `s` or `d` is (Cypher), and ClickHouse's
+    /// split of NULL is `['']`: UNWIND of it gives no rows.
+    fn split_of_null(
+        &self,
+        expr: &LogicalExpr,
+        list: RenderExpr,
+        spelling: &Unwind,
+    ) -> Result<RenderExpr, LowerError> {
+        let LogicalExpr::ScalarFnCall(f) = expr else {
+            return Ok(list);
+        };
+        if !f.name.eq_ignore_ascii_case("split") || f.args.is_empty() {
+            return Ok(list);
+        }
+        let mut null = Vec::new();
+        for a in &f.args {
+            let a = render_expr_to_sql_plain(&self.expr(a, &HashMap::new())?);
+            null.push((spelling.is_null)(&a));
+        }
+        Ok(RenderExpr::Case(RenderCase {
+            expr: None,
+            when_then: vec![(
+                RenderExpr::Raw(null.join(" OR ")),
+                RenderExpr::List(Vec::new()),
+            )],
+            else_expr: Some(Box::new(list)),
+        }))
+    }
+
+    /// The rows so far, in their order (rows in no order: in any, fixed by
+    /// the numbers), become a CTE exporting the scope and each row's number
+    /// in that order; the rows are then in the order of that number.
+    pub(super) fn number_rows(&mut self) -> Result<(), LowerError> {
+        let Some(spelling) = current_function_mapper().unwind() else {
+            return unsupported("UNWIND in this SQL dialect");
+        };
+        let alias = self.next_cte_alias();
+        let mut body = Body::default();
+        let mut exports = Exports::default();
+        self.export_scope(&alias, &mut body, &mut exports)?;
+        // Lowered stable, ties are broken by every column (#1395): rows
+        // that still tie are alike, so their numbers are interchangeable.
+        let ties = match self.stable {
+            true => self.tie_breaks(&body.select, &exports, false)?,
+            false => Vec::new(),
+        };
+        let (number, unordered) = match &self.order {
+            RowOrder::Keys(keys) => {
+                let keys: Vec<OrderByItem> = keys.iter().cloned().chain(ties).collect();
+                (
+                    (spelling.row_number)(&order_keys_to_sql_plain(&keys)),
+                    keys.iter().any(|k| self.is_unordered_number(k)),
+                )
+            }
+            RowOrder::Unordered if self.stable && !ties.is_empty() => (
+                (spelling.row_number)(&order_keys_to_sql_plain(&ties)),
+                false,
+            ),
+            RowOrder::Unordered => (spelling.any_row_number.to_string(), !self.stable),
+            RowOrder::Lost => return unsupported("internal: numbering rows of a lost order"),
+        };
+        body.select
+            .push(select(RenderExpr::Raw(number), ROW_NUMBER));
+        self.close_segment(body, exports, alias.clone())?;
+        let column = render_expr_to_sql_plain(&col_at(&alias, ROW_NUMBER));
+        if unordered {
+            self.unordered_numbers.insert(column.clone());
+        }
+        self.numbers.insert(column);
+        self.order = RowOrder::Keys(vec![OrderByItem {
+            expression: col_at(&alias, ROW_NUMBER),
+            order: OrderByOrder::Asc,
+        }]);
+        Ok(())
+    }
+}
+
+/// Refuse a plan that reads more than once rows that depend on how rows in
+/// no order were numbered (`unstable`, by CTE name): numbers the stable
+/// lowering could not fix ([`rereads`]).
+pub(super) fn reject_rereads_of_numbered_rows(
+    plan: &RenderPlan,
+    unstable: &BTreeSet<String>,
+) -> Result<(), LowerError> {
+    if rereads(plan, unstable) {
+        return unsupported(
+            "rows numbered in no order (SKIP / LIMIT or collect() after an UNWIND) \
+             read more than once",
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a result decided by a drawn value (#1495): ClickHouse evaluates
+/// a CTE once per read, and a call of [`DRAWN_SQL`] draws again on each
+/// read. A CTE with a drawn call, read more than once (by itself, or
+/// through a CTE reading it — the [`rereads`] dictate), decides across the
+/// reads either when a drawn item's column is a join key of the final
+/// SELECT (the readback of an OPTIONAL MATCH's or a subquery's drive: the
+/// reads draw different values, the joins match no row), or when a drawn
+/// call filters (orders, groups) its rows (the reads keep different rows).
+/// A drawn value no second read decides on lowers as before.
+/// A drawn CTE's own fate: the aliases its WITH exports for a drawn item
+/// (the column's readback a join key may carry back), whether a drawn call
+/// decides its rows (a WHERE's predicate, an ORDER BY's key, a GROUP BY's
+/// key), and the call families its text spells.
+#[derive(Default)]
+struct DrawnFate {
+    aliases: Vec<String>,
+    filters: bool,
+    families: Vec<&'static str>,
+}
+
+pub(super) fn reject_reads_of_drawn_values(plan: &RenderPlan) -> Result<(), LowerError> {
+    let (ctes, select) = render_plan_parts_plain(plan.clone());
+    // Each drawn CTE carries its own fate, not a pooled one: a CTE read
+    // once decides on its read's own draw (the spec's fact 4) and lowers
+    // as written. Only the fate of a CTE the reads read more than once
+    // refuses, and the refusal names that CTE and the call family — never
+    // another CTE's drawn item.
+    let mut drawn: BTreeMap<&str, DrawnFate> = BTreeMap::new();
+    for cte in &ctes {
+        let mut fate = DrawnFate::default();
+        for (at, family) in drawn_call_families(&cte.text) {
+            fate.families.push(family);
+            match drawn_column_alias(&cte.text[at..]) {
+                Some(alias) => fate.aliases.push(alias.to_string()),
+                None => fate.filters = true,
+            }
+        }
+        if fate.families.is_empty() {
+            continue;
+        }
+        fate.families.dedup();
+        drawn.insert(cte.name.as_str(), fate);
+    }
+    // The drawn CTEs the reads read more than once, by name — from the
+    // parts already rendered above, so the plan renders once.
+    let named: BTreeSet<String> = drawn.keys().map(|n| (*n).to_string()).collect();
+    let reread = those_reread(&ctes, &select, &named);
+    if reread.is_empty() {
+        return Ok(());
+    }
+    let select = select.to_ascii_lowercase();
+    // The join keys answer first, CTE by CTE (as a pooled check did):
+    // a readback equal on the drawn column joins two draws, which agree
+    // no more. Case-folded, as the select's text is.
+    for name in &reread {
+        let Some(fate) = drawn.get(name.as_str()) else {
+            continue;
+        };
+        if fate
+            .aliases
+            .iter()
+            .any(|alias| select.contains(&format!(".{} = ", alias.to_ascii_lowercase())))
+        {
+            return unsupported(format!(
+                "a value drawn in WITH {name} by {} draws again on every read \
+                 and is a join key of its reads",
+                fate.families.join(" / "),
+            ));
+        }
+    }
+    // Then the row-deciding drawn calls: a WHERE's predicate, an ORDER
+    // BY's key or a GROUP BY's key keeps a different row set per read.
+    for name in &reread {
+        let Some(fate) = drawn.get(name.as_str()) else {
+            continue;
+        };
+        if fate.filters {
+            return unsupported(format!(
+                "a value drawn in WITH {name} by {} draws again on every read \
+                 and selects different rows on every read",
+                fate.families.join(" / "),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lowercase SQL spellings of the calls that draw a different value on
+/// each evaluation: `rand()` (`randCanonical()` on ClickHouse, `rand()` on
+/// Spark), `randomUUID()` (`randomUUID()` spelled through unmapped, or the
+/// mapping #1540 resolves for it — ClickHouse's `generateUUIDv4()`, Spark's
+/// `uuid()`; `randomuuid` stays so a dialect spelling it verbatim again,
+/// or spelling that surfaces before this list is updated, still draws),
+/// the millisecond clock (`now64(3)`, `current_timestamp()`, and `now()`,
+/// nested as in `toUnixTimestamp(now())`). Whole words, so `rand` does not
+/// match `randCanonical` (the ident-boundary `c`), and `uuid` does not
+/// match inside `generateUUIDv4` (the boundary `e`). The day-granular
+/// draws (`today()`, `current_date()`) are not here: the reads of one
+/// query agree within the day, so a join of their reads is correct. The
+/// mapping's spellings are tied to this list by the battery's spelling
+/// test (#1495 review, DRAWN_VALUES.md): a mapping change without its
+/// token fails there.
+const DRAWN_SQL: [&str; 8] = [
+    "randcanonical",
+    "rand",
+    "randomuuid",
+    "generateuuidv4",
+    "uuid",
+    "now64",
+    "now",
+    "current_timestamp",
+];
+
+/// The byte positions in `text` of each drawn call, with its family: a
+/// drawn function's name, outside every quoted string (a query that
+/// searches for the word `now` must not look drawn), as a whole word
+/// followed by its `(`. Visible to the battery's spelling tie, which
+/// probes the registry's mapped spellings against this scan.
+pub(super) fn drawn_call_families(text: &str) -> Vec<(usize, &'static str)> {
+    let lower = text.to_ascii_lowercase();
+    let text = lower.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut starts = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        match text[at] {
+            quote @ (b'\'' | b'"') => {
+                at += 1;
+                while at < text.len() {
+                    if text[at] == quote {
+                        if text.get(at + 1) == Some(&quote) {
+                            at += 2; // an escaped quote, still inside
+                            continue;
+                        }
+                        at += 1; // the string's own closing quote
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            _ => {
+                for token in DRAWN_SQL {
+                    let token = token.as_bytes();
+                    if text[at..].starts_with(token)
+                        && (at == 0 || !ident(text[at - 1]))
+                        && text.get(at + token.len()) == Some(&b'(')
+                    {
+                        starts.push((at, drawn_call_family(token)));
+                        break;
+                    }
+                }
+                at += 1;
+            }
+        }
+    }
+    starts
+}
+
+/// A drawn token's call family, as the Cypher spells it (the SQL spelling
+/// varies by dialect: `rand` the map, `randCanonical` ClickHouse's).
+fn drawn_call_family(token: &[u8]) -> &'static str {
+    match token {
+        b"randcanonical" | b"rand" => "rand()",
+        b"randomuuid" | b"generateuuidv4" | b"uuid" => "randomUUID()",
+        _ => "the clock (now64(3) / current_timestamp() / now())",
+    }
+}
+
+/// A drawn call's item's exported column: the text after the ` AS ` the
+/// plain renderer spells every select item with, quoted `"v2"`
+/// (ClickHouse) or backticked `` `v2` `` (Spark). `None` for a call
+/// placed where it decides rows (a WHERE's predicate, an ORDER BY's key,
+/// a GROUP BY's key): no select item of its own exists after it.
+fn drawn_column_alias(after_call: &str) -> Option<&str> {
+    const MARKER: &str = " AS ";
+    let after = after_call.find(MARKER)? + MARKER.len();
+    let rest = &after_call[after..];
+    let (quote, within) = match (rest.strip_prefix('"'), rest.strip_prefix('`')) {
+        (Some(within), _) => ('"', within),
+        (_, Some(within)) => ('`', within),
+        (None, None) => return None,
+    };
+    let end = within.find(quote)?;
+    Some(&within[..end])
+}
+
+/// Whether the plan reads more than once a CTE of `marked` (by name), or
+/// one reading such a CTE.
+///
+/// ClickHouse evaluates a CTE once per read, and rows in no order are
+/// numbered (`Unwind::any_row_number`), grouped (`collect()`) or taken by
+/// SKIP / LIMIT in whatever order an evaluation produces them: two reads can
+/// differ, and a join of the reads (an OPTIONAL MATCH's or a subquery's
+/// drive, a path's seed) matches the wrong rows. Rows that only carry such
+/// a CTE's values are the same rows on every read. They are read once when
+/// each CTE that reads them, directly or through others, is itself named
+/// once in the rest of the SQL.
+pub(super) fn rereads(plan: &RenderPlan, marked: &BTreeSet<String>) -> bool {
+    let (ctes, select) = render_plan_parts_plain(plan.clone());
+    !those_reread(&ctes, &select, marked).is_empty()
+}
+
+/// The names, among `marked`, that the SQL reads more than once (marked
+/// itself, or a CTE reading one of them), from parts a caller has already
+/// rendered.
+fn those_reread(ctes: &[PlainCte], select: &str, marked: &BTreeSet<String>) -> BTreeSet<String> {
+    if marked.is_empty() {
+        return BTreeSet::new();
+    }
+    // The names each CTE defines: its own, and a path relation's helpers.
+    let names: Vec<Vec<&str>> = ctes
+        .iter()
+        .map(|c| {
+            let mut names = vec![c.name.as_str()];
+            names.extend(defined_names(&c.text).filter(|n| *n != c.name));
+            names
+        })
+        .collect();
+    // How often the rest of the SQL names CTE `i`.
+    let reads = |i: usize| -> usize {
+        let elsewhere = ctes
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, c)| c.text.as_str())
+            .chain(std::iter::once(select));
+        elsewhere
+            .map(|text| names[i].iter().map(|n| word_count(text, n)).sum::<usize>())
+            .sum()
+    };
+    // The marked CTEs and those reading them; CTEs are in dependency
+    // order, so one pass finds every reader.
+    let mut tainted: Vec<bool> = ctes.iter().map(|c| marked.contains(&c.name)).collect();
+    for i in 0..ctes.len() {
+        if !tainted[i] {
+            tainted[i] = (0..i)
+                .any(|j| tainted[j] && names[j].iter().any(|n| word_count(&ctes[i].text, n) > 0));
+        }
+    }
+    (0..ctes.len())
+        .filter(|&i| tainted[i] && reads(i) > 1)
+        .map(|i| ctes[i].name.clone())
+        .collect()
+}
+
+/// The names of the plan's CTEs.
+pub(super) fn cte_names(plan: &RenderPlan) -> BTreeSet<String> {
+    plan.ctes.0.iter().map(|c| c.cte_name.clone()).collect()
+}
+
+/// The CTEs of `plan` (by name) that `other`, a lowering of the same query,
+/// spells otherwise: all of them when the two do not have the same CTEs.
+pub(super) fn changed_ctes(plan: &RenderPlan, other: &RenderPlan) -> BTreeSet<String> {
+    let (ctes, _) = render_plan_parts_plain(plan.clone());
+    let (others, _) = render_plan_parts_plain(other.clone());
+    let same_names =
+        ctes.len() == others.len() && ctes.iter().zip(&others).all(|(a, b)| a.name == b.name);
+    ctes.iter()
+        .zip(&others)
+        .filter(|(a, b)| !same_names || a.text != b.text)
+        .map(|(a, _)| a.name.clone())
+        .chain(
+            (!same_names)
+                .then(|| ctes.iter().map(|c| c.name.clone()))
+                .into_iter()
+                .flatten(),
+        )
+        .collect()
+}
+
+/// The CTE names `text` defines (`name AS (`).
+fn defined_names(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices(" AS (").filter_map(move |(at, _)| {
+        let before = &text[..at];
+        let start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |p| p + 1);
+        let name = &before[start..];
+        (!name.is_empty()).then_some(name)
+    })
+}
+
+/// How often `word` occurs in `text` as a whole identifier.
+fn word_count(text: &str, word: &str) -> usize {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word)
+        .filter(|(at, _)| {
+            !text[..*at].ends_with(ident) && !text[at + word.len()..].starts_with(ident)
+        })
+        .count()
+}

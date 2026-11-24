@@ -1,0 +1,76 @@
+name: Security Audit
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Run weekly on Monday at 08:00 UTC to catch new advisories
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.0
+
+      - name: Run cargo audit
+        # Ignore non-vulnerability warnings for transitive deps we can't control:
+        # - RUSTSEC-2025-0134: rustls-pemfile unmaintained (via chdb-rust → reqwest 0.11)
+        # - RUSTSEC-2026-0258: residual h2 0.3.27 via chdb-rust → reqwest 0.11.
+        #   Server path (hyper 1.x) patched to h2 0.4.16; no 0.3.x patch exists.
+        #   See deny.toml for the full justification.
+        run: cargo audit --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0258
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          log-level: warn
+          arguments: --all-features
+
+  osv:
+    name: osv-scanner (OSV-DB advisory report)
+    runs-on: ubuntu-latest
+    # Reporting lane, not a gate: the OSV-DB carries GitHub advisories the
+    # RustSec DB does not (the openssl pin class of GHSA rows that #1543
+    # fixed came from here, invisible to `cargo audit`). Triage moves each
+    # finding into a dependency-pin fix or a justified deny.toml suppression.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install osv-scanner (pinned v2.7.0)
+        # Pinned (the review): the step installs from the release's asset and
+        # runs the arg-syntax-sensitive `scan source -r .` under
+        # `continue-on-error`, so a v3 with changed arguments would fail the
+        # job and leave the check green — the blind-spot lane would silently
+        # reopen. The binary verifies against the release's own SHA256SUMS
+        # (its row is already in `sha256sum --check` format — no echo of an
+        # escape, which Ubuntu's bash `echo` does not translate), so a
+        # tampered or truncated fetch cannot run instead.
+        env:
+          OSV_SCANNER_VERSION: v2.7.0
+        run: |
+          curl -fsSL -o osv-scanner_linux_amd64 "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          curl -fsSL -o osv-scanner_SHA256SUMS "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_SHA256SUMS"
+          grep " osv-scanner_linux_amd64$" osv-scanner_SHA256SUMS | sha256sum --strict --quiet --check -
+          install -m 0755 osv-scanner_linux_amd64 /usr/local/bin/osv-scanner
+
+      - name: osv-scanner scan
+        run: osv-scanner scan source -r .

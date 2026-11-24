@@ -1,0 +1,810 @@
+default_schema: social_integration
+schemas:
+  - name: social_integration
+    graph_schema:
+      nodes:
+        - label: User
+          database: test_integration
+          table: users_test
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: full_name
+            email: email_address
+            age: age
+            registration_date: registration_date
+            is_active: is_active
+            country: country
+            city: city
+        - label: Post
+          database: test_integration
+          table: posts_test
+          node_id: post_id
+          property_mappings:
+            post_id: post_id
+            title: post_title
+            content: post_content
+            created_at: post_date
+            author_id: author_id
+      edges:
+        - type: AUTHORED
+          database: test_integration
+          table: posts_test
+          from_id: author_id
+          to_id: post_id
+          from_node: User
+          to_node: Post
+          is_denormalized: true
+        - type: FOLLOWS
+          database: test_integration
+          table: user_follows_test
+          from_id: follower_id
+          to_id: followed_id
+          edge_id: follow_id
+          from_node: User
+          to_node: User
+          property_mappings:
+            follow_date: follow_date
+        - type: LIKED
+          database: test_integration
+          table: post_likes_test
+          from_id: user_id
+          to_id: post_id
+          edge_id: like_id
+          from_node: User
+          to_node: Post
+          property_mappings:
+            like_date: like_date
+
+  - name: test_fixtures
+    graph_schema:
+      nodes:
+        - label: TestUser
+          database: test_integration
+          table: users
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: name
+            age: age
+        - label: TestProduct
+          database: test_integration
+          table: products
+          node_id: product_id
+          property_mappings:
+            product_id: product_id
+            name: name
+            price: price
+        - label: TestGroup
+          database: test_integration
+          table: groups
+          node_id: group_id
+          property_mappings:
+            group_id: group_id
+            name: name
+      edges:
+        - type: TEST_PURCHASED
+          database: test_integration
+          table: purchases
+          from_id: user_id
+          to_id: product_id
+          from_node: TestUser
+          to_node: TestProduct
+          property_mappings:
+            purchase_date: purchase_date
+            quantity: quantity
+        - type: TEST_FRIENDS_WITH
+          database: test_integration
+          table: friendships
+          from_id: user_id_1
+          to_id: user_id_2
+          from_node: TestUser
+          to_node: TestUser
+          property_mappings:
+            since: since
+        - type: TEST_FOLLOWS
+          database: test_integration
+          table: follows
+          from_id: follower_id
+          to_id: followed_id
+          from_node: TestUser
+          to_node: TestUser
+          property_mappings:
+            since: since
+        - type: MEMBER_OF
+          database: test_integration
+          table: memberships
+          from_id: user_id
+          to_id: group_id
+          from_node: TestUser
+          to_node: TestGroup
+          property_mappings:
+            joined_date: joined_date
+            role: role
+        - type: RATED
+          database: test_integration
+          table: ratings
+          from_id: user_id
+          to_id: product_id
+          from_node: TestUser
+          to_node: TestProduct
+          property_mappings:
+            rating: rating
+            review_text: review_text
+
+  - name: ldbc_snb
+    graph_schema:
+      nodes:
+        - label: Person
+          database: ldbc
+          table: person
+          node_id: personId
+          property_mappings:
+            personId: personId
+            firstName: firstName
+            lastName: lastName
+            creationDate: creationDate
+        - label: Comment
+          database: ldbc
+          table: comment
+          node_id: commentId
+          property_mappings:
+            commentId: commentId
+            content: content
+            creationDate: creationDate
+        - label: Forum
+          database: ldbc
+          table: forum
+          node_id: forumId
+          property_mappings:
+            forumId: forumId
+            title: title
+            creationDate: creationDate
+        - label: Tag
+          database: ldbc
+          table: tag
+          node_id: tagId
+          property_mappings:
+            tagId: tagId
+            name: name
+      edges:
+        - type: KNOWS
+          database: ldbc
+          table: person_knows_person
+          from_id: person1Id
+          to_id: person2Id
+          from_node: Person
+          to_node: Person
+        - type: HAS_CREATOR
+          database: ldbc
+          table: comment
+          from_id: commentId
+          to_id: creatorId
+          from_node: Comment
+          to_node: Person
+        - type: REPLY_OF
+          database: ldbc
+          table: comment
+          from_id: commentId
+          to_id: replyOfCommentId
+          from_node: Comment
+          to_node: Comment
+        - type: LIKES
+          database: ldbc
+          table: person_likes_comment
+          from_id: personId
+          to_id: commentId
+          from_node: Person
+          to_node: Comment
+        - type: CONTAINER_OF
+          database: ldbc
+          table: forum_containerof_post
+          from_id: forumId
+          to_id: postId
+          from_node: Forum
+          to_node: Comment
+        - type: HAS_MEMBER
+          database: ldbc
+          table: forum_hasmember_person
+          from_id: forumId
+          to_id: personId
+          from_node: Forum
+          to_node: Person
+        - type: HAS_MODERATOR
+          database: ldbc
+          table: forum
+          from_id: forumId
+          to_id: moderatorId
+          from_node: Forum
+          to_node: Person
+        - type: HAS_TAG
+          database: ldbc
+          table: comment_hastag_tag
+          from_id: commentId
+          to_id: tagId
+          from_node: Comment
+          to_node: Tag
+
+  - name: denormalized_flights
+    graph_schema:
+      nodes:
+        - label: Airport
+          database: db_denormalized
+          table: flights_denorm
+          node_id: code
+          property_mappings: {}
+          from_node_properties:
+            code: origin_code
+            city: origin_city
+            state: origin_state
+          to_node_properties:
+            code: dest_code
+            city: dest_city
+            state: dest_state
+      edges:
+        - type: FLIGHT
+          database: db_denormalized
+          table: flights_denorm
+          from_id: origin_code
+          to_id: dest_code
+          from_node: Airport
+          to_node: Airport
+          edge_id: [flight_id, flight_number]
+          property_mappings:
+            flight_id: flight_id
+            flight_num: flight_number
+            carrier: carrier
+            departure_time: departure_time
+            arrival_time: arrival_time
+            distance: distance
+
+  # ==========================================================================
+  # Schema Variations for Testing (db_xxx databases)
+  # ==========================================================================
+  
+  - name: standard
+    graph_schema:
+      nodes:
+        - label: User
+          database: db_standard
+          table: users
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: full_name
+            email: email_address
+            registration_date: registration_date
+            is_active: is_active
+            country: country
+            city: city
+        - label: Post
+          database: db_standard
+          table: posts
+          node_id: post_id
+          property_mappings:
+            post_id: post_id
+            content: content
+            date: created_at
+      edges:
+        - type: FOLLOWS
+          database: db_standard
+          table: user_follows
+          from_id: follower_id
+          to_id: followed_id
+          from_node: User
+          to_node: User
+          property_mappings:
+            follow_date: follow_date
+        - type: AUTHORED
+          database: db_standard
+          table: posts
+          from_id: user_id
+          to_id: post_id
+          edge_id: post_id
+          from_node: User
+          to_node: Post
+          property_mappings: {}
+        - type: LIKED
+          database: db_standard
+          table: post_likes
+          from_id: user_id
+          to_id: post_id
+          from_node: User
+          to_node: Post
+          property_mappings:
+            like_date: liked_at
+        - type: FRIENDS_WITH
+          database: db_standard
+          table: friendships
+          from_id: user_id_1
+          to_id: user_id_2
+          edge_id: [user_id_1, user_id_2]
+          from_node: User
+          to_node: User
+          property_mappings:
+            since_date: since
+
+  - name: fk_edge
+    graph_schema:
+      nodes:
+        - label: Order
+          database: db_fk_edge
+          table: orders_fk
+          node_id: order_id
+          property_mappings:
+            order_id: order_id
+            order_date: order_date
+            total_amount: total_amount
+        - label: Customer
+          database: db_fk_edge
+          table: customers_fk
+          node_id: customer_id
+          property_mappings:
+            customer_id: customer_id
+            name: name
+            email: email
+      edges:
+        - type: PLACED_BY
+          database: db_fk_edge
+          table: orders_fk
+          from_id: order_id
+          to_id: customer_id
+          from_node: Order
+          to_node: Customer
+
+  - name: polymorphic
+    graph_schema:
+      nodes:
+        - label: User
+          database: db_polymorphic
+          table: users
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: full_name
+            email: email_address
+        - label: Post
+          database: db_polymorphic
+          table: posts
+          node_id: post_id
+          property_mappings:
+            post_id: post_id
+            content: content
+            created: created_at
+      edges:
+        - polymorphic: true
+          database: db_polymorphic
+          table: interactions
+          from_id: from_id
+          to_id: to_id
+          type_column: interaction_type
+          from_label_column: from_type
+          to_label_column: to_type
+          type_values:
+            - FOLLOWS
+            - LIKES
+            - AUTHORED
+            - COMMENTED
+            - SHARED
+          edge_id: [from_id, to_id, interaction_type, timestamp]
+          property_mappings:
+            created_at: timestamp
+            weight: interaction_weight
+
+  - name: composite_id
+    graph_schema:
+      nodes:
+        - label: Account
+          database: db_composite_id
+          table: accounts
+          node_id: [bank_id, account_number]
+          property_mappings:
+            bank_id: bank_id
+            account_number: account_number
+            holder_name: holder_name
+            account_type: account_type
+            balance: balance
+            opened_date: opened_date
+        - label: Customer
+          database: db_composite_id
+          table: customers
+          node_id: customer_id
+          property_mappings:
+            customer_id: customer_id
+            name: name
+            email: email
+            city: city
+      edges:
+        - type: OWNS
+          database: db_composite_id
+          table: account_ownership
+          from_id: customer_id
+          to_id: [bank_id, account_number]
+          from_node: Customer
+          to_node: Account
+          property_mappings:
+            role: role
+            since: since
+        - type: TRANSFERRED
+          database: db_composite_id
+          table: transfers
+          from_id: [from_bank_id, from_account_number]
+          to_id: [to_bank_id, to_account_number]
+          from_node: Account
+          to_node: Account
+          edge_id: transfer_id
+          property_mappings:
+            transfer_id: transfer_id
+            amount: amount
+            transfer_date: transfer_date
+
+  - name: pattern_comp
+    graph_schema:
+      nodes:
+        - label: PatternCompUser
+          database: test_integration
+          table: pattern_comp_users
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: name
+      edges:
+        - type: PATTERN_COMP_FOLLOWS
+          database: test_integration
+          table: pattern_comp_follows
+          from_id: follower_id
+          to_id: followed_id
+          from_node: PatternCompUser
+          to_node: PatternCompUser
+
+  - name: zeek_logs
+    graph_schema:
+      nodes:
+        - label: IP
+          # For now, IP nodes come only from DNS as origin
+          database: zeek
+          table: dns_log
+          node_id: id.orig_h
+          property_mappings:
+            ip: id.orig_h
+        - label: Domain
+          database: zeek
+          table: dns_log
+          node_id: query
+          property_mappings:
+            name: query
+      edges:
+        - type: DNS_REQUESTED
+          database: zeek
+          table: dns_log
+          from_id: id.orig_h
+          to_id: query
+          from_node: IP
+          to_node: Domain
+          property_mappings:
+            uid: uid
+            timestamp: ts
+            qtype: qtype_name
+            rcode: rcode_name
+            answers: answers
+        # NOTE: CONNECTED_TO disabled for now - requires full multi-table label support
+        # - type: CONNECTED_TO
+        #   database: zeek
+        #   table: conn_log
+        #   from_id: id.orig_h
+        #   to_id: id.resp_h
+        #   from_node: IP
+        #   to_node: IP
+
+  - name: zeek_merged_test
+    graph_schema:
+      nodes:
+        # IP node from dns_log
+        - label: IP
+          database: zeek
+          table: dns_log
+          node_id: "id.orig_h"
+          property_mappings: {}
+          from_node_properties:
+            ip: "id.orig_h"
+          to_node_properties:
+            ip: "id.resp_h"
+        
+        # IP node from conn_log
+        - label: IP
+          database: zeek
+          table: conn_log
+          node_id: "id.orig_h"
+          property_mappings: {}
+          from_node_properties:
+            ip: "id.orig_h"
+            port: "id.orig_p"
+          to_node_properties:
+            ip: "id.resp_h"
+            port: "id.resp_p"
+        
+        # Domain node
+        - label: Domain
+          database: zeek
+          table: dns_log
+          node_id: query
+          property_mappings: {}
+          from_node_properties:
+            name: query
+          to_node_properties:
+            name: query
+        
+        # ResolvedIP node (from answers array)
+        - label: ResolvedIP
+          database: zeek
+          table: dns_log
+          node_id: answers
+          property_mappings: {}
+          to_node_properties:
+            ip: answers
+      
+      edges:
+        # Coupled Edge 1: REQUESTED (from dns_log)
+        - type: REQUESTED
+          database: zeek
+          table: dns_log
+          from_id: "id.orig_h"
+          to_id: query
+          from_node: IP
+          to_node: Domain
+          edge_id: uid
+          property_mappings:
+            uid: uid
+            timestamp: ts
+            dns_server: "id.resp_h"
+            qtype: qtype_name
+            rcode: rcode_name
+            answers: answers
+        
+        # Coupled Edge 2: RESOLVED_TO (from dns_log)
+        - type: RESOLVED_TO
+          database: zeek
+          table: dns_log
+          from_id: query
+          to_id: answers
+          from_node: Domain
+          to_node: ResolvedIP
+          edge_id: [uid, answers]
+          property_mappings:
+            uid: uid
+            timestamp: ts
+            ttls: TTLs
+        
+        # ACCESSED edge (from conn_log)
+        - type: ACCESSED
+          database: zeek
+          table: conn_log
+          from_id: "id.orig_h"
+          to_id: "id.resp_h"
+          from_node: IP
+          to_node: IP
+          edge_id: uid
+          property_mappings:
+            uid: uid
+            timestamp: ts
+            protocol: proto
+            service: service
+            duration: duration
+            orig_bytes: orig_bytes
+            resp_bytes: resp_bytes
+            conn_state: conn_state
+
+  # ==========================================================================
+  # social_demo: mirrors demos/neo4j-browser/social_demo.yaml structure
+  # backed by test_integration tables for integration testing
+  # ==========================================================================
+
+  - name: social_demo
+    graph_schema:
+      nodes:
+        - label: User
+          database: test_integration
+          table: users_test
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: full_name
+            email: email_address
+            created_at: registration_date
+
+        - label: Post
+          database: test_integration
+          table: posts_test
+          node_id: post_id
+          property_mappings:
+            post_id: post_id
+            content: post_content
+            created_at: post_date
+
+      edges:
+        - type: FOLLOWS
+          database: test_integration
+          table: user_follows_test
+          from_id: follower_id
+          to_id: followed_id
+          edge_id: follow_id
+          from_node: User
+          to_node: User
+          property_mappings:
+            created_at: follow_date
+
+        - type: AUTHORED
+          database: test_integration
+          table: posts_test
+          from_id: author_id
+          to_id: post_id
+          from_node: User
+          to_node: Post
+          is_denormalized: true
+          property_mappings:
+            created_at: post_date
+
+        - type: LIKED
+          database: test_integration
+          table: post_likes_test
+          from_id: user_id
+          to_id: post_id
+          edge_id: like_id
+          from_node: User
+          to_node: Post
+          property_mappings:
+            created_at: like_date
+
+  # ==========================================================================
+  # ontime_flights: denormalized Airport node in flights table (OnTime dataset)
+  # Uses default.flights table (same as flights benchmark data)
+  # ==========================================================================
+
+  - name: ontime_flights
+    graph_schema:
+      nodes:
+        - label: Airport
+          database: default
+          table: flights
+          node_id: code
+          property_mappings: {}
+
+          from_node_properties:
+            code: Origin
+            city: OriginCityName
+            state: OriginState
+
+          to_node_properties:
+            code: Dest
+            city: DestCityName
+            state: DestState
+
+      edges:
+        - type: FLIGHT
+          database: default
+          table: flights
+          from_id: Origin
+          to_id: Dest
+          from_node: Airport
+          to_node: Airport
+          edge_id: [flight_id, flight_number]
+          property_mappings:
+            flight_id: flight_id
+            flight_num: flight_number
+            carrier: airline
+            dep_time: dep_time
+            arr_time: arr_time
+
+  # ==========================================================================
+  # social_polymorphic: polymorphic edge table with multiple interaction types
+  # Uses brahmand.interactions table
+  # ==========================================================================
+
+  - name: social_polymorphic
+    graph_schema:
+      nodes:
+        - label: User
+          database: brahmand
+          table: users_bench
+          node_id: user_id
+          property_mappings:
+            user_id: user_id
+            name: full_name
+            email: email_address
+
+        - label: Post
+          database: brahmand
+          table: posts_bench
+          node_id: post_id
+          property_mappings:
+            post_id: post_id
+            title: content
+            content: content
+            created: created_at
+
+      edges:
+        - polymorphic: true
+          database: brahmand
+          table: interactions
+          from_id: from_id
+          to_id: to_id
+          type_column: interaction_type
+          from_label_column: from_type
+          to_label_column: to_type
+          type_values:
+            - FOLLOWS
+            - LIKES
+            - AUTHORED
+            - COMMENTED
+            - SHARED
+          edge_id: [from_id, to_id, interaction_type, timestamp]
+          property_mappings:
+            created_at: timestamp
+            weight: interaction_weight
+
+  # ==========================================================================
+  # zeek_dns: coupled edge patterns from Zeek DNS log
+  # Uses zeek.dns_log table
+  # ==========================================================================
+
+  - name: zeek_dns
+    graph_schema:
+      nodes:
+        - label: IP
+          database: zeek
+          table: dns_log
+          node_id: ip_address
+          property_mappings: {}
+          from_node_properties:
+            ip_address: "id.orig_h"
+          to_node_properties:
+            ip_address: "id.resp_h"
+
+        - label: Domain
+          database: zeek
+          table: dns_log
+          node_id: domain_name
+          property_mappings: {}
+          from_node_properties:
+            domain_name: query
+          to_node_properties:
+            domain_name: query
+
+        - label: ResolvedIP
+          database: zeek
+          table: dns_log
+          node_id: answers
+          property_mappings: {}
+          from_node_properties:
+            resolved_ip: answers
+          to_node_properties:
+            resolved_ip: answers
+
+      edges:
+        - type: REQUESTED
+          database: zeek
+          table: dns_log
+          from_id: "id.orig_h"
+          to_id: query
+          from_node: IP
+          to_node: Domain
+          edge_id: uid
+          property_mappings:
+            uid: uid
+            timestamp: ts
+            dns_server: "id.resp_h"
+            qtype: qtype_name
+            rcode: rcode_name
+
+        - type: RESOLVED_TO
+          database: zeek
+          table: dns_log
+          from_id: query
+          to_id: answers
+          from_node: Domain
+          to_node: ResolvedIP
+          edge_id: [uid, answers]
+          property_mappings:
+            uid: uid
+            timestamp: ts
+            query: query

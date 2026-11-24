@@ -1,0 +1,54 @@
+# Corpus entries excluded from the P0.6 sweep's byte-lock comparison because
+# their rendered SQL is not byte-stable across regenerations — see
+# tests/rust/integration/corpus_sweep.rs's module docs and the
+# "nondeterministic" discussion in tests/rust/integration/sql_golden_tests.rs.
+#
+# Format: one entry per line, `schema/name<TAB>reason`. Entries are still
+# RENDERED by the sweep (so a panic regression is still caught) but excluded
+# from the golden-file comparison/regeneration.
+#
+# Regenerate this list by running `UPDATE_GOLDEN=1 cargo test --test
+# integration corpus_sweep` three times and diffing
+# tests/rust/integration/golden/corpus/ between runs; any changed file's
+# (schema, name) belongs here instead of a flapping golden.
+#
+# HISTORY: this list once carried 19 entries, all rooted in unsorted-HashMap
+# iteration feeding rendered SQL:
+#   - 15 entries for #480 (`expand_cte_entity` sourcing unsorted
+#     `get_node_properties`/`get_relationship_properties` plus an unsorted
+#     denormalized `from_/to_properties` merge; and the denormalized VLP CTE
+#     builder iterating `from_/to_properties` straight into the CTE column
+#     order), plus two late-identified siblings fixed in the same slice
+#     (`RETURN *` expansion order via `get_explicit_aliases`, and the
+#     multi-type VLP `labels(x)` array built from an unsorted label set).
+#   - 4 zeek_merged_test entries for #481 (coupled-edge multi-hop MIDDLE-NODE
+#     endpoint binding resolved through random `pattern_contexts` iteration —
+#     a CORRECTNESS flap: one HashMap-seed variant bound `b.ip` to the OTHER
+#     endpoint's column and returned wrong data).
+# All 19 HashMap flaps were fixed (sorted-by-cypher-property-key emission per
+# the #458/#464 recipe; owning-edge-first role resolution in
+# `PlanCtx::get_node_strategy` for #481); 14 goldens are now byte-locked. The
+# fixes are regression-tested by
+# `whole_entity_and_denorm_vlp_column_order_deterministic_480` and
+# `coupled_multihop_middle_node_binds_shared_endpoint_481` in
+# sql_golden_tests.rs, and the sweep was verified clean across 12
+# fresh-process runs after un-excluding.
+#
+# Until P-4c S14c0, 5 entries remained excluded for a DIFFERENT, harness-level
+# reason (the legacy pipeline's):
+# their SQL embeds the process-global anonymous-alias counter INSIDE a CTE
+# identifier (`pattern_union_t805`), which `normalize()`'s `\bt\d+\b` regex
+# cannot remap (`_` is a word character — no boundary before the `t`). The
+# rendered SQL is fully deterministic across fresh processes (verified: the
+# only run-to-run diff inside the full `cargo test` binary is the counter
+# value, which shifts with test order/parallelism in the SHARED process).
+# This is the same documented harness gap as
+# `standard_path_unlabeled_pattern_union_name_is_unstable` in
+# sql_golden_tests.rs; the candidate fix (widen `normalize()` to catch
+# `_t\d+` suffixes and regenerate every golden) is its own reviewed slice.
+# NOTE for that future slice: these 5 are the ONLY corpus entries whose
+# goldens would contain `_t\d+` — un-exclude them when normalize() is widened.
+#
+# P-4c S14c0: the sweep locks the bound plan's SQL now, which has no such
+# counter in its names; those 5 entries are locked again (verified over
+# fresh-process and whole-binary runs). The list is empty.

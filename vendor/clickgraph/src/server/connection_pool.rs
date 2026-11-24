@@ -1,0 +1,602 @@
+//! Role-based ClickHouse connection pool manager
+//!
+//! Maintains separate connection pools for different roles to avoid
+//! SET ROLE overhead and ensure proper role isolation.
+//!
+//! When `CLICKHOUSE_CLUSTER` is set, discovers cluster nodes from
+//! `system.clusters` and round-robins queries across them.
+
+use clickhouse::Client;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+
+/// Manages multiple connection pools, one per role + default.
+/// When cluster mode is active, round-robins across discovered nodes.
+pub struct RoleConnectionPool {
+    default_clients: Vec<Client>,
+    role_clients: Arc<RwLock<HashMap<String, Vec<Client>>>>,
+    base_config: ConnectionConfig,
+    round_robin: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct ConnectionConfig {
+    urls: Vec<String>,
+    cluster_name: Option<String>,
+    user: String,
+    password: String,
+    database: String,
+    max_cte_depth: u32,
+}
+
+/// Timeout for cluster discovery query during startup.
+const CLUSTER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl RoleConnectionPool {
+    /// Create a new role-based connection pool.
+    /// If `CLICKHOUSE_CLUSTER` is set, queries the seed node to discover cluster members.
+    pub async fn new(max_cte_depth: u32) -> Result<Self, String> {
+        let mut config = ConnectionConfig::from_env(max_cte_depth)?;
+
+        // If cluster mode, discover nodes from the seed URL
+        if config.cluster_name.is_some() {
+            config.discover_cluster_nodes().await;
+        }
+
+        Self::from_config(config)
+    }
+
+    /// Create a new role-based connection pool with explicit connection parameters.
+    ///
+    /// Unlike `new()`, this does not read from environment variables — all
+    /// connection details are provided directly by the caller.
+    pub async fn new_with_params(
+        url: &str,
+        user: &str,
+        password: &str,
+        database: Option<&str>,
+        cluster_name: Option<&str>,
+        max_cte_depth: u32,
+    ) -> Result<Self, String> {
+        let mut config = ConnectionConfig {
+            urls: vec![url.to_string()],
+            cluster_name: cluster_name.map(|s| s.to_string()),
+            user: user.to_string(),
+            password: password.to_string(),
+            database: database.unwrap_or("default").to_string(),
+            max_cte_depth,
+        };
+
+        if config.cluster_name.is_some() {
+            config.discover_cluster_nodes().await;
+        }
+
+        Self::from_config(config)
+    }
+
+    /// Build a pool from a fully-resolved `ConnectionConfig`.
+    fn from_config(config: ConnectionConfig) -> Result<Self, String> {
+        let default_clients: Vec<Client> = config
+            .urls
+            .iter()
+            .map(|url| config.create_client_for_url(url, None))
+            .collect();
+
+        let node_count = default_clients.len();
+        let cluster_info = if let Some(ref name) = config.cluster_name {
+            format!("Cluster mode: {} nodes for cluster '{}'", node_count, name)
+        } else {
+            "Single-node mode".to_string()
+        };
+        log::info!("{}", cluster_info);
+
+        Ok(Self {
+            default_clients,
+            role_clients: Arc::new(RwLock::new(HashMap::new())),
+            base_config: config,
+            round_robin: AtomicUsize::new(0),
+        })
+    }
+
+    /// Get a client for the specified role (or default if None).
+    /// Round-robins across cluster nodes when multiple URLs are configured.
+    ///
+    /// This method:
+    /// 1. Picks a node index via round-robin
+    /// 2. Returns default pool if role is None
+    /// 3. Checks if role pool exists (fast path - read lock)
+    /// 4. Creates new role pool if needed (slow path - write lock)
+    ///
+    /// Role pools are lazy-initialized on first use.
+    pub async fn get_client(&self, role: Option<&str>) -> Client {
+        let idx = self.round_robin.fetch_add(1, Ordering::Relaxed) % self.default_clients.len();
+
+        let Some(role) = role else {
+            return self.default_clients[idx].clone();
+        };
+
+        // Fast path: check if role pool exists (read lock)
+        {
+            let pools = self.role_clients.read().await;
+            if let Some(clients) = pools.get(role) {
+                return clients[idx].clone();
+            }
+        }
+
+        // Slow path: create new role pools for all URLs (write lock)
+        let mut pools = self.role_clients.write().await;
+
+        // Double-check after acquiring write lock (another thread might have created it)
+        if let Some(clients) = pools.get(role) {
+            return clients[idx].clone();
+        }
+
+        // Create clients with role for all URLs. The role is log-scrubbed:
+        // it is caller-supplied text (`role` on the registry endpoints) and
+        // the endpoint 400s a control character, but this is the one place
+        // a pool is built for any caller, so the discipline stays local.
+        log::info!(
+            "Creating new connection pool for role: {}",
+            crate::server::schema_registry::log_safe(role)
+        );
+        let clients: Vec<Client> = self
+            .base_config
+            .urls
+            .iter()
+            .map(|url| self.base_config.create_client_for_url(url, Some(role)))
+            .collect();
+        let client = clients[idx].clone();
+        pools.insert(role.to_string(), clients);
+
+        client
+    }
+
+    /// Get statistics about pool usage
+    pub async fn stats(&self) -> PoolStats {
+        let pools = self.role_clients.read().await;
+        PoolStats {
+            total_role_pools: pools.len(),
+            roles: pools.keys().cloned().collect(),
+            node_count: self.default_clients.len(),
+            cluster_name: self.base_config.cluster_name.clone(),
+        }
+    }
+
+    /// Raw HTTP endpoint parts for the metrics summary path (`remote.rs`), which
+    /// bypasses the `clickhouse` crate to read `X-ClickHouse-Summary`. Selects a
+    /// node via the same round-robin as `get_client` and carries the identical
+    /// settings (`standard_options`) + role so results match the crate path.
+    pub fn http_endpoint(&self, role: Option<&str>) -> ChHttpEndpoint {
+        let idx = self.round_robin.fetch_add(1, Ordering::Relaxed) % self.base_config.urls.len();
+        ChHttpEndpoint {
+            url: self.base_config.urls[idx].clone(),
+            user: self.base_config.user.clone(),
+            password: self.base_config.password.clone(),
+            database: self.base_config.database.clone(),
+            options: ConnectionConfig::standard_options(self.base_config.max_cte_depth, role),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PoolStats {
+    pub total_role_pools: usize,
+    pub roles: Vec<String>,
+    pub node_count: usize,
+    pub cluster_name: Option<String>,
+}
+
+/// Connection details for a direct ClickHouse HTTP request (the metrics
+/// summary path). Auth goes in `X-ClickHouse-User` / `-Key` headers; `database`,
+/// `options`, and any role go in the URL query string — matching how the
+/// `clickhouse` crate composes its request.
+#[derive(Debug, Clone)]
+pub struct ChHttpEndpoint {
+    pub url: String,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+    pub options: Vec<(String, String)>,
+}
+
+impl ConnectionConfig {
+    fn from_env(max_cte_depth: u32) -> Result<Self, String> {
+        let url = env::var("CLICKHOUSE_URL").map_err(|_| "CLICKHOUSE_URL not set".to_string())?;
+        let cluster_name = env::var("CLICKHOUSE_CLUSTER").ok();
+
+        Ok(Self {
+            urls: vec![url],
+            cluster_name,
+            user: env::var("CLICKHOUSE_USER").map_err(|_| "CLICKHOUSE_USER not set".to_string())?,
+            // Allow empty password for local development
+            password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
+            // Database is optional - defaults to "default". All queries use fully-qualified table names anyway.
+            database: env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string()),
+            max_cte_depth,
+        })
+    }
+
+    /// Discover cluster nodes from `system.clusters` using the seed URL.
+    /// Falls back to the seed URL with a warning if discovery fails or returns empty.
+    async fn discover_cluster_nodes(&mut self) {
+        let cluster_name = match &self.cluster_name {
+            Some(name) => name.clone(),
+            None => return,
+        };
+
+        let seed_url = &self.urls[0];
+        log::info!(
+            "Discovering cluster '{}' nodes from seed: {}",
+            cluster_name,
+            seed_url
+        );
+
+        #[derive(Debug, clickhouse::Row, Deserialize)]
+        struct ClusterNode {
+            host_address: String,
+        }
+
+        let client = Client::default()
+            .with_url(seed_url)
+            .with_user(&self.user)
+            .with_password(&self.password)
+            .with_database(&self.database);
+
+        // Use '' for ClickHouse string literal escaping (not backslash)
+        let query = format!(
+            "SELECT DISTINCT host_address FROM system.clusters WHERE cluster = '{}' ORDER BY host_address",
+            cluster_name.replace('\'', "''")
+        );
+
+        // Wrap discovery in a timeout so startup doesn't stall on unreachable seeds
+        let result = tokio::time::timeout(
+            CLUSTER_DISCOVERY_TIMEOUT,
+            client.query(&query).fetch_all::<ClusterNode>(),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(rows)) => {
+                let hosts: Vec<String> = rows.into_iter().map(|node| node.host_address).collect();
+                let discovered_urls = build_cluster_urls(seed_url, &hosts);
+
+                if discovered_urls.is_empty() {
+                    log::warn!(
+                        "Cluster '{}' returned no nodes, falling back to seed URL",
+                        cluster_name
+                    );
+                } else {
+                    log::info!(
+                        "Discovered {} nodes for cluster '{}': {:?}",
+                        discovered_urls.len(),
+                        cluster_name,
+                        discovered_urls
+                    );
+                    self.urls = discovered_urls;
+                }
+            }
+            Ok(Err(e)) => {
+                log::warn!(
+                    "Failed to discover cluster '{}' nodes: {}. Falling back to seed URL",
+                    cluster_name,
+                    e
+                );
+            }
+            Err(_) => {
+                log::warn!(
+                    "Cluster '{}' discovery timed out after {}s. Falling back to seed URL",
+                    cluster_name,
+                    CLUSTER_DISCOVERY_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+
+    /// The ClickHouse settings every query runs with. Single source of truth so
+    /// the `clickhouse`-crate client and the metrics reqwest path (which reads
+    /// `X-ClickHouse-Summary`) apply identical settings — any drift would make
+    /// the two execution paths return different results.
+    fn standard_options(max_cte_depth: u32, role: Option<&str>) -> Vec<(String, String)> {
+        // Result-correctness settings first (shared with chdb and SQL-only
+        // output via `portable_sql`), then limits and formats.
+        let mut opts: Vec<(String, String)> = crate::sql_generator::session_settings()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        opts.extend([
+            ("allow_experimental_json_type".to_string(), "1".to_string()),
+            (
+                "input_format_binary_read_json_as_string".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "output_format_binary_write_json_as_string".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "max_recursive_cte_evaluation_depth".to_string(),
+                max_cte_depth.to_string(),
+            ),
+            // VLP queries with polymorphic schemas generate large SQL via UNION
+            // ALL expansion; the 256KB default is too small for multi-type VLP.
+            ("max_query_size".to_string(), "10485760".to_string()), // 10MB
+            // Large VLP SQL also creates large ASTs; default 50000 is too small.
+            ("max_ast_elements".to_string(), "1000000".to_string()), // 1M
+        ]);
+        if let Some(role_name) = role {
+            opts.push(("role".to_string(), role_name.to_string()));
+        }
+        opts
+    }
+
+    fn create_client_for_url(&self, url: &str, role: Option<&str>) -> Client {
+        let mut client = Client::default()
+            .with_url(url)
+            .with_user(&self.user)
+            .with_password(&self.password)
+            .with_database(&self.database);
+        for (name, value) in Self::standard_options(self.max_cte_depth, role) {
+            client = client.with_option(name, value);
+        }
+        if role.is_some() {
+            log::debug!("Creating connection pool with role: {:?}", role);
+        }
+        client
+    }
+}
+
+/// Build cluster URLs by replacing the host in the seed URL with each discovered host.
+///
+/// Preserves the seed URL's scheme, port, and path — only the hostname is swapped.
+/// `system.clusters.port` is the native TCP port (9000), NOT the HTTP port, so we
+/// always use the port from the seed URL.
+fn build_cluster_urls(seed_url: &str, hosts: &[String]) -> Vec<String> {
+    // Parse seed URL: scheme://host[:port][/path...]
+    let (scheme, after_scheme) = if let Some(rest) = seed_url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = seed_url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        // Unrecognized scheme — can't safely parse
+        return vec![];
+    };
+
+    // Split host[:port] from /path
+    let (host_port, path) = match after_scheme.find('/') {
+        Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
+        None => (after_scheme, ""),
+    };
+
+    // Extract port from seed (if present)
+    let port_suffix = match host_port.rfind(':') {
+        Some(colon_idx) => &host_port[colon_idx..], // includes the ':'
+        None => "",
+    };
+
+    hosts
+        .iter()
+        .map(|host| format!("{}://{}{}{}", scheme, host, port_suffix, path))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    #[ignore] // Requires ClickHouse connection
+    async fn test_role_pool_isolation() {
+        // Set up environment
+        // SAFETY: this test is serialized with the other env-mutating tests,
+        // so no other test mutates the process environment concurrently.
+        unsafe {
+            env::set_var("CLICKHOUSE_URL", "http://localhost:8123");
+            env::set_var("CLICKHOUSE_USER", "test_user");
+            env::set_var("CLICKHOUSE_PASSWORD", "test_pass");
+            env::set_var("CLICKHOUSE_DATABASE", "test_db");
+        }
+
+        let pool = RoleConnectionPool::new(100).await.unwrap();
+
+        // Get clients for different roles
+        let _default = pool.get_client(None).await;
+        let _analyst = pool.get_client(Some("analyst")).await;
+        let _admin = pool.get_client(Some("admin")).await;
+
+        // Verify pools exist (can't compare Client instances directly)
+        // ClickHouse Client doesn't implement Debug or PartialEq
+
+        // Check stats to verify different roles created different pools
+        let stats = pool.stats().await;
+        assert_eq!(stats.total_role_pools, 2); // analyst + admin
+        assert!(stats.roles.contains(&"analyst".to_string()));
+        assert!(stats.roles.contains(&"admin".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_single_node_config() {
+        // SAFETY: `#[serial]` serializes process-wide environment mutation
+        // across the tests that opt in.
+        unsafe {
+            env::set_var("CLICKHOUSE_URL", "http://localhost:8123");
+            env::set_var("CLICKHOUSE_USER", "test_user");
+            env::set_var("CLICKHOUSE_PASSWORD", "test_pass");
+            env::remove_var("CLICKHOUSE_CLUSTER");
+        }
+
+        let config = ConnectionConfig::from_env(100).unwrap();
+        assert_eq!(config.urls.len(), 1);
+        assert_eq!(config.urls[0], "http://localhost:8123");
+        assert!(config.cluster_name.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_cluster_config_env() {
+        // SAFETY: `#[serial]` serializes process-wide environment mutation
+        // across the tests that opt in.
+        unsafe {
+            env::set_var("CLICKHOUSE_URL", "http://localhost:8123");
+            env::set_var("CLICKHOUSE_USER", "test_user");
+            env::set_var("CLICKHOUSE_PASSWORD", "test_pass");
+            env::set_var("CLICKHOUSE_CLUSTER", "my_cluster");
+        }
+
+        let config = ConnectionConfig::from_env(100).unwrap();
+        assert_eq!(config.cluster_name, Some("my_cluster".to_string()));
+        // URLs still just seed before discovery
+        assert_eq!(config.urls.len(), 1);
+
+        // Clean up
+        // SAFETY: still inside the `#[serial]` test, so no other test mutates
+        // the environment concurrently.
+        unsafe {
+            env::remove_var("CLICKHOUSE_CLUSTER");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_new_with_params_single_node() {
+        let pool = RoleConnectionPool::new_with_params(
+            "http://localhost:8123",
+            "test_user",
+            "test_pass",
+            Some("my_db"),
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.node_count, 1);
+        assert!(stats.cluster_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_with_params_default_database() {
+        let pool = RoleConnectionPool::new_with_params(
+            "http://localhost:8123",
+            "test_user",
+            "test_pass",
+            None, // should default to "default"
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.node_count, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_round_robin_distribution() {
+        // SAFETY: `#[serial]` serializes process-wide environment mutation
+        // across the tests that opt in.
+        unsafe {
+            env::set_var("CLICKHOUSE_URL", "http://localhost:8123");
+            env::set_var("CLICKHOUSE_USER", "test_user");
+            env::set_var("CLICKHOUSE_PASSWORD", "test_pass");
+            env::remove_var("CLICKHOUSE_CLUSTER");
+        }
+
+        let mut config = ConnectionConfig::from_env(100).unwrap();
+        // Simulate multi-node by adding URLs manually
+        config.urls = vec![
+            "http://node1:8123".to_string(),
+            "http://node2:8123".to_string(),
+            "http://node3:8123".to_string(),
+        ];
+
+        let default_clients: Vec<Client> = config
+            .urls
+            .iter()
+            .map(|url| config.create_client_for_url(url, None))
+            .collect();
+
+        let pool = RoleConnectionPool {
+            default_clients,
+            role_clients: Arc::new(RwLock::new(HashMap::new())),
+            base_config: config,
+            round_robin: AtomicUsize::new(0),
+        };
+
+        // Verify round-robin cycles through indices
+        let stats = pool.stats().await;
+        assert_eq!(stats.node_count, 3);
+
+        // Call get_client multiple times and verify counter advances
+        for _ in 0..9 {
+            let _ = pool.get_client(None).await;
+        }
+        // After 9 calls, counter should be at 9
+        assert_eq!(pool.round_robin.load(Ordering::Relaxed), 9);
+    }
+
+    // --- build_cluster_urls tests ---
+
+    #[test]
+    fn test_build_cluster_urls_preserves_port() {
+        let urls = build_cluster_urls(
+            "http://seed:8123",
+            &["10.0.0.1".into(), "10.0.0.2".into(), "10.0.0.3".into()],
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "http://10.0.0.1:8123",
+                "http://10.0.0.2:8123",
+                "http://10.0.0.3:8123",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_cluster_urls_preserves_https() {
+        let urls = build_cluster_urls("https://seed:8443", &["node1".into(), "node2".into()]);
+        assert_eq!(urls, vec!["https://node1:8443", "https://node2:8443"]);
+    }
+
+    #[test]
+    fn test_build_cluster_urls_preserves_path() {
+        let urls = build_cluster_urls(
+            "http://proxy:8123/clickhouse",
+            &["10.0.0.1".into(), "10.0.0.2".into()],
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "http://10.0.0.1:8123/clickhouse",
+                "http://10.0.0.2:8123/clickhouse",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_cluster_urls_no_port() {
+        let urls = build_cluster_urls("http://seed", &["node1".into(), "node2".into()]);
+        assert_eq!(urls, vec!["http://node1", "http://node2"]);
+    }
+
+    #[test]
+    fn test_build_cluster_urls_empty_hosts() {
+        let urls = build_cluster_urls("http://seed:8123", &[]);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_build_cluster_urls_bad_scheme() {
+        let urls = build_cluster_urls("ftp://seed:8123", &["node1".into()]);
+        assert!(urls.is_empty());
+    }
+}

@@ -1,0 +1,354 @@
+use anyhow::{anyhow, Result};
+use clickgraph_embedded::{
+    connection::Connection,
+    database::{Database, RemoteConfig},
+    error::EmbeddedError,
+    value::Value,
+};
+
+use clickgraph::graph_catalog::config::GraphSchemaConfig;
+
+use crate::config::CgConfig;
+use crate::DialectArg;
+
+/// `cg sql` — translate Cypher to SQL and print it.
+pub fn run_sql(cypher: &str, cfg: &CgConfig) -> Result<()> {
+    let sql = tokio::task::block_in_place(|| translate(cypher, cfg))?;
+    println!("{}", sql);
+    Ok(())
+}
+
+/// `cg validate` — parse + plan Cypher, report success or error.
+pub fn run_validate(cypher: &str, cfg: &CgConfig) -> Result<()> {
+    tokio::task::block_in_place(|| translate(cypher, cfg))?;
+    println!("OK — Cypher is valid and translates successfully.");
+    Ok(())
+}
+
+/// Translate Cypher → SQL (nothing is executed).
+fn translate(cypher: &str, cfg: &CgConfig) -> Result<String> {
+    let db = open_for_translation(cfg)?;
+    let conn = Connection::new(&db).map_err(|e| anyhow!("{}", e))?;
+    conn.query_to_sql(cypher).map_err(|e| anyhow!("{}", e))
+}
+
+/// Open the schema for translation without executing anything.
+///
+/// A schema element with `auto_discover_columns: true` takes its properties
+/// from its table's columns, which only ClickHouse can list: such a schema
+/// opens through `--clickhouse` (reading `system.columns`) and is refused
+/// without one. Blocks, so call it off the async worker.
+pub(crate) fn open_for_translation(cfg: &CgConfig) -> Result<Database> {
+    let path = cfg.require_schema()?;
+    let config = GraphSchemaConfig::from_yaml_file(path)
+        .map_err(|e| anyhow!("Failed to load schema '{}': {}", path, e))?;
+    let Some(target) = config.column_discovery_targets().into_iter().next() else {
+        // With a ClickHouse to read from, translate with the column types
+        // the server would read (docs/design/VALUE_TYPES.md §2), so the SQL
+        // is the SQL `cg query` runs. They are best effort: without a
+        // connection, the translation is the same one with unknown types.
+        if let (DialectArg::Clickhouse, Some(remote)) = (&cfg.dialect, remote_config(cfg)) {
+            match Database::new_remote(path, remote) {
+                Ok(db) => {
+                    warn_load(&db);
+                    return Ok(db);
+                }
+                // The schema itself is wrong: the same error either way.
+                Err(e @ EmbeddedError::Schema(_)) => return Err(anyhow!("{}", e)),
+                Err(e) => eprintln!(
+                    "warning: could not read column types from ClickHouse, translating \
+                     without them: {}",
+                    e
+                ),
+            }
+        }
+        return Database::sql_only_with_dialect(path, cfg.dialect.to_sql_dialect())
+            .map_err(|e| anyhow!("{}", e));
+    };
+    match (&cfg.dialect, remote_config(cfg)) {
+        (DialectArg::Clickhouse, Some(remote)) => Database::new_remote(path, remote)
+            .inspect(warn_load)
+            .map_err(|e| anyhow!("Failed to read columns from ClickHouse: {}", e)),
+        (DialectArg::Clickhouse, None) => Err(anyhow!(
+            "{} sets auto_discover_columns: true, so its properties are the columns of \
+             `{}`.`{}`, read from ClickHouse: pass --clickhouse (or CG_CLICKHOUSE_URL), \
+             or declare its property_mappings instead.",
+            target.owner,
+            target.database,
+            target.table
+        )),
+        (DialectArg::Databricks, _) => Err(anyhow!(
+            "{} sets auto_discover_columns: true, which is not supported with Databricks; \
+             declare its property_mappings instead",
+            target.owner
+        )),
+    }
+}
+
+/// Print what loading the schema did without (`Database::load_warnings`:
+/// column types it could not read), so a translation that differs from the
+/// server's says why.
+fn warn_load(db: &Database) {
+    for w in db.load_warnings() {
+        eprintln!("warning: {}", w);
+    }
+}
+
+/// The remote ClickHouse that `--clickhouse` names, if any.
+fn remote_config(cfg: &CgConfig) -> Option<RemoteConfig> {
+    Some(RemoteConfig {
+        url: cfg.clickhouse_url.clone()?,
+        user: cfg.ch_user.clone(),
+        password: cfg.ch_password.clone(),
+        database: cfg.ch_database.clone(),
+        cluster_name: None,
+    })
+}
+
+/// `cg query` — translate Cypher and optionally execute against ClickHouse.
+pub async fn run_query(cypher: &str, sql_only: bool, format: &str, cfg: &CgConfig) -> Result<()> {
+    let path = cfg.require_schema()?;
+
+    if sql_only {
+        return run_sql(cypher, cfg);
+    }
+
+    if matches!(cfg.dialect, DialectArg::Databricks) {
+        return run_query_databricks(cypher, format, cfg).await;
+    }
+
+    let remote = remote_config(cfg)
+        .ok_or_else(|| anyhow!("No ClickHouse URL. Use --clickhouse or CG_CLICKHOUSE_URL."))?;
+    let schema_path = path.to_string();
+    let cypher = cypher.to_string();
+
+    let (col_names, rows) = tokio::task::spawn_blocking(move || {
+        let db = Database::new_remote(&schema_path, remote)
+            .map_err(|e| anyhow!("Failed to connect to ClickHouse: {}", e))?;
+        warn_load(&db);
+        let conn = Connection::new(&db).map_err(|e| anyhow!("{}", e))?;
+        let result = conn.query_remote(&cypher).map_err(|e| anyhow!("{}", e))?;
+        let col_names: Vec<String> = result.get_column_names().to_vec();
+        let rows: Vec<Vec<Value>> = result.map(|row| row.values().to_vec()).collect();
+        Ok::<_, anyhow::Error>((col_names, rows))
+    })
+    .await??;
+
+    match format {
+        "json" => print_json(&col_names, &rows)?,
+        "pretty" => print_json_pretty(&col_names, &rows)?,
+        _ => print_table(&col_names, &rows),
+    }
+
+    Ok(())
+}
+
+// ── Databricks execution ────────────────────────────────────────────────────
+//
+// `databricks` is a non-default `cg` build feature. When it is off, calling
+// `cg query --dialect databricks` (without `--sql-only`) returns a clear
+// rebuild error rather than a confusing ClickHouse-URL error. When it is on,
+// the same call routes through `clickgraph-embedded::Database::new_databricks`
+// and `Connection::query_remote` — the SQL is translated under the Spark
+// dialect by the dialect-aware renderer and POSTed to the Statement Execution
+// API. We keep the words "--sql-only" in the off-feature error so users who
+// only need translation get a single working command without rebuilding.
+
+#[cfg(feature = "databricks")]
+async fn run_query_databricks(cypher: &str, format: &str, cfg: &CgConfig) -> Result<()> {
+    let path = cfg.require_schema()?;
+    let host = cfg.databricks.hostname.as_deref().ok_or_else(|| {
+        anyhow!(
+            "Databricks hostname not set. Provide DATABRICKS_HOST (or CG_DATABRICKS_HOST), \
+             or a [databricks] section in ~/.config/cg/config.toml."
+        )
+    })?;
+    let warehouse_id = cfg.databricks.warehouse_id.as_deref().ok_or_else(|| {
+        anyhow!(
+            "Databricks warehouse_id not set. Provide DATABRICKS_WAREHOUSE_ID \
+             (or CG_DATABRICKS_WAREHOUSE_ID), or a [databricks] section in \
+             ~/.config/cg/config.toml."
+        )
+    })?;
+    // OAuth M2M takes precedence when both client credentials are present;
+    // otherwise a PAT is required. Exactly one of the pair set is almost always
+    // a misconfiguration (typo'd env var) — error rather than silently falling
+    // back to PAT, which would mask the intent.
+    let oauth = match (
+        cfg.databricks.client_id.as_deref(),
+        cfg.databricks.client_secret.as_deref(),
+    ) {
+        (Some(id), Some(secret)) => Some(clickgraph_embedded::OAuthM2MConfig::new(id, secret)),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(anyhow!(
+                "Incomplete Databricks OAuth config: set BOTH \
+                 CG_DATABRICKS_CLIENT_ID and CG_DATABRICKS_CLIENT_SECRET for OAuth M2M, \
+                 or neither (and provide DATABRICKS_TOKEN for PAT auth)."
+            ));
+        }
+        (None, None) => None,
+    };
+    // The PAT is required only when OAuth is not configured. Use a placeholder
+    // when OAuth is active (the executor never reads it in that mode).
+    let token = if oauth.is_some() {
+        cfg.databricks.token.clone().unwrap_or_default()
+    } else {
+        cfg.databricks.token.clone().ok_or_else(|| {
+            anyhow!(
+                "Databricks auth not set. Provide DATABRICKS_TOKEN (or CG_DATABRICKS_TOKEN) for \
+                 PAT auth, or CG_DATABRICKS_CLIENT_ID + CG_DATABRICKS_CLIENT_SECRET for OAuth \
+                 M2M, or a [databricks] section in ~/.config/cg/config.toml. Secrets are never \
+                 accepted on the command line."
+            )
+        })?
+    };
+
+    let mut dbc = clickgraph_embedded::DatabricksConfig::new(host, warehouse_id, token);
+    dbc.catalog = cfg.databricks.catalog.clone();
+    dbc.schema = cfg.databricks.schema.clone();
+    dbc.base_url = cfg.databricks.base_url.clone();
+    dbc.oauth = oauth;
+
+    let schema_path = path.to_string();
+    let cypher = cypher.to_string();
+    let (col_names, rows) = tokio::task::spawn_blocking(move || {
+        let db = clickgraph_embedded::Database::new_databricks(&schema_path, dbc)
+            .map_err(|e| anyhow!("Failed to open Databricks executor: {}", e))?;
+        let conn = clickgraph_embedded::Connection::new(&db).map_err(|e| anyhow!("{}", e))?;
+        let result = conn.query_remote(&cypher).map_err(|e| anyhow!("{}", e))?;
+        let col_names: Vec<String> = result.get_column_names().to_vec();
+        let rows: Vec<Vec<Value>> = result.map(|row| row.values().to_vec()).collect();
+        Ok::<_, anyhow::Error>((col_names, rows))
+    })
+    .await??;
+
+    match format {
+        "json" => print_json(&col_names, &rows)?,
+        "pretty" => print_json_pretty(&col_names, &rows)?,
+        _ => print_table(&col_names, &rows),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "databricks"))]
+async fn run_query_databricks(_cypher: &str, _format: &str, _cfg: &CgConfig) -> Result<()> {
+    Err(anyhow!(
+        "`cg query --dialect databricks` requires the `databricks` build feature. \
+         Rebuild cg with `cargo install clickgraph-tool --features databricks` \
+         (or `cargo build -p clickgraph-tool --features databricks`). \
+         You can also use `--sql-only` to print Spark SQL without executing."
+    ))
+}
+
+// ── Output formatters ────────────────────────────────────────────────────────
+
+fn print_table(cols: &[String], rows: &[Vec<Value>]) {
+    if rows.is_empty() {
+        println!("(0 rows)");
+        return;
+    }
+
+    let mut widths: Vec<usize> = cols.iter().map(|c| c.len()).collect();
+    for row in rows {
+        for (i, val) in row.iter().enumerate() {
+            widths[i] = widths[i].max(value_str(val).len());
+        }
+    }
+
+    let sep: String = widths
+        .iter()
+        .map(|w| "-".repeat(w + 2))
+        .collect::<Vec<_>>()
+        .join("+");
+    println!("+{}+", sep);
+    let header: Vec<String> = cols
+        .iter()
+        .zip(&widths)
+        .map(|(c, w)| format!(" {:w$} ", c, w = w))
+        .collect();
+    println!("|{}|", header.join("|"));
+    println!("+{}+", sep);
+    for row in rows {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(v, w)| format!(" {:w$} ", value_str(v), w = w))
+            .collect();
+        println!("|{}|", cells.join("|"));
+    }
+    println!("+{}+", sep);
+    println!(
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+}
+
+fn print_json(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
+    for row in rows {
+        let obj: serde_json::Map<String, serde_json::Value> = cols
+            .iter()
+            .zip(row)
+            .map(|(k, v)| (k.clone(), value_to_json(v)))
+            .collect();
+        println!("{}", serde_json::to_string(&obj)?);
+    }
+    Ok(())
+}
+
+fn print_json_pretty(cols: &[String], rows: &[Vec<Value>]) -> Result<()> {
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let obj: serde_json::Map<String, serde_json::Value> = cols
+                .iter()
+                .zip(row)
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&arr)?);
+    Ok(())
+}
+
+fn value_str(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int64(n) => n.to_string(),
+        Value::Float64(f) => f.to_string(),
+        Value::String(s) | Value::Date(s) | Value::Timestamp(s) | Value::UUID(s) => s.clone(),
+        Value::List(items) => format!(
+            "[{}]",
+            items.iter().map(value_str).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Map(pairs) => format!(
+            "{{{}}}",
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, value_str(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int64(n) => serde_json::Value::Number((*n).into()),
+        Value::Float64(f) => serde_json::json!(f),
+        Value::String(s) | Value::Date(s) | Value::Timestamp(s) | Value::UUID(s) => {
+            serde_json::Value::String(s.clone())
+        }
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Map(pairs) => serde_json::Value::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        ),
+    }
+}

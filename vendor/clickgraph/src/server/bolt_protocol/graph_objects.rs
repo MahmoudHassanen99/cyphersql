@@ -1,0 +1,964 @@
+//! Neo4j Bolt 5.x Graph Objects
+//!
+//! This module defines Node, Relationship, and Path structures compatible with
+//! Neo4j Bolt protocol 5.x. These objects use packstream encoding and include
+//! the new STRING-based elementId field.
+//!
+//! # Packstream Encoding
+//!
+//! Bolt 5.x uses packstream binary encoding for graph objects:
+//!
+//! ## Node Structure
+//! ```text
+//! Signature: 0xB4 (4-field struct) + 0x4E ('N')
+//! Fields:
+//!   1. id: Integer (legacy, can be 0)
+//!   2. labels: List<String>
+//!   3. properties: Map<String, Value>
+//!   4. elementId: String
+//! ```
+//!
+//! ## Relationship Structure
+//! ```text
+//! Signature: 0xB8 (8-field struct) + 0x52 ('R')
+//! Fields:
+//!   1. id: Integer (legacy, can be 0)
+//!   2. startNodeId: Integer (legacy)
+//!   3. endNodeId: Integer (legacy)
+//!   4. type: String
+//!   5. properties: Map<String, Value>
+//!   6. elementId: String
+//!   7. startNodeElementId: String
+//!   8. endNodeElementId: String
+//! ```
+//!
+//! # Usage
+//!
+//! ```rust
+//! use clickgraph::server::bolt_protocol::graph_objects::Node;
+//! use std::collections::HashMap;
+//! use serde_json::Value;
+//!
+//! let mut properties = HashMap::new();
+//! properties.insert("user_id".to_string(), Value::Number(123.into()));
+//! properties.insert("name".to_string(), Value::String("Alice".to_string()));
+//!
+//! let node = Node {
+//!     id: 0,  // Legacy ID (unused in modern Neo4j)
+//!     labels: vec!["User".to_string()],
+//!     properties,
+//!     element_id: "User:123".to_string(),
+//! };
+//!
+//! // Encode to packstream bytes
+//! let encoded = node.to_packstream();
+//! ```
+
+use serde_json::Value;
+use std::collections::HashMap;
+
+use crate::server::models::{GraphEdge, GraphNode};
+
+/// Neo4j Bolt 5.x Node structure
+///
+/// Represents a graph node with labels, properties, and Neo4j 5.0+ elementId.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Node {
+    /// Legacy integer ID (can be 0 or hash for compatibility)
+    pub id: i64,
+    /// Node labels (e.g., ["User", "Person"])
+    pub labels: Vec<String>,
+    /// Node properties as JSON values
+    pub properties: HashMap<String, Value>,
+    /// Neo4j 5.0+ STRING-based element ID
+    /// Format: "Label:id" or "Label:id1|id2|id3" for composite IDs
+    pub element_id: String,
+}
+
+/// Neo4j Bolt 5.x Relationship structure
+///
+/// Represents a graph relationship with type, properties, and Neo4j 5.0+ elementIds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relationship {
+    /// Legacy integer ID (can be 0 for compatibility)
+    pub id: i64,
+    /// Legacy start node ID
+    pub start_node_id: i64,
+    /// Legacy end node ID
+    pub end_node_id: i64,
+    /// Relationship type (e.g., "FOLLOWS", "AUTHORED")
+    pub rel_type: String,
+    /// Relationship properties as JSON values
+    pub properties: HashMap<String, Value>,
+    /// Neo4j 5.0+ STRING-based element ID for this relationship
+    /// Format: "Type:from_id->to_id", "Type:edge_id:from_id->to_id" where
+    /// its schema declares an `edge_id` (`element_id::relationship_element_id`)
+    pub element_id: String,
+    /// Neo4j 5.0+ STRING-based element ID for start node
+    pub start_node_element_id: String,
+    /// Neo4j 5.0+ STRING-based element ID for end node
+    pub end_node_element_id: String,
+}
+
+/// Neo4j Bolt Path structure
+///
+/// Represents a graph path as a sequence of alternating nodes and relationships.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Path {
+    /// Nodes in the path
+    pub nodes: Vec<Node>,
+    /// Relationships connecting the nodes
+    pub relationships: Vec<Relationship>,
+    /// Indices describing the path structure
+    /// Each pair (node_idx, rel_idx) indicates the path segment
+    pub indices: Vec<i64>,
+}
+
+impl Path {
+    /// Create a new Path
+    pub fn new(nodes: Vec<Node>, relationships: Vec<Relationship>, indices: Vec<i64>) -> Self {
+        Path {
+            nodes,
+            relationships,
+            indices,
+        }
+    }
+
+    /// Create a simple single-hop path: `(start)-[rel]->(end)`
+    pub fn single_hop(start_node: Node, relationship: Relationship, end_node: Node) -> Self {
+        // For a single hop path: node[0] -> rel[0] -> node[1]
+        // Indices: [1, 1] means "go to node 1 via relationship with index 1"
+        // In Neo4j path encoding: indices alternate between rel_idx and node_idx
+        // For (a)-[r]->(b): indices = [1, 1] meaning rel 1, then node 1
+        Path {
+            nodes: vec![start_node, end_node],
+            relationships: vec![relationship],
+            indices: vec![1, 1], // rel index 1 (meaning relationship[0] forward), then node index 1
+        }
+    }
+
+    /// Encode this Path to packstream format
+    ///
+    /// Path encoding: 0xB3 (3-field struct) + 0x50 ('P') + [nodes, rels, indices]
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the packstream-encoded bytes
+    pub fn to_packstream(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Struct signature: 0xB3 (3 fields) + 0x50 ('P')
+        bytes.push(0xB3);
+        bytes.push(0x50);
+
+        // Field 1: nodes (List of Node structures)
+        // First encode the list header
+        let node_count = self.nodes.len();
+        if node_count < 16 {
+            bytes.push(0x90 | node_count as u8);
+        } else if node_count < 256 {
+            bytes.push(0xD4);
+            bytes.push(node_count as u8);
+        } else {
+            bytes.push(0xD5);
+            bytes.extend_from_slice(&(node_count as u16).to_be_bytes());
+        }
+        // Then encode each node
+        for node in &self.nodes {
+            bytes.extend_from_slice(&node.to_packstream());
+        }
+
+        // Field 2: relationships (List of UnboundRelationship structures)
+        // UnboundRelationship: 0xB3 (3-field) + 0x72 ('r') + [id, type, properties]
+        // Note: relationships in Path are "unbound" (no start/end node IDs in struct)
+        let rel_count = self.relationships.len();
+        if rel_count < 16 {
+            bytes.push(0x90 | rel_count as u8);
+        } else if rel_count < 256 {
+            bytes.push(0xD4);
+            bytes.push(rel_count as u8);
+        } else {
+            bytes.push(0xD5);
+            bytes.extend_from_slice(&(rel_count as u16).to_be_bytes());
+        }
+        // Encode each relationship as UnboundRelationship
+        for rel in &self.relationships {
+            bytes.extend_from_slice(&rel.to_unbound_packstream());
+        }
+
+        // Field 3: indices (List of Integers)
+        let idx_count = self.indices.len();
+        if idx_count < 16 {
+            bytes.push(0x90 | idx_count as u8);
+        } else if idx_count < 256 {
+            bytes.push(0xD4);
+            bytes.push(idx_count as u8);
+        } else {
+            bytes.push(0xD5);
+            bytes.extend_from_slice(&(idx_count as u16).to_be_bytes());
+        }
+        for idx in &self.indices {
+            bytes.extend_from_slice(&encode_integer(*idx));
+        }
+
+        bytes
+    }
+}
+
+impl Node {
+    /// Create a new Node
+    pub fn new(
+        id: i64,
+        labels: Vec<String>,
+        properties: HashMap<String, Value>,
+        element_id: String,
+    ) -> Self {
+        Node {
+            id,
+            labels,
+            properties,
+            element_id,
+        }
+    }
+
+    /// Convert to HTTP API GraphNode
+    pub fn to_graph_node(&self) -> GraphNode {
+        GraphNode {
+            element_id: self.element_id.clone(),
+            labels: self.labels.clone(),
+            properties: self.properties.clone(),
+        }
+    }
+
+    /// Encode this Node to packstream format
+    ///
+    /// Format: 0xB4 (4-field struct) + 0x4E ('N') + [id, labels, properties, elementId]
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the packstream-encoded bytes
+    pub fn to_packstream(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Struct signature: 0xB4 (4 fields) + 0x4E ('N')
+        bytes.push(0xB4);
+        bytes.push(0x4E);
+
+        // Field 1: id (Integer)
+        bytes.extend_from_slice(&encode_integer(self.id));
+
+        // Field 2: labels (List of Strings)
+        bytes.extend_from_slice(&encode_string_list(&self.labels));
+
+        // Field 3: properties (Map)
+        bytes.extend_from_slice(&encode_properties_map(&self.properties));
+
+        // Field 4: elementId (String)
+        bytes.extend_from_slice(&encode_string(&self.element_id));
+
+        bytes
+    }
+}
+
+impl Relationship {
+    /// Create a new Relationship
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: i64,
+        start_node_id: i64,
+        end_node_id: i64,
+        rel_type: String,
+        properties: HashMap<String, Value>,
+        element_id: String,
+        start_node_element_id: String,
+        end_node_element_id: String,
+    ) -> Self {
+        Relationship {
+            id,
+            start_node_id,
+            end_node_id,
+            rel_type,
+            properties,
+            element_id,
+            start_node_element_id,
+            end_node_element_id,
+        }
+    }
+
+    /// Convert to HTTP API GraphEdge
+    pub fn to_graph_edge(&self) -> GraphEdge {
+        GraphEdge {
+            element_id: self.element_id.clone(),
+            rel_type: self.rel_type.clone(),
+            start_node_element_id: self.start_node_element_id.clone(),
+            end_node_element_id: self.end_node_element_id.clone(),
+            properties: self.properties.clone(),
+        }
+    }
+
+    /// Encode this Relationship to packstream format
+    ///
+    /// Format: 0xB8 (8-field struct) + 0x52 ('R') + [8 fields]
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the packstream-encoded bytes
+    pub fn to_packstream(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Struct signature: 0xB8 (8 fields) + 0x52 ('R')
+        bytes.push(0xB8);
+        bytes.push(0x52);
+
+        // Field 1: id (Integer)
+        bytes.extend_from_slice(&encode_integer(self.id));
+
+        // Field 2: startNodeId (Integer)
+        bytes.extend_from_slice(&encode_integer(self.start_node_id));
+
+        // Field 3: endNodeId (Integer)
+        bytes.extend_from_slice(&encode_integer(self.end_node_id));
+
+        // Field 4: type (String)
+        bytes.extend_from_slice(&encode_string(&self.rel_type));
+
+        // Field 5: properties (Map)
+        bytes.extend_from_slice(&encode_properties_map(&self.properties));
+
+        // Field 6: elementId (String)
+        bytes.extend_from_slice(&encode_string(&self.element_id));
+
+        // Field 7: startNodeElementId (String)
+        bytes.extend_from_slice(&encode_string(&self.start_node_element_id));
+
+        // Field 8: endNodeElementId (String)
+        bytes.extend_from_slice(&encode_string(&self.end_node_element_id));
+
+        bytes
+    }
+
+    /// Encode this Relationship as UnboundRelationship for Path encoding
+    ///
+    /// UnboundRelationship format: 0xB4 (4-field struct) + 0x72 ('r') + [id, type, properties, elementId]
+    /// Note: Unlike full Relationship, UnboundRelationship doesn't include start/end node IDs
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the packstream-encoded bytes
+    pub fn to_unbound_packstream(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Struct signature: 0xB4 (4 fields) + 0x72 ('r' lowercase for unbound)
+        bytes.push(0xB4);
+        bytes.push(0x72);
+
+        // Field 1: id (Integer)
+        bytes.extend_from_slice(&encode_integer(self.id));
+
+        // Field 2: type (String)
+        bytes.extend_from_slice(&encode_string(&self.rel_type));
+
+        // Field 3: properties (Map)
+        bytes.extend_from_slice(&encode_properties_map(&self.properties));
+
+        // Field 4: elementId (String)
+        bytes.extend_from_slice(&encode_string(&self.element_id));
+
+        bytes
+    }
+}
+
+// ========== Packstream Encoding Helpers ==========
+
+// ========== Packstream Encoding Helpers ==========
+//
+// Custom Packstream Implementation Rationale:
+//
+// We implement Packstream encoding directly (vs using crates like `packs` or `neo4j_rust_bolt`)
+// for several reasons:
+//
+// 1. **Precise Control**: Need exact byte-level control for Bolt 5.x graph objects
+//    - Custom elementId format: "Label:id1|id2|id3" for composite IDs
+//    - Tight integration with ClickGraph's schema type system
+//    - Direct control over Node/Relationship structure encoding
+//
+// 2. **Minimal Dependencies**: ~200 LOC implementation with zero external deps
+//    - No version conflicts or breaking changes risk
+//    - Faster compilation, smaller binary
+//    - Easier to debug and maintain
+//
+// 3. **Available Crates Limitations**:
+//    - `packstream 0.0.0`: Appears unfinished/placeholder
+//    - `packs`: General-purpose, would need adapter layer anyway
+//    - `raio`/`neo4j_rust_bolt`: Full drivers (overkill for encoding layer)
+//
+// 4. **Performance**: Zero abstraction overhead - direct byte vector generation
+//
+// If migrating to external crate in future: benchmark performance, add adapter layer,
+// test all schema variations (composite IDs, denormalized, polymorphic, etc.)
+//
+// Spec reference: https://neo4j.com/docs/bolt/current/packstream/
+
+/// Encode an integer to packstream format
+///
+/// Packstream integer encoding:
+/// - -16..127: Single byte (signed)
+/// - Other: 0xC8 + 1 byte, 0xC9 + 2 bytes (BE), 0xCA + 4 bytes (BE), 0xCB + 8 bytes (BE)
+fn encode_integer(value: i64) -> Vec<u8> {
+    if (-16..=127).contains(&value) {
+        // TINY_INT: Single byte
+        vec![value as u8]
+    } else if i8::MIN as i64 <= value && value <= i8::MAX as i64 {
+        // INT_8: 0xC8 + 1 byte
+        vec![0xC8, value as u8]
+    } else if i16::MIN as i64 <= value && value <= i16::MAX as i64 {
+        // INT_16: 0xC9 + 2 bytes (big-endian)
+        let bytes = (value as i16).to_be_bytes();
+        vec![0xC9, bytes[0], bytes[1]]
+    } else if i32::MIN as i64 <= value && value <= i32::MAX as i64 {
+        // INT_32: 0xCA + 4 bytes (big-endian)
+        let bytes = (value as i32).to_be_bytes();
+        vec![0xCA, bytes[0], bytes[1], bytes[2], bytes[3]]
+    } else {
+        // INT_64: 0xCB + 8 bytes (big-endian)
+        let bytes = value.to_be_bytes();
+        let mut result = vec![0xCB];
+        result.extend_from_slice(&bytes);
+        result
+    }
+}
+
+/// Encode a string to packstream format
+///
+/// Packstream string encoding:
+/// - 0..15 bytes: 0x8X + bytes (where X = length)
+/// - 16..255 bytes: 0xD0 + 1-byte length + bytes
+/// - 256..65535 bytes: 0xD1 + 2-byte length (BE) + bytes
+/// - 65536+: 0xD2 + 4-byte length (BE) + bytes
+fn encode_string(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+
+    let mut result = Vec::new();
+
+    if len < 16 {
+        // TINY_STRING: 0x80..0x8F
+        result.push(0x80 | (len as u8));
+    } else if len <= 255 {
+        // STRING_8: 0xD0 + 1-byte length
+        result.push(0xD0);
+        result.push(len as u8);
+    } else if len <= 65535 {
+        // STRING_16: 0xD1 + 2-byte length (big-endian)
+        result.push(0xD1);
+        result.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        // STRING_32: 0xD2 + 4-byte length (big-endian)
+        result.push(0xD2);
+        result.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+
+    result.extend_from_slice(bytes);
+    result
+}
+
+/// Encode a list of strings to packstream format
+fn encode_string_list(strings: &[String]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let len = strings.len();
+
+    // List header
+    if len < 16 {
+        // TINY_LIST: 0x90..0x9F
+        result.push(0x90 | (len as u8));
+    } else if len <= 255 {
+        // LIST_8: 0xD4 + 1-byte length
+        result.push(0xD4);
+        result.push(len as u8);
+    } else if len <= 65535 {
+        // LIST_16: 0xD5 + 2-byte length
+        result.push(0xD5);
+        result.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        // LIST_32: 0xD6 + 4-byte length
+        result.push(0xD6);
+        result.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+
+    // List items
+    for s in strings {
+        result.extend_from_slice(&encode_string(s));
+    }
+
+    result
+}
+
+/// Encode a list of already-packstream-encoded items (e.g. Node or
+/// Relationship structures) into a packstream List value. Used to build the
+/// `nodes`/`relationships` columns of `db.schema.visualization()`.
+pub fn encode_packstream_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let len = items.len();
+    if len < 16 {
+        result.push(0x90 | (len as u8));
+    } else if len <= 255 {
+        result.push(0xD4);
+        result.push(len as u8);
+    } else if len <= 65535 {
+        result.push(0xD5);
+        result.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        result.push(0xD6);
+        result.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+    for item in items {
+        result.extend_from_slice(item);
+    }
+    result
+}
+
+/// Encode a properties map to packstream format
+fn encode_properties_map(properties: &HashMap<String, Value>) -> Vec<u8> {
+    let mut result = Vec::new();
+    let len = properties.len();
+
+    // Map header
+    if len < 16 {
+        // TINY_MAP: 0xA0..0xAF
+        result.push(0xA0 | (len as u8));
+    } else if len <= 255 {
+        // MAP_8: 0xD8 + 1-byte length
+        result.push(0xD8);
+        result.push(len as u8);
+    } else if len <= 65535 {
+        // MAP_16: 0xD9 + 2-byte length
+        result.push(0xD9);
+        result.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        // MAP_32: 0xDA + 4-byte length
+        result.push(0xDA);
+        result.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+
+    // Map entries (key-value pairs)
+    for (key, value) in properties {
+        result.extend_from_slice(&encode_string(key));
+        encode_json_value_into(value, &mut result, 0);
+    }
+
+    result
+}
+
+/// Maximum nesting depth for recursive JSON encoding to prevent stack overflow.
+const MAX_JSON_NESTING_DEPTH: usize = 64;
+
+/// Encode a JSON value to packstream format.
+///
+/// Test-only convenience wrapper around `encode_json_value_into`. Production
+/// callers use the buffer-writing variant directly to avoid per-element
+/// allocation.
+#[cfg(test)]
+fn encode_json_value(value: &Value) -> Vec<u8> {
+    let mut result = Vec::new();
+    encode_json_value_into(value, &mut result, 0);
+    result
+}
+
+/// Encode a JSON value directly into an existing buffer, avoiding per-element allocation.
+/// Tracks nesting depth to guard against stack overflow from deeply nested structures.
+fn encode_json_value_into(value: &Value, result: &mut Vec<u8>, depth: usize) {
+    if depth > MAX_JSON_NESTING_DEPTH {
+        result.push(0xC0); // NULL sentinel for excessively nested values
+        return;
+    }
+    match value {
+        Value::Null => result.push(0xC0),        // NULL
+        Value::Bool(true) => result.push(0xC3),  // TRUE
+        Value::Bool(false) => result.push(0xC2), // FALSE
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                let bytes = encode_integer(i);
+                result.extend_from_slice(&bytes);
+            } else if n.is_u64() {
+                // Above `i64::MAX`: no Bolt Integer holds it, and a Float
+                // loses its low digits. The string of its digits is exact
+                // (`integers_exact_in_bolt`, #1516).
+                result.extend_from_slice(&encode_string(&n.to_string()));
+            } else if let Some(f) = n.as_f64() {
+                // FLOAT_64: 0xC1 + 8 bytes (big-endian)
+                result.push(0xC1);
+                result.extend_from_slice(&f.to_be_bytes());
+            } else {
+                let bytes = encode_integer(0);
+                result.extend_from_slice(&bytes);
+            }
+        }
+        Value::String(s) => {
+            let bytes = encode_string(s);
+            result.extend_from_slice(&bytes);
+        }
+        Value::Array(arr) => {
+            let len = arr.len();
+            // List header
+            if len < 16 {
+                result.push(0x90 | (len as u8));
+            } else if len <= 255 {
+                result.push(0xD4);
+                result.push(len as u8);
+            } else if len <= 65535 {
+                result.push(0xD5);
+                result.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                result.push(0xD6);
+                let len32 = u32::try_from(len).unwrap_or(u32::MAX);
+                result.extend_from_slice(&len32.to_be_bytes());
+            }
+            for item in arr {
+                encode_json_value_into(item, result, depth + 1);
+            }
+        }
+        Value::Object(obj) => {
+            let len = obj.len();
+            // Map header
+            if len < 16 {
+                result.push(0xA0 | (len as u8));
+            } else if len <= 255 {
+                result.push(0xD8);
+                result.push(len as u8);
+            } else if len <= 65535 {
+                result.push(0xD9);
+                result.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                result.push(0xDA);
+                let len32 = u32::try_from(len).unwrap_or(u32::MAX);
+                result.extend_from_slice(&len32.to_be_bytes());
+            }
+            for (key, val) in obj {
+                let key_bytes = encode_string(key);
+                result.extend_from_slice(&key_bytes);
+                encode_json_value_into(val, result, depth + 1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1516: a node returned whole carries such a property as its digits.
+    #[test]
+    fn a_node_property_above_i64_is_its_digits_in_the_node() {
+        let mut properties = HashMap::new();
+        properties.insert("v".to_string(), Value::Number(u64::MAX.into()));
+        let node = Node::new(1, vec!["U".to_string()], properties, "U:1-".to_string());
+        let bytes = node.to_packstream();
+        let digits = b"18446744073709551615";
+        assert!(
+            bytes.windows(digits.len()).any(|w| w == digits),
+            "{bytes:02X?}"
+        );
+    }
+
+    /// #1516: a node property above `i64::MAX` is its digits, not a Float.
+    #[test]
+    fn a_property_above_i64_is_its_digits() {
+        let bytes = encode_json_value(&Value::Number(u64::MAX.into()));
+        let mut expected = vec![0xD0, 20];
+        expected.extend_from_slice(b"18446744073709551615");
+        assert_eq!(bytes, expected);
+        assert_eq!(encode_json_value(&Value::Number(i64::MAX.into()))[0], 0xCB);
+    }
+
+    /// #1536: a Float64 with a long shortest text (`0.30000000000000004` is
+    /// what `avg()` and division commonly produce) stays FLOAT_64. What makes
+    /// a value text is the column's type, not the length of its text.
+    #[test]
+    fn a_long_float_text_stays_float_64_1536() {
+        let value: Value = serde_json::from_str("0.30000000000000004").unwrap();
+        let bytes = encode_json_value(&value);
+        assert_eq!(bytes[0], 0xC1, "{bytes:02X?}");
+        let mut f = [0u8; 8];
+        f.copy_from_slice(&bytes[1..]);
+        assert_eq!(
+            f64::from_be_bytes(f).to_bits(),
+            0.30000000000000004f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn test_encode_packstream_list() {
+        // Empty list -> tiny-list header 0x90, no items.
+        assert_eq!(encode_packstream_list(&[]), vec![0x90]);
+        // Two pre-encoded items -> 0x92 + item bytes concatenated in order.
+        let items = vec![vec![0x01u8], vec![0x02u8, 0x03u8]];
+        assert_eq!(encode_packstream_list(&items), vec![0x92, 0x01, 0x02, 0x03]);
+        // 16-element boundary crosses into LIST_8 (0xD4 + count).
+        let many: Vec<Vec<u8>> = (0..16).map(|_| vec![0x00u8]).collect();
+        let encoded = encode_packstream_list(&many);
+        assert_eq!(&encoded[0..2], &[0xD4, 16]);
+        assert_eq!(encoded.len(), 2 + 16);
+    }
+
+    #[test]
+    fn test_encode_integer_tiny() {
+        // TINY_INT: -16..127
+        assert_eq!(encode_integer(0), vec![0x00]);
+        assert_eq!(encode_integer(1), vec![0x01]);
+        assert_eq!(encode_integer(127), vec![0x7F]);
+        assert_eq!(encode_integer(-1), vec![0xFF]);
+        assert_eq!(encode_integer(-16), vec![0xF0]);
+    }
+
+    #[test]
+    fn test_encode_integer_int8() {
+        // INT_8: beyond TINY_INT range
+        assert_eq!(encode_integer(-17), vec![0xC8, 0xEF]); // -17 as i8
+        assert_eq!(encode_integer(-128), vec![0xC8, 0x80]); // i8::MIN
+    }
+
+    #[test]
+    fn test_encode_integer_int16() {
+        // INT_16
+        assert_eq!(encode_integer(128), vec![0xC9, 0x00, 0x80]);
+        assert_eq!(encode_integer(32767), vec![0xC9, 0x7F, 0xFF]);
+        assert_eq!(encode_integer(-129), vec![0xC9, 0xFF, 0x7F]);
+    }
+
+    #[test]
+    fn test_encode_integer_int32() {
+        // INT_32
+        assert_eq!(encode_integer(65536), vec![0xCA, 0x00, 0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_encode_string_tiny() {
+        // TINY_STRING: 0..15 bytes
+        assert_eq!(encode_string(""), vec![0x80]);
+        assert_eq!(encode_string("A"), vec![0x81, b'A']);
+        assert_eq!(
+            encode_string("Hello"),
+            vec![0x85, b'H', b'e', b'l', b'l', b'o']
+        );
+    }
+
+    #[test]
+    fn test_encode_string_8() {
+        // STRING_8: 16..255 bytes
+        let long_str = "x".repeat(20);
+        let encoded = encode_string(&long_str);
+        assert_eq!(encoded[0], 0xD0); // STRING_8 marker
+        assert_eq!(encoded[1], 20); // Length
+        assert_eq!(encoded.len(), 2 + 20);
+    }
+
+    #[test]
+    fn test_encode_string_list_empty() {
+        assert_eq!(encode_string_list(&[]), vec![0x90]); // TINY_LIST with 0 items
+    }
+
+    #[test]
+    fn test_encode_string_list_single() {
+        let list = vec!["User".to_string()];
+        let encoded = encode_string_list(&list);
+        assert_eq!(encoded[0], 0x91); // TINY_LIST with 1 item
+                                      // Followed by encoded "User" string
+        assert_eq!(&encoded[1..], &[0x84, b'U', b's', b'e', b'r']);
+    }
+
+    #[test]
+    fn test_encode_string_list_multiple() {
+        let list = vec!["User".to_string(), "Person".to_string()];
+        let encoded = encode_string_list(&list);
+        assert_eq!(encoded[0], 0x92); // TINY_LIST with 2 items
+    }
+
+    #[test]
+    fn test_node_packstream_encoding() {
+        let mut properties = HashMap::new();
+        properties.insert("user_id".to_string(), Value::Number(123.into()));
+        properties.insert("name".to_string(), Value::String("Alice".to_string()));
+
+        let node = Node::new(
+            0,
+            vec!["User".to_string()],
+            properties,
+            "User:123".to_string(),
+        );
+
+        let encoded = node.to_packstream();
+
+        // Verify structure signature
+        assert_eq!(encoded[0], 0xB4); // 4-field struct
+        assert_eq!(encoded[1], 0x4E); // 'N' for Node
+
+        // Field 1: id = 0
+        assert_eq!(encoded[2], 0x00); // TINY_INT 0
+
+        // Field 2: labels = ["User"] starts at byte 3
+        assert_eq!(encoded[3], 0x91); // TINY_LIST with 1 item
+        assert_eq!(encoded[4], 0x84); // TINY_STRING with 4 bytes
+        assert_eq!(&encoded[5..9], b"User");
+
+        // Remaining fields: properties map and elementId string
+        // (detailed validation omitted for brevity)
+    }
+
+    #[test]
+    fn test_relationship_packstream_encoding() {
+        let properties = HashMap::new();
+
+        let rel = Relationship::new(
+            0,
+            0,
+            0,
+            "FOLLOWS".to_string(),
+            properties,
+            "FOLLOWS:123->456".to_string(),
+            "User:123".to_string(),
+            "User:456".to_string(),
+        );
+
+        let encoded = rel.to_packstream();
+
+        // Verify structure signature
+        assert_eq!(encoded[0], 0xB8); // 8-field struct
+        assert_eq!(encoded[1], 0x52); // 'R' for Relationship
+
+        // Field 1: id = 0
+        assert_eq!(encoded[2], 0x00); // TINY_INT 0
+
+        // Field 2: startNodeId = 0
+        assert_eq!(encoded[3], 0x00);
+
+        // Field 3: endNodeId = 0
+        assert_eq!(encoded[4], 0x00);
+
+        // Field 4: type = "FOLLOWS"
+        assert_eq!(encoded[5], 0x87); // TINY_STRING with 7 bytes
+        assert_eq!(&encoded[6..13], b"FOLLOWS");
+    }
+
+    #[test]
+    fn test_node_with_composite_element_id() {
+        let properties = HashMap::new();
+
+        let node = Node::new(
+            0,
+            vec!["Account".to_string()],
+            properties,
+            "Account:tenant_1|456".to_string(), // Composite ID
+        );
+
+        let encoded = node.to_packstream();
+
+        // Just verify it encodes without panic
+        assert!(encoded.len() > 10);
+        assert_eq!(encoded[0], 0xB4);
+        assert_eq!(encoded[1], 0x4E);
+    }
+
+    #[test]
+    fn test_node_with_multiple_labels() {
+        let properties = HashMap::new();
+
+        let node = Node::new(
+            0,
+            vec!["User".to_string(), "Person".to_string()],
+            properties,
+            "User:123".to_string(),
+        );
+
+        let encoded = node.to_packstream();
+
+        // Verify 2 labels
+        assert_eq!(encoded[3], 0x92); // TINY_LIST with 2 items
+    }
+
+    #[test]
+    fn test_encode_json_array() {
+        // Array of integers
+        let val = Value::Array(vec![
+            Value::Number(serde_json::Number::from(1)),
+            Value::Number(serde_json::Number::from(2)),
+            Value::Number(serde_json::Number::from(3)),
+        ]);
+        let encoded = encode_json_value(&val);
+        assert_eq!(encoded[0], 0x93); // TINY_LIST with 3 items
+        assert_eq!(encoded[1], 0x01); // integer 1
+        assert_eq!(encoded[2], 0x02); // integer 2
+        assert_eq!(encoded[3], 0x03); // integer 3
+    }
+
+    #[test]
+    fn test_encode_json_array_strings() {
+        let val = Value::Array(vec![
+            Value::String("tcp".to_string()),
+            Value::String("udp".to_string()),
+        ]);
+        let encoded = encode_json_value(&val);
+        assert_eq!(encoded[0], 0x92); // TINY_LIST with 2 items
+                                      // First string: 0x83 (TINY_STRING len 3) + "tcp"
+        assert_eq!(encoded[1], 0x83);
+        assert_eq!(&encoded[2..5], b"tcp");
+        // Second string: 0x83 + "udp"
+        assert_eq!(encoded[5], 0x83);
+        assert_eq!(&encoded[6..9], b"udp");
+    }
+
+    #[test]
+    fn test_encode_json_empty_array() {
+        let val = Value::Array(vec![]);
+        let encoded = encode_json_value(&val);
+        assert_eq!(encoded, vec![0x90]); // TINY_LIST with 0 items
+    }
+
+    #[test]
+    fn test_encode_json_object() {
+        let mut map = serde_json::Map::new();
+        map.insert("key".to_string(), Value::String("value".to_string()));
+        let val = Value::Object(map);
+        let encoded = encode_json_value(&val);
+        assert_eq!(encoded[0], 0xA1); // TINY_MAP with 1 entry
+                                      // Key: TINY_STRING len 3 + "key"
+        assert_eq!(encoded[1], 0x83);
+        assert_eq!(&encoded[2..5], b"key");
+        // Value: TINY_STRING len 5 + "value"
+        assert_eq!(encoded[5], 0x85);
+        assert_eq!(&encoded[6..11], b"value");
+        assert_eq!(encoded.len(), 11);
+    }
+
+    #[test]
+    fn test_encode_json_nested_array() {
+        // Array containing mixed types including nested array
+        let val = Value::Array(vec![
+            Value::Number(serde_json::Number::from(42)),
+            Value::String("hello".to_string()),
+            Value::Array(vec![Value::Bool(true)]),
+        ]);
+        let encoded = encode_json_value(&val);
+        assert_eq!(encoded[0], 0x93); // TINY_LIST with 3 items
+                                      // Item 1: integer 42
+        assert_eq!(encoded[1], 0x2A);
+        // Item 2: TINY_STRING len 5 + "hello"
+        assert_eq!(encoded[2], 0x85);
+        assert_eq!(&encoded[3..8], b"hello");
+        // Item 3: nested TINY_LIST with 1 item
+        assert_eq!(encoded[8], 0x91); // TINY_LIST with 1 item
+        assert_eq!(encoded[9], 0xC3); // TRUE
+        assert_eq!(encoded.len(), 10);
+    }
+
+    #[test]
+    fn test_encode_json_depth_guard() {
+        // Build deeply nested array beyond MAX_JSON_NESTING_DEPTH
+        let mut val = Value::Bool(true);
+        for _ in 0..=MAX_JSON_NESTING_DEPTH + 1 {
+            val = Value::Array(vec![val]);
+        }
+        let encoded = encode_json_value(&val);
+        // Should not stack overflow; excessively nested values become NULL
+        assert!(!encoded.is_empty());
+    }
+}
