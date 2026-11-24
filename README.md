@@ -147,26 +147,25 @@ Stateless helper function that validates `schema` and compiles `cypher` in a sin
 ## Architecture
 
 ```text
-openCypher Query + YAML/Dict Schema
-                │
-                ▼
-┌─────────────────────────────────────────┐
-│  cyphersql._core (Rust / PyO3 abi3)     │
-│  • YAML Schema Validator                │
-│  • openCypher AST Parser                │
-│  • Relational & Recursive CTE Planner   │
-└───────────────┬─────────────────────────┘
-                │ Raw ClickHouse / Databricks SQL
-                ▼
-┌─────────────────────────────────────────┐
-│  cyphersql.compiler (Python / sqlglot)  │
-│  • $param -> AST Parameter Binding      │
-│  • ClickHouse -> Trino/PG/MySQL Rewrite │
-└───────────────┬─────────────────────────┘
-                │
-                ▼
-   Native SQL Ready for Execution
-
+      openCypher Query + YAML/Dict Schema
+                       |
+                       v
++----------------------------------------------+
+|  cyphersql._core (Rust / PyO3 abi3)          |
+|  - YAML Schema Validator                     |
+|  - openCypher AST Parser                     |
+|  - Relational & Recursive CTE Planner        |
++----------------------+-----------------------+
+                       | Raw ClickHouse / Databricks SQL
+                       v
++----------------------------------------------+
+|  cyphersql.compiler (Python / sqlglot)       |
+|  - $param -> AST Parameter Binding           |
+|  - ClickHouse -> Trino/PG/MySQL/DuckDB       |
++----------------------+-----------------------+
+                       |
+                       v
+         Native SQL Ready for Execution
 ```
 
 ---
