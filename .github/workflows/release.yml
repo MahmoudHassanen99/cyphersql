@@ -27,6 +27,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
+      - run: git config --system core.longpaths true
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
         with:

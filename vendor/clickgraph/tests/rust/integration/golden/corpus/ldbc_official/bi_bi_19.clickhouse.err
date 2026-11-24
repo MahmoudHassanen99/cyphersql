@@ -1,1 +1,0 @@
-not supported: a procedure CALL here (the server answers a standalone CALL; one inside a query or a UNION is not supported)

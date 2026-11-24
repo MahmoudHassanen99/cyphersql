@@ -1,9 +1,0 @@
-{
- "columns": [
-  "r"
- ],
- "cypher": "MATCH ()-[r:NONEXISTENT]->() RETURN r",
- "order_keys": null,
- "rows": [],
- "schema": "social_integration"
-}

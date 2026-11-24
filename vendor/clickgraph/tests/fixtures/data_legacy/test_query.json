@@ -1,3 +1,0 @@
-{
-  "cypher": "MATCH (u:user)-[r:AUTHORED]->(p:post) RETURN u.name, p.title LIMIT 5"
-}

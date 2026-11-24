@@ -1,1 +1,0 @@
-parse error: Parsing Failure: OpenCypherParsingError { errors: [("Value of skip clause should be integer", "Error in skip clause")] }

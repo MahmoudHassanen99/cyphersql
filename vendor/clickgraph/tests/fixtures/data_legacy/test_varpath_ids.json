@@ -1,3 +1,0 @@
-{
-  "query": "MATCH (u1:user)-[:FRIEND*1..2]->(u2:user) RETURN u1.user_id, u2.user_id"
-}

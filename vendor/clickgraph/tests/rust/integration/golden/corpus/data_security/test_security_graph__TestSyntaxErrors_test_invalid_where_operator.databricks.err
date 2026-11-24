@@ -1,1 +1,0 @@
-parse error: Parsing Failure: OpenCypherParsingError { errors: [("MATCH (u:User) WHERE AND u.name = 'Alice' RETURN u.name", "Unexpected tokens after query"), ("MATCH (u:User) WHERE AND u.name = 'Alice' RETURN u.name", "Unparsed input")] }

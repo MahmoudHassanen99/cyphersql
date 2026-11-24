@@ -1,1 +1,0 @@
-parse error: Parsing Failure: OpenCypherParsingError { errors: [("MATCH (a:TestUser)-[:TEST_FOLLOWS*-1]->(b:TestUser)\n            RETURN a.name, b.name", "Unexpected tokens after query"), ("MATCH (a:TestUser)-[:TEST_FOLLOWS*-1]->(b:TestUser)\n            RETURN a.name, b.name", "Unparsed input")] }

@@ -1,1 +1,0 @@
-parse error: Parsing Failure: OpenCypherParsingError { errors: [(" > AND a.name = 'Alice'\n            RETURN a.name", "Unexpected tokens after query"), ("> AND a.name = 'Alice'\n            RETURN a.name", "Unparsed input")] }

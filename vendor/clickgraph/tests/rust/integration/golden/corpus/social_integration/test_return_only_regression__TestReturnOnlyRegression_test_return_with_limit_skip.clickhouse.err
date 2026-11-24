@@ -1,1 +1,0 @@
-parse error: Parsing Failure: OpenCypherParsingError { errors: [("SKIP 0", "Unexpected tokens after query"), ("SKIP 0", "Unparsed input")] }
