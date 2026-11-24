@@ -1,12 +1,3 @@
-[workspace]
-members = [
-    "clickgraph-client",
-    "clickgraph-embedded",
-    "clickgraph-ffi",
-    "clickgraph-tck",
-    "clickgraph-tool",
-]
-
 [package]
 name = "clickgraph"
 version = "0.6.8-dev"
